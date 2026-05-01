@@ -1484,6 +1484,38 @@ pub mod eap_tls {
             self.context.get_emsk()
         }
 
+        /// Export keying material from the TLS connection (RFC 5705)
+        ///
+        /// Generic wrapper around rustls' `export_keying_material` for callers
+        /// that need a labeled exporter other than the EAP-TLS MSK/EMSK derivation
+        /// (e.g. EAP-TEAP's `session_key_seed`, RFC 7170 Section 5.2).
+        ///
+        /// # Arguments
+        /// * `label` - Exporter label, per the consuming RFC
+        /// * `context` - Optional context value (None for empty context)
+        /// * `length` - Number of bytes of keying material to derive
+        ///
+        /// # Errors
+        /// Returns `EapError::InvalidState` if the TLS handshake is not complete,
+        /// or `EapError::TlsError` if the underlying export fails.
+        pub fn export_keying_material(
+            &self,
+            label: &[u8],
+            context: Option<&[u8]>,
+            length: usize,
+        ) -> Result<Vec<u8>, EapError> {
+            if !self.is_handshake_complete() {
+                return Err(EapError::InvalidState);
+            }
+            let conn = self.connection.as_ref().ok_or(EapError::InvalidState)?;
+            let mut output = vec![0u8; length];
+            conn.export_keying_material(output.as_mut_slice(), label, context)
+                .map_err(|e| {
+                    EapError::TlsError(format!("export_keying_material failed: {:?}", e))
+                })?;
+            Ok(output)
+        }
+
         /// Get reference to the context
         pub fn context(&self) -> &EapTlsContext {
             &self.context

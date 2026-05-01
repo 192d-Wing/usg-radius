@@ -125,10 +125,15 @@ This document identifies gaps between the current USG RADIUS implementation and 
 
 #### Proxy-State Attribute (Type 33)
 
-**Status**: Not preserved
-**Current**: Proxy-State attributes not copied to response
-**Required**: RFC 2865 Section 5.33 - Must be returned unmodified
-**Priority**: LOW (proxy functionality not currently implemented)
+**Status**: Echoed in response, ordering tests pending
+**Current**: Proxy-State attributes from the request are copied into
+Access-Accept, Access-Reject, Access-Challenge, and Accounting-Response
+in the order they appear in the request
+([crates/radius-server/src/server.rs](../../crates/radius-server/src/server.rs)).
+**Required**: RFC 2865 Section 5.33 - Must be returned unmodified.
+**Gap**: Lacks integration test coverage for multi-Proxy-State ordering and
+correct stripping of server-added Proxy-State on the response leg.
+**Priority**: LOW (proxy functionality usable; tighten with regression tests).
 
 ---
 
@@ -715,8 +720,14 @@ Total:         156+ tests
 ### Priority 3 (MEDIUM) - ⚠️ PARTIAL
 
 1. ✅ **EAP-TLS** (v0.5.0) - Complete
-2. ❌ **EAP-TEAP** - Planned for future release
-3. ❌ **Proxy-State** - Not implemented
+2. ⚠️ **EAP-TEAP** (v0.7.x) - Phase 1 (TLS tunnel) and Phase 2 TLV protocol
+   complete, including history-aware Crypto-Binding compound MAC
+   (RFC 7170 §5.3) and RFC 5705 `session_key_seed` derivation. Inner
+   methods producing real keying material (e.g. EAP-MSCHAPv2) are still
+   pending; current inner methods (Basic-Password-Auth, EAP-MD5) use the
+   zero-IMSK fallback per RFC 7170 §5.2.
+3. ⚠️ **Proxy-State** - Echoed in responses; ordering regression tests
+   pending
 4. ❌ **Hot Configuration Reload** - Deferred
 5. ⚠️ **Health Monitoring** - Basic Status-Server implemented
 
@@ -750,9 +761,9 @@ Total:         156+ tests
 | Status-Server | 5997 | ⚠️ Partial | v0.1.0 | LOW | Basic support |
 | CHAP | 2865 | ❌ Deferred | - | LOW | Superseded by EAP-TLS |
 | Message-Authenticator | 2869 | ❌ Deferred | - | MEDIUM | Less critical with TLS |
-| Proxy-State | 2865 | ❌ Missing | - | MEDIUM | Proxy support |
+| Proxy-State | 2865 | ⚠️ Echoed | v0.x | MEDIUM | Ordering tests pending |
 | Hot Reload | - | ❌ Deferred | - | MEDIUM | Requires restart |
-| EAP-TEAP | 7170 | ❌ Planned | - | MEDIUM | Future release |
+| EAP-TEAP | 7170 | ⚠️ Phase 1+2 | v0.7.x | MEDIUM | Crypto-binding RFC-correct; inner methods with real IMSK pending |
 
 ---
 
