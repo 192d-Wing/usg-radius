@@ -28,6 +28,21 @@ use thiserror::Error;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
+/// Copy every Proxy-State attribute from `request` into `response`,
+/// preserving their relative order (RFC 2865 §5.33).
+///
+/// "If a Proxy-State attribute was added to the access-request, it MUST be
+/// copied unmodified to the response packet." Order is preserved by
+/// iterating `request.attributes` in sequence and pushing each match onto
+/// `response`, which appends in order.
+fn copy_proxy_state(request: &Packet, response: &mut Packet) {
+    for attr in request.attributes.iter() {
+        if attr.attr_type == AttributeType::ProxyState as u8 {
+            response.add_attribute(attr.clone());
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum ServerError {
     #[error("IO error: {0}")]
@@ -1124,12 +1139,7 @@ impl RadiusServer {
                     response.add_attribute(attr);
                 }
 
-                // Copy Proxy-State attributes from request to response (RFC 2865 Section 5.33)
-                for attr in request.attributes.iter() {
-                    if attr.attr_type == AttributeType::ProxyState as u8 {
-                        response.add_attribute(attr.clone());
-                    }
-                }
+                copy_proxy_state(request, &mut response);
 
                 // Calculate and set Response Authenticator using client-specific secret
                 let response_auth =
@@ -1178,12 +1188,7 @@ impl RadiusServer {
                     response.add_attribute(attr);
                 }
 
-                // Copy Proxy-State attributes from request to response (RFC 2865 Section 5.33)
-                for attr in request.attributes.iter() {
-                    if attr.attr_type == AttributeType::ProxyState as u8 {
-                        response.add_attribute(attr.clone());
-                    }
-                }
+                copy_proxy_state(request, &mut response);
 
                 // Calculate and set Response Authenticator using client-specific secret
                 let response_auth =
@@ -1227,12 +1232,7 @@ impl RadiusServer {
                     response.add_attribute(attr);
                 }
 
-                // Copy Proxy-State attributes from request to response (RFC 2865 Section 5.33)
-                for attr in request.attributes.iter() {
-                    if attr.attr_type == AttributeType::ProxyState as u8 {
-                        response.add_attribute(attr.clone());
-                    }
-                }
+                copy_proxy_state(request, &mut response);
 
                 // Calculate and set Response Authenticator using client-specific secret
                 let response_auth =
@@ -1413,12 +1413,7 @@ impl RadiusServer {
         // Create Accounting-Response (always success per RFC 2866)
         let mut response = Packet::new(Code::AccountingResponse, request.identifier, [0u8; 16]);
 
-        // Copy Proxy-State attributes from request to response (RFC 2865 Section 5.33)
-        for attr in request.attributes.iter() {
-            if attr.attr_type == AttributeType::ProxyState as u8 {
-                response.add_attribute(attr.clone());
-            }
-        }
+        copy_proxy_state(request, &mut response);
 
         // Calculate and set Response Authenticator using client-specific secret
         let response_auth =

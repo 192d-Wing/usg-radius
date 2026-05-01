@@ -2038,3 +2038,218 @@ async fn test_file_accounting_handler() {
     assert_eq!(stop_json["output_octets"], 7680);
     assert_eq!(stop_json["terminate_cause"], 1);
 }
+
+// ---------------------------------------------------------------------------
+// Proxy-State echo (RFC 2865 §5.33)
+//
+// "If a Proxy-State attribute was added to the Access-Request, it MUST be
+// copied unmodified to the response packet." The sender's relative ordering
+// of multiple Proxy-State attributes must be preserved (RFC 2865 §5.33 and
+// §3 invariant on response composition).
+// ---------------------------------------------------------------------------
+
+/// Collect every Proxy-State attribute value from `packet` in the order they
+/// appear on the wire. We deliberately avoid `Packet::find_attribute`
+/// (returns only the first) — order is the property under test.
+fn extract_proxy_states(packet: &Packet) -> Vec<Vec<u8>> {
+    packet
+        .attributes
+        .iter()
+        .filter(|a| a.attr_type == AttributeType::ProxyState as u8)
+        .map(|a| a.value.clone())
+        .collect()
+}
+
+/// Append three Proxy-State attributes [A, B, C] to `packet`. Returns the
+/// expected ordered list of values for assertion.
+fn add_three_proxy_states(packet: &mut Packet) -> Vec<Vec<u8>> {
+    let values: Vec<Vec<u8>> = vec![
+        b"proxy-A".to_vec(),
+        b"proxy-B".to_vec(),
+        b"proxy-C".to_vec(),
+    ];
+    for v in &values {
+        packet.add_attribute(
+            Attribute::new(AttributeType::ProxyState as u8, v.clone())
+                .expect("Proxy-State attribute"),
+        );
+    }
+    values
+}
+
+#[tokio::test]
+async fn test_proxy_state_echoed_on_access_accept() {
+    let mut config = Config::default();
+    config.listen_address = "127.0.0.1".to_string();
+    config.listen_port = 0;
+    config.secret = "testing123".to_string();
+
+    let mut handler = SimpleAuthHandler::new();
+    handler.add_user("psuser", "pspass");
+
+    let server_config = ServerConfig::from_config(config, Arc::new(handler))
+        .expect("server config");
+    let server = RadiusServer::new(server_config).await.expect("server");
+    let server_addr = server.local_addr().expect("server addr");
+
+    tokio::spawn(async move {
+        server.run().await.ok();
+    });
+    sleep(Duration::from_millis(500)).await;
+
+    let mut packet = create_access_request("psuser", "pspass", b"testing123", 1);
+    let expected = add_three_proxy_states(&mut packet);
+
+    let response = send_radius_request(&packet, server_addr)
+        .await
+        .expect("send");
+
+    assert_eq!(response.code, Code::AccessAccept);
+    assert_eq!(extract_proxy_states(&response), expected);
+}
+
+#[tokio::test]
+async fn test_proxy_state_echoed_on_access_reject() {
+    let mut config = Config::default();
+    config.listen_address = "127.0.0.1".to_string();
+    config.listen_port = 0;
+    config.secret = "testing123".to_string();
+
+    let mut handler = SimpleAuthHandler::new();
+    handler.add_user("psuser", "rightpass");
+
+    let server_config = ServerConfig::from_config(config, Arc::new(handler))
+        .expect("server config");
+    let server = RadiusServer::new(server_config).await.expect("server");
+    let server_addr = server.local_addr().expect("server addr");
+
+    tokio::spawn(async move {
+        server.run().await.ok();
+    });
+    sleep(Duration::from_millis(500)).await;
+
+    // Wrong password forces Access-Reject.
+    let mut packet = create_access_request("psuser", "wrongpass", b"testing123", 2);
+    let expected = add_three_proxy_states(&mut packet);
+
+    let response = send_radius_request(&packet, server_addr)
+        .await
+        .expect("send");
+
+    assert_eq!(response.code, Code::AccessReject);
+    assert_eq!(extract_proxy_states(&response), expected);
+}
+
+#[tokio::test]
+async fn test_proxy_state_echoed_on_access_challenge() {
+    let mut config = Config::default();
+    config.listen_address = "127.0.0.1".to_string();
+    config.listen_port = 0;
+    config.secret = "testing123".to_string();
+
+    let mut handler = ChallengeAuthHandler::new();
+    handler.add_user("challengeuser", "password");
+
+    let server_config = ServerConfig::from_config(config, Arc::new(handler))
+        .expect("server config");
+    let server = RadiusServer::new(server_config).await.expect("server");
+    let server_addr = server.local_addr().expect("server addr");
+
+    tokio::spawn(async move {
+        server.run().await.ok();
+    });
+    sleep(Duration::from_millis(500)).await;
+
+    let mut packet = create_access_request("challengeuser", "password", b"testing123", 3);
+    let expected = add_three_proxy_states(&mut packet);
+
+    let response = send_radius_request(&packet, server_addr)
+        .await
+        .expect("send");
+
+    assert_eq!(response.code, Code::AccessChallenge);
+    assert_eq!(extract_proxy_states(&response), expected);
+}
+
+#[tokio::test]
+async fn test_proxy_state_echoed_on_accounting_response() {
+    let mut config = Config::default();
+    config.listen_address = "127.0.0.1".to_string();
+    config.listen_port = 0;
+
+    let auth_handler = SimpleAuthHandler::new();
+    let acct_impl = Arc::new(SimpleAccountingHandler::new());
+    let acct_handler = acct_impl.clone() as Arc<dyn AccountingHandler>;
+
+    let server_config = ServerConfig::from_config(config, Arc::new(auth_handler))
+        .expect("server config")
+        .with_accounting_handler(acct_handler);
+    let server = RadiusServer::new(server_config).await.expect("server");
+    let server_addr = server.local_addr().expect("server addr");
+
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    sleep(Duration::from_millis(100)).await;
+
+    let secret = b"testing123";
+    let mut packet =
+        create_accounting_request(AcctStatusType::Start, "session-proxy-1", "psuser", 4, secret);
+    let expected = add_three_proxy_states(&mut packet);
+    // Recompute Accounting Request authenticator after adding Proxy-State.
+    packet.authenticator = calculate_accounting_request_authenticator(&packet, secret);
+
+    let response = send_radius_request(&packet, server_addr)
+        .await
+        .expect("send");
+
+    assert_eq!(response.code, Code::AccountingResponse);
+    assert_eq!(extract_proxy_states(&response), expected);
+}
+
+/// Server-added Proxy-State (e.g. by a downstream proxy on the request leg)
+/// must come *after* the client's existing Proxy-State, and the response
+/// must still preserve the original client order in the echo. This pins the
+/// invariant that `add_attribute` appends — not prepends — and that the
+/// echo loop iterates `request.attributes` in receive order.
+#[tokio::test]
+async fn test_proxy_state_order_preserved_with_many_values() {
+    let mut config = Config::default();
+    config.listen_address = "127.0.0.1".to_string();
+    config.listen_port = 0;
+    config.secret = "testing123".to_string();
+
+    let mut handler = SimpleAuthHandler::new();
+    handler.add_user("psuser", "pspass");
+
+    let server_config = ServerConfig::from_config(config, Arc::new(handler))
+        .expect("server config");
+    let server = RadiusServer::new(server_config).await.expect("server");
+    let server_addr = server.local_addr().expect("server addr");
+
+    tokio::spawn(async move {
+        server.run().await.ok();
+    });
+    sleep(Duration::from_millis(500)).await;
+
+    // Use distinguishable byte payloads so a swap or reordering would be
+    // caught by the equality assertion (not just a length match).
+    let values: Vec<Vec<u8>> = (0u8..7)
+        .map(|i| vec![0xC0, 0xFF, 0xEE, i, i.wrapping_mul(3)])
+        .collect();
+
+    let mut packet = create_access_request("psuser", "pspass", b"testing123", 5);
+    for v in &values {
+        packet.add_attribute(
+            Attribute::new(AttributeType::ProxyState as u8, v.clone())
+                .expect("Proxy-State attribute"),
+        );
+    }
+
+    let response = send_radius_request(&packet, server_addr)
+        .await
+        .expect("send");
+
+    assert_eq!(response.code, Code::AccessAccept);
+    assert_eq!(extract_proxy_states(&response), values);
+}

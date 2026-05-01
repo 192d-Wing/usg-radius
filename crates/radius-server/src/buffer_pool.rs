@@ -99,13 +99,16 @@ impl BufferPool {
 
     /// Acquire a buffer from the pool
     ///
-    /// If the pool is empty, allocates a new buffer.
+    /// If the pool is empty, allocates a new buffer. Returned buffers have
+    /// `len() == buffer_size` so callers can pass them to `recv_from` and
+    /// similar APIs that write into a `&mut [u8]` derived from the Vec's
+    /// length (not capacity) — `Vec::with_capacity` alone leaves `len == 0`.
     pub async fn acquire(self: &Arc<Self>) -> PooledBuffer {
         let mut pool = self.buffers.lock().await;
-        let buffer = pool.pop().unwrap_or_else(|| {
-            // Allocate new buffer if pool is empty
-            Vec::with_capacity(self.buffer_size)
-        });
+        let mut buffer = pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(self.buffer_size));
+        buffer.resize(self.buffer_size, 0);
 
         PooledBuffer {
             buffer,
@@ -127,14 +130,12 @@ mod tests {
     async fn test_buffer_pool_acquire_and_return() {
         let pool = BufferPool::new(4096, 10);
 
-        // Acquire buffer
-        let mut buffer = pool.acquire().await;
-        assert_eq!(buffer.len(), 0);
+        // Acquire buffer. Post-acquire invariant: len == buffer_size so the
+        // buffer can be passed directly to recv_from-style APIs that write
+        // into a `&mut [u8]` derived from Vec length.
+        let buffer = pool.acquire().await;
+        assert_eq!(buffer.len(), 4096);
         assert!(buffer.capacity() >= 4096);
-
-        // Use buffer
-        buffer.as_mut().extend_from_slice(b"test data");
-        assert_eq!(buffer.len(), 9);
 
         // Drop buffer (returns to pool synchronously)
         drop(buffer);
@@ -142,9 +143,9 @@ mod tests {
         // Verify buffer was returned
         assert_eq!(pool.size().await, 1);
 
-        // Acquire again - should reuse
+        // Acquire again - should reuse the same Vec, re-resized to full length
         let buffer2 = pool.acquire().await;
-        assert_eq!(buffer2.len(), 0); // Should be cleared
+        assert_eq!(buffer2.len(), 4096);
         assert_eq!(pool.size().await, 0); // Pool should be empty
     }
 
