@@ -107,25 +107,36 @@ fn validate_access_request(packet: &Packet, _mode: ValidationMode) -> Result<(),
         ));
     }
 
-    // RFC 2865 Section 4.1: Either User-Password or CHAP-Password MUST be present
+    // RFC 2865 §4.1 requires User-Password OR CHAP-Password — but RFC 3579 §3.1
+    // (RADIUS+EAP) carves out an exception: when EAP-Message (attr 79) is
+    // present, neither User-Password nor CHAP-Password may be included.
     let has_user_password = packet
         .find_attribute(AttributeType::UserPassword as u8)
         .is_some();
     let has_chap_password = packet
         .find_attribute(AttributeType::ChapPassword as u8)
         .is_some();
+    let has_eap_message = packet
+        .find_attribute(AttributeType::EapMessage as u8)
+        .is_some();
 
-    if !has_user_password && !has_chap_password {
-        return Err(ValidationError::new(
-            "Either User-Password or CHAP-Password is required in Access-Request",
-        ));
-    }
-
-    // RFC 2865 Section 4.1: User-Password and CHAP-Password MUST NOT both be present
-    if has_user_password && has_chap_password {
-        return Err(ValidationError::new(
-            "User-Password and CHAP-Password cannot both be present in Access-Request",
-        ));
+    if has_eap_message {
+        if has_user_password || has_chap_password {
+            return Err(ValidationError::new(
+                "EAP-Message is present; User-Password/CHAP-Password MUST NOT be included (RFC 3579 §3.1)",
+            ));
+        }
+    } else {
+        if !has_user_password && !has_chap_password {
+            return Err(ValidationError::new(
+                "Either User-Password, CHAP-Password, or EAP-Message is required in Access-Request",
+            ));
+        }
+        if has_user_password && has_chap_password {
+            return Err(ValidationError::new(
+                "User-Password and CHAP-Password cannot both be present in Access-Request",
+            ));
+        }
     }
 
     // RFC 2865 Section 5.32 & 5.4: Either NAS-IP-Address or NAS-Identifier MUST be present
@@ -486,8 +497,42 @@ mod tests {
             result
                 .unwrap_err()
                 .message
-                .contains("User-Password or CHAP-Password is required")
+                .contains("User-Password, CHAP-Password, or EAP-Message is required")
         );
+    }
+
+    #[test]
+    fn test_validate_access_request_eap_message_no_password() {
+        // RFC 3579 §3.1: EAP-Message satisfies the credential requirement;
+        // User-Password / CHAP-Password MUST NOT be present.
+        let mut packet = Packet::new(Code::AccessRequest, 1, [0u8; 16]);
+        packet.add_attribute(Attribute::string(AttributeType::UserName as u8, "test").unwrap());
+        packet.add_attribute(
+            Attribute::new(AttributeType::EapMessage as u8, vec![0x02, 0x00, 0x00, 0x05, 0x01])
+                .unwrap(),
+        );
+        packet.add_attribute(
+            Attribute::new(AttributeType::NasIpAddress as u8, vec![127, 0, 0, 1]).unwrap(),
+        );
+        assert!(validate_packet(&packet, ValidationMode::Lenient).is_ok());
+    }
+
+    #[test]
+    fn test_validate_access_request_eap_with_password_rejected() {
+        let mut packet = Packet::new(Code::AccessRequest, 1, [0u8; 16]);
+        packet.add_attribute(Attribute::string(AttributeType::UserName as u8, "test").unwrap());
+        packet.add_attribute(
+            Attribute::new(AttributeType::EapMessage as u8, vec![0x02, 0x00, 0x00, 0x05, 0x01])
+                .unwrap(),
+        );
+        packet.add_attribute(
+            Attribute::new(AttributeType::NasIpAddress as u8, vec![127, 0, 0, 1]).unwrap(),
+        );
+        packet.add_attribute(
+            Attribute::new(AttributeType::UserPassword as u8, vec![0u8; 16]).unwrap(),
+        );
+        let err = validate_packet(&packet, ValidationMode::Lenient).unwrap_err();
+        assert!(err.message.contains("MUST NOT be included"));
     }
 
     #[test]
