@@ -33,3 +33,11 @@ config.json
 # Log files
 *.log
 /var/log/
+# Local TLS test material — NEVER commit private keys.
+certs/
+*.pem
+*.key
+*.srl
+
+# Local test scratch
+examples/configs/local-test.json
