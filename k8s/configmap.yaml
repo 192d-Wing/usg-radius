@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: usg-radius-config
+  namespace: usg-radius
+data:
+  config.json: |
+    {
+      "listen_address": "::",
+      "listen_port": 1812,
+      "secret": "${RADIUS_SECRET}",
+      "clients": [
+        {
+          "address": "10.0.0.0/8",
+          "secret": "${CLIENT_1_SECRET}",
+          "name": "cluster-network",
+          "enabled": true
+        }
+      ],
+      "users": [
+        {
+          "username": "admin",
+          "password": "${ADMIN_PASSWORD}",
+          "attributes": {}
+        }
+      ],
+      "log_level": "info",
+      "audit_log_path": "stdout",
+      "strict_rfc_compliance": true,
+      "request_cache_ttl": 60,
+      "request_cache_max_entries": 10000,
+      "rate_limit_per_client_rps": 100,
+      "rate_limit_per_client_burst": 200,
+      "rate_limit_global_rps": 1000,
+      "rate_limit_global_burst": 2000,
+      "eap": {
+        "tls": {
+          "cert_path": "/etc/radius/certs/server.pem",
+          "key_path": "/etc/radius/certs/server-key.pem",
+          "ca_path": "/etc/radius/certs/ca.pem",
+          "require_client_cert": false
+        },
+        "enable_tls": true,
+        "enable_teap": true
+      }
+    }

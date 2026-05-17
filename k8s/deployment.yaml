@@ -1,0 +1,138 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: usg-radius
+  namespace: usg-radius
+  labels:
+    app: usg-radius
+spec:
+  # Safe to scale once shared Valkey state is in use (sessions, cache,
+  # rate-limit counters). For EAP/TEAP traffic, ensure the Service uses
+  # externalTrafficPolicy: Local so a given client's UDP packets land on
+  # one pod consistently (see service.yaml).
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: usg-radius
+  template:
+    metadata:
+      labels:
+        app: usg-radius
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 30
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: usg-radius
+          image: ghcr.io/192d-cyberspace-control-squadron/usg-radius:0.7.0
+          imagePullPolicy: IfNotPresent
+          args: ["/etc/radius/config.json"]
+          env:
+            - name: RUST_LOG
+              value: "info"
+            - name: HEALTH_LISTEN_ADDR
+              value: "0.0.0.0:8080"
+            # Valkey backend for shared state (HA feature)
+            - name: VALKEY_URL
+              value: "redis://valkey.usg-radius.svc.cluster.local:6379"
+            # Secrets consumed by ${VAR} interpolation in config.json
+            - name: RADIUS_SECRET
+              valueFrom:
+                secretKeyRef: { name: usg-radius-secrets, key: RADIUS_SECRET }
+            - name: CLIENT_1_SECRET
+              valueFrom:
+                secretKeyRef: { name: usg-radius-secrets, key: CLIENT_1_SECRET }
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: usg-radius-secrets, key: ADMIN_PASSWORD }
+          ports:
+            - name: radius-auth
+              containerPort: 1812
+              protocol: UDP
+            - name: radius-acct
+              containerPort: 1813
+              protocol: UDP
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          startupProbe:
+            httpGet: { path: /healthz, port: health }
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+              ephemeral-storage: 64Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+              ephemeral-storage: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/radius/config.json
+              subPath: config.json
+              readOnly: true
+            - name: certs
+              mountPath: /etc/radius/certs
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: usg-radius-config
+        - name: certs
+          secret:
+            secretName: usg-radius-tls
+            defaultMode: 0440
+        - name: tmp
+          emptyDir: {}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: usg-radius
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: usg-radius
+  namespace: usg-radius
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: usg-radius

@@ -1,0 +1,90 @@
+# MetalLB configuration for usg-radius — BGP mode, dual-stack (IPv4 + IPv6) VIPs.
+#
+# Prerequisite: MetalLB v0.13+ installed cluster-wide (namespace: metallb-system),
+# typically via:
+#   kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.8/config/manifests/metallb-native.yaml
+#
+# These CRs live in the metallb-system namespace, NOT usg-radius.
+# Replace placeholders (ASNs, peer IPs, VIP ranges) with values from your network team.
+
+---
+# IPv4 BGP peer (typically your ToR / spine switch or upstream router)
+apiVersion: metallb.io/v1beta2
+kind: BGPPeer
+metadata:
+  name: tor-v4
+  namespace: metallb-system
+spec:
+  myASN: 64512                 # MetalLB's ASN (private range; coordinate with netops)
+  peerASN: 64500               # upstream router ASN
+  peerAddress: 192.0.2.1       # IPv4 of the BGP peer (ToR/spine)
+  # password: "REPLACE_ME"     # MD5 auth if required
+  # bfdProfile: default        # enable if BFD is configured
+  # ebgpMultiHop: false        # set true only if the peer is >1 hop away
+
+---
+# IPv6 BGP peer — separate session for v6 family. Some fabrics carry v6 NLRI
+# over the v4 session via multiprotocol BGP; in that case omit this and add
+# the v6 pool to the v4 peer's advertisement instead.
+apiVersion: metallb.io/v1beta2
+kind: BGPPeer
+metadata:
+  name: tor-v6
+  namespace: metallb-system
+spec:
+  myASN: 64512
+  peerASN: 64500
+  peerAddress: 2001:db8:f00d::1
+
+---
+# IPv4 VIP pool for RADIUS services
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: radius-v4
+  namespace: metallb-system
+spec:
+  addresses:
+    - 192.0.2.100-192.0.2.110  # adjust to your assigned VIP range
+  autoAssign: false            # only the Service that explicitly requests this pool gets a VIP
+
+---
+# IPv6 VIP pool for RADIUS services
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: radius-v6
+  namespace: metallb-system
+spec:
+  addresses:
+    - 2001:db8:radius::100-2001:db8:radius::110
+  autoAssign: false
+
+---
+# Advertise the IPv4 pool over BGP
+apiVersion: metallb.io/v1beta1
+kind: BGPAdvertisement
+metadata:
+  name: radius-v4
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - radius-v4
+  peers:
+    - tor-v4
+  # aggregationLength: 32      # advertise /32 host routes (default for v4)
+  # communities: ["64512:100"] # tag for upstream policy if needed
+
+---
+# Advertise the IPv6 pool over BGP
+apiVersion: metallb.io/v1beta1
+kind: BGPAdvertisement
+metadata:
+  name: radius-v6
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - radius-v6
+  peers:
+    - tor-v6
+  # aggregationLengthV6: 128   # advertise /128 host routes (default for v6)

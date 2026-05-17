@@ -1,0 +1,39 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: usg-radius
+  namespace: usg-radius
+spec:
+  podSelector:
+    matchLabels:
+      app: usg-radius
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - ports:
+        - protocol: UDP
+          port: 1812
+        - protocol: UDP
+          port: 1813
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Valkey backend
+    - to:
+        - podSelector:
+            matchLabels:
+              app: valkey
+      ports:
+        - protocol: TCP
+          port: 6379
+    # LDAP / PostgreSQL / proxy upstreams - add as needed.
