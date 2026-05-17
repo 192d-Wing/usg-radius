@@ -1,4 +1,5 @@
 use clap::Parser;
+use radius_server::server::AuthHandler;
 use radius_server::{Config, RadiusServer, ServerConfig, SimpleAuthHandler};
 use std::process;
 use std::sync::Arc;
@@ -143,8 +144,50 @@ async fn main() {
         }
     }
 
+    // If EAP is configured, wrap the SimpleAuthHandler in an EapAuthHandler so the
+    // server speaks EAP-TLS / EAP-TEAP. Otherwise use the plain PAP handler.
+    let handler: Arc<dyn AuthHandler> = match &config.eap {
+        None => Arc::new(auth_handler),
+        Some(eap_cfg) => {
+            #[cfg(not(feature = "tls"))]
+            {
+                let _ = eap_cfg;
+                error!("config.eap is set but the binary was built without the `tls` feature");
+                process::exit(1);
+            }
+            #[cfg(feature = "tls")]
+            {
+                use radius_proto::eap::eap_tls::TlsCertificateConfig;
+                use radius_server::EapAuthHandler;
+
+                let cert_cfg = TlsCertificateConfig::new(
+                    eap_cfg.tls.cert_path.clone(),
+                    eap_cfg.tls.key_path.clone(),
+                    eap_cfg.tls.ca_path.clone(),
+                    eap_cfg.tls.require_client_cert,
+                );
+                let mut eap = EapAuthHandler::new(Arc::new(auth_handler));
+                if eap_cfg.enable_teap {
+                    if let Err(e) = eap.configure_teap("", cert_cfg.clone()) {
+                        error!("Failed to configure EAP-TEAP: {}", e);
+                        process::exit(1);
+                    }
+                    info!("EAP-TEAP enabled (cert: {})", eap_cfg.tls.cert_path);
+                }
+                if eap_cfg.enable_tls {
+                    if let Err(e) = eap.configure_tls("", cert_cfg) {
+                        error!("Failed to configure EAP-TLS: {}", e);
+                        process::exit(1);
+                    }
+                    info!("EAP-TLS enabled (cert: {})", eap_cfg.tls.cert_path);
+                }
+                Arc::new(eap)
+            }
+        }
+    };
+
     // Create server configuration with client validation
-    let server_config = match ServerConfig::from_config(config.clone(), Arc::new(auth_handler)) {
+    let server_config = match ServerConfig::from_config(config.clone(), handler) {
         Ok(cfg) => cfg,
         Err(e) => {
             error!("Invalid configuration: {}", e);
@@ -172,9 +215,64 @@ async fn main() {
     info!("Press Ctrl+C to stop");
     info!("");
 
-    // Run server
-    if let Err(e) = server.run().await {
-        error!("Server error: {}", e);
-        process::exit(1);
+    // Spawn a minimal HTTP health server for Kubernetes probes (requires `ha` feature,
+    // which is enabled by default). Bound to HEALTH_LISTEN_ADDR (default 0.0.0.0:8080).
+    #[cfg(feature = "ha")]
+    {
+    let health_addr = std::env::var("HEALTH_LISTEN_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    tokio::spawn(async move {
+        match health_addr.parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                use axum::{routing::get, Router};
+                let app = Router::new()
+                    .route("/healthz", get(|| async { "ok" }))
+                    .route("/readyz", get(|| async { "ok" }))
+                    .route("/livez", get(|| async { "ok" }));
+                match tokio::net::TcpListener::bind(addr).await {
+                    Ok(listener) => {
+                        info!("Health server listening on {}", addr);
+                        if let Err(e) = axum::serve(listener, app).await {
+                            error!("Health server error: {}", e);
+                        }
+                    }
+                    Err(e) => error!("Failed to bind health server on {}: {}", addr, e),
+                }
+            }
+            Err(e) => error!("Invalid HEALTH_LISTEN_ADDR: {}", e),
+        }
+    });
+    }
+
+    // Run server with graceful shutdown on SIGTERM/SIGINT (Kubernetes sends SIGTERM
+    // then waits terminationGracePeriodSeconds before SIGKILL).
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+            tokio::select! {
+                _ = term.recv() => info!("Received SIGTERM, shutting down"),
+                _ = int.recv()  => info!("Received SIGINT, shutting down"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Received Ctrl-C, shutting down");
+        }
+    };
+
+    tokio::select! {
+        res = server.run() => {
+            if let Err(e) = res {
+                error!("Server error: {}", e);
+                process::exit(1);
+            }
+        }
+        _ = shutdown => {
+            info!("Graceful shutdown complete");
+        }
     }
 }

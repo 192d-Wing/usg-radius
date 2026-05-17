@@ -10,7 +10,12 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use tracing::error;
+use tracing::{error, info};
+
+enum AuditSink {
+    File(Arc<Mutex<std::fs::File>>),
+    Stdout,
+}
 
 /// Audit event type
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,49 +124,53 @@ impl AuditEntry {
 }
 
 /// Audit logger
+///
+/// Sinks: a filesystem path, or the literal value `"stdout"` / `"-"` to emit
+/// JSON-Lines on stdout (12-factor / Kubernetes friendly).
 pub struct AuditLogger {
-    /// File path for audit log
     file_path: Option<String>,
-    /// File handle (wrapped in Arc<Mutex> for thread safety)
-    file: Option<Arc<Mutex<std::fs::File>>>,
+    sink: Option<AuditSink>,
 }
 
 impl AuditLogger {
-    /// Create a new audit logger
     pub fn new(file_path: Option<String>) -> std::io::Result<Self> {
-        let file = if let Some(ref path) = file_path {
-            let f = OpenOptions::new().create(true).append(true).open(path)?;
-            Some(Arc::new(Mutex::new(f)))
-        } else {
-            None
+        let sink = match file_path.as_deref() {
+            None => None,
+            Some("stdout") | Some("-") => Some(AuditSink::Stdout),
+            Some(path) => {
+                let f = OpenOptions::new().create(true).append(true).open(path)?;
+                Some(AuditSink::File(Arc::new(Mutex::new(f))))
+            }
         };
-
-        Ok(AuditLogger { file_path, file })
+        Ok(AuditLogger { file_path, sink })
     }
 
-    /// Log an audit entry
     pub async fn log(&self, entry: AuditEntry) {
-        if let Some(ref file) = self.file {
-            match serde_json::to_string(&entry) {
-                Ok(json) => {
-                    let mut f = file.lock().await;
-                    if let Err(e) = writeln!(f, "{}", json) {
-                        error!("Failed to write audit log: {}", e);
-                    }
+        let Some(ref sink) = self.sink else { return };
+        let json = match serde_json::to_string(&entry) {
+            Ok(j) => j,
+            Err(e) => {
+                error!("Failed to serialize audit entry: {}", e);
+                return;
+            }
+        };
+        match sink {
+            AuditSink::File(file) => {
+                let mut f = file.lock().await;
+                if let Err(e) = writeln!(f, "{}", json) {
+                    error!("Failed to write audit log: {}", e);
                 }
-                Err(e) => {
-                    error!("Failed to serialize audit entry: {}", e);
-                }
+            }
+            AuditSink::Stdout => {
+                info!(target: "audit", "{}", json);
             }
         }
     }
 
-    /// Check if audit logging is enabled
     pub fn is_enabled(&self) -> bool {
-        self.file.is_some()
+        self.sink.is_some()
     }
 
-    /// Get the audit log file path
     pub fn file_path(&self) -> Option<&str> {
         self.file_path.as_deref()
     }

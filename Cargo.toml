@@ -114,7 +114,7 @@ name = "radius_load_test"
 path = "tools/radius_load_test.rs"
 
 [features]
-default = []
+default = ["ha"]
 tls = ["radius-proto/tls", "radius-server/tls"]
 ha = ["radius-server/ha"]
 revocation = ["radius-proto/revocation"]
