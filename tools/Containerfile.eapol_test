@@ -1,0 +1,39 @@
+# Build eapol_test from hostap git source with EAP-TEAP support enabled.
+# Distro packages either omit TEAP (Alpine defconfig, Debian wpasupplicant) or
+# ship a broken eapol_test, so we build it ourselves.
+#
+# Build:   podman build -t eapol_test:teap -f tools/Containerfile.eapol_test .
+# Use:     podman run --rm -v ./certs:/certs:Z,ro eapol_test:teap \
+#            -c /certs/teap.conf -a <server> -p 1812 -s <shared_secret>
+
+FROM docker.io/library/alpine:3.20 AS build
+RUN apk add --no-cache build-base linux-headers openssl-dev git
+WORKDIR /src
+RUN git clone --depth 1 --branch hostap_2_11 https://w1.fi/hostap.git
+WORKDIR /src/hostap/wpa_supplicant
+# Minimal .config — just what eapol_test needs. defconfig pulls in dbus,
+# driver backends, etc. that we don't want for a testing tool.
+RUN printf '%s\n' \
+      'CONFIG_DRIVER_NONE=y' \
+      'CONFIG_TLS=openssl' \
+      'CONFIG_TLSV12=y' \
+      'CONFIG_IEEE8021X_EAPOL=y' \
+      'CONFIG_EAP_TEAP=y' \
+      'CONFIG_EAP_TLS=y' \
+      'CONFIG_EAP_PEAP=y' \
+      'CONFIG_EAP_TTLS=y' \
+      'CONFIG_EAP_MSCHAPV2=y' \
+      'CONFIG_EAP_GTC=y' \
+      'CONFIG_EAP_MD5=y' \
+      'CONFIG_EAP_PSK=y' \
+      'CONFIG_EAP_PWD=y' \
+      'CONFIG_EAPOL_TEST=y' \
+      'CONFIG_CTRL_IFACE=unix' \
+      'CONFIG_BACKEND=file' \
+      > .config \
+ && make -j"$(nproc)" eapol_test
+
+FROM docker.io/library/alpine:3.20
+RUN apk add --no-cache openssl
+COPY --from=build /src/hostap/wpa_supplicant/eapol_test /usr/local/bin/eapol_test
+ENTRYPOINT ["/usr/local/bin/eapol_test"]
