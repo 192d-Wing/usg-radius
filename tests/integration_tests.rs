@@ -954,7 +954,7 @@ impl AuthHandler for ChallengeAuthHandler {
             if let Some(pwd) = password
                 && pwd == self.pin
             {
-                return AuthResult::Accept;
+                return AuthResult::accept();
             }
         }
 

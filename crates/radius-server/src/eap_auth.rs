@@ -402,9 +402,14 @@ impl EapAuthHandler {
         AuthResult::Reject
     }
 
-    /// Continue EAP-TLS authentication
+    /// Continue EAP-TLS authentication.
+    ///
+    /// Drives the TLS handshake one EAP round-trip at a time. The peer sends
+    /// either (a) an EAP-TLS ACK — empty payload, signaling "ready for next
+    /// fragment" — or (b) actual TLS data. We handle both by checking the
+    /// per-session outgoing fragment queue first; only when it's drained do we
+    /// feed the incoming bytes to rustls.
     #[cfg(feature = "tls")]
-    #[allow(unused_variables)]
     fn continue_eap_tls(
         &self,
         username: &str,
@@ -412,87 +417,129 @@ impl EapAuthHandler {
         eap_response: &EapPacket,
     ) -> AuthResult {
         let mut tls_sessions = self.tls_sessions.write().unwrap();
+        let Some(tls_server) = tls_sessions.get_mut(session_id) else {
+            error!(session_id, "continue_eap_tls: no TLS session (state expired?)");
+            return AuthResult::Reject;
+        };
 
-        if let Some(tls_server) = tls_sessions.get_mut(session_id) {
-            // Parse EAP-TLS packet from EAP data
-            if let Ok(tls_packet) = EapTlsPacket::from_eap_data(&eap_response.data) {
-                // Process client message
-                match tls_server.process_client_message(&tls_packet) {
-                    Ok(Some(ref response_data)) => {
-                        // Create response packet
-                        let identifier = {
-                            let mut manager = self.session_manager.write().unwrap();
-                            if let Some(session) = manager.get_session_mut(session_id) {
-                                session.next_identifier()
-                            } else {
-                                eap_response.identifier.wrapping_add(1)
-                            }
-                        };
+        // Helper to allocate the next EAP identifier (release the session
+        // manager lock immediately so we don't hold it across the build path).
+        let next_id = || {
+            let mut manager = self.session_manager.write().unwrap();
+            manager
+                .get_session_mut(session_id)
+                .map(|s| s.next_identifier())
+                .unwrap_or_else(|| eap_response.identifier.wrapping_add(1))
+        };
 
-                        // Fragment if needed and create EAP-TLS packets
-                        let fragments =
-                            radius_proto::eap::eap_tls::fragment_tls_message(response_data, 1020);
-
-                        if let Some(first_fragment) = fragments.first() {
-                            let eap_packet = first_fragment.to_eap_request(identifier);
-
-                            if let Ok(eap_attrs) =
-                                radius_proto::eap::eap_to_radius_attributes(&eap_packet)
-                            {
-                                return AuthResult::Challenge {
-                                    message: None,
-                                    state: session_id.as_bytes().to_vec(),
-                                    attributes: eap_attrs,
-                                };
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        // Check if handshake is complete
-                        if tls_server.is_handshake_complete() {
-                            // Extract keys
-                            if tls_server.extract_keys().is_ok() {
-                                // Verify client certificate if mutual TLS
-                                let identity_verified =
-                                    if let Some(_peer_certs) = tls_server.get_peer_certificates() {
-                                        tls_server.verify_peer_identity(username).unwrap_or(false)
-                                    } else {
-                                        true // Server-only auth
-                                    };
-
-                                if identity_verified {
-                                    // Success!
-                                    let identifier = {
-                                        let mut manager = self.session_manager.write().unwrap();
-                                        if let Some(session) = manager.get_session_mut(session_id) {
-                                            let _ = session.transition(EapState::Success);
-                                            session.next_identifier()
-                                        } else {
-                                            eap_response.identifier.wrapping_add(1)
-                                        }
-                                    };
-
-                                    let success_packet = EapPacket::success(identifier);
-
-                                    if let Ok(_eap_attrs) =
-                                        radius_proto::eap::eap_to_radius_attributes(&success_packet)
-                                    {
-                                        // Could add MS-MPPE keys here from MSK
-                                        return AuthResult::Accept;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // TLS error
-                        return AuthResult::Reject;
-                    }
+        // Helper to wrap a single outgoing EAP-TLS fragment into an
+        // Access-Challenge result.
+        let make_challenge = |frag: EapTlsPacket, id: u8| -> Option<AuthResult> {
+            let eap_packet = frag.to_eap_request(id);
+            match radius_proto::eap::eap_to_radius_attributes(&eap_packet) {
+                Ok(attrs) => Some(AuthResult::Challenge {
+                    message: None,
+                    state: session_id.as_bytes().to_vec(),
+                    attributes: attrs,
+                }),
+                Err(e) => {
+                    error!(session_id, error = ?e, "continue_eap_tls: eap_to_radius_attributes failed");
+                    None
                 }
             }
+        };
+
+        // 1) Peer-ACK path: still have queued fragments from a previous round.
+        if tls_server.has_pending_fragments() {
+            let Some(frag) = tls_server.next_outgoing_fragment() else {
+                error!(session_id, "continue_eap_tls: has_pending_fragments lied");
+                return AuthResult::Reject;
+            };
+            let id = next_id();
+            debug!(session_id, identifier = id, "continue_eap_tls: sending next fragment");
+            return make_challenge(frag, id).unwrap_or(AuthResult::Reject);
         }
 
-        AuthResult::Reject
+        // 2) Otherwise: parse the inbound EAP-TLS packet and feed rustls.
+        let tls_packet = match EapTlsPacket::from_eap_data(&eap_response.data) {
+            Ok(p) => p,
+            Err(e) => {
+                error!(session_id, error = ?e, "continue_eap_tls: malformed EAP-TLS packet");
+                return AuthResult::Reject;
+            }
+        };
+
+        match tls_server.process_client_message(&tls_packet) {
+            // Rustls produced outbound TLS data — queue it as fragments and
+            // send the first one. Subsequent rounds will hit the ACK path.
+            Ok(Some(response_data)) => {
+                tls_server.queue_outgoing_tls(response_data, 1020);
+                let Some(frag) = tls_server.next_outgoing_fragment() else {
+                    error!(session_id, "continue_eap_tls: queue produced no fragments");
+                    return AuthResult::Reject;
+                };
+                let id = next_id();
+                debug!(session_id, identifier = id, "continue_eap_tls: sending first fragment of new TLS message");
+                make_challenge(frag, id).unwrap_or(AuthResult::Reject)
+            }
+
+            // No outbound data. Either the handshake just finished, or rustls
+            // is still waiting for more from the peer.
+            Ok(None) => {
+                if !tls_server.is_handshake_complete() {
+                    // Mid-handshake with nothing to send back is wrong — peer
+                    // sent us nothing we could act on.
+                    warn!(
+                        session_id,
+                        "continue_eap_tls: no outbound TLS, handshake incomplete"
+                    );
+                    return AuthResult::Reject;
+                }
+                if tls_server.extract_keys().is_err() {
+                    error!(session_id, "continue_eap_tls: extract_keys failed after handshake");
+                    return AuthResult::Reject;
+                }
+                let identity_verified = if let Some(_peer_certs) = tls_server.get_peer_certificates() {
+                    tls_server.verify_peer_identity(username).unwrap_or(false)
+                } else {
+                    true // server-only authentication
+                };
+                if !identity_verified {
+                    warn!(session_id, username, "continue_eap_tls: peer identity verification failed");
+                    return AuthResult::Reject;
+                }
+
+                // Build an EAP-Success packet and attach it to the Accept as
+                // EAP-Message attribute(s). RFC 3579 §3.3: the server.rs
+                // helper will then add Message-Authenticator before computing
+                // Response-Authenticator.
+                let success_id = {
+                    let mut manager = self.session_manager.write().unwrap();
+                    if let Some(s) = manager.get_session_mut(session_id) {
+                        let _ = s.transition(EapState::Success);
+                        s.next_identifier()
+                    } else {
+                        eap_response.identifier.wrapping_add(1)
+                    }
+                };
+                let success = EapPacket::success(success_id);
+                let attrs = match radius_proto::eap::eap_to_radius_attributes(&success) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        error!(session_id, error = ?e, "continue_eap_tls: failed to wrap EAP-Success");
+                        return AuthResult::Reject;
+                    }
+                };
+                debug!(session_id, username, "continue_eap_tls: handshake complete, EAP-Success");
+                // TODO: derive MS-MPPE keys from the MSK and attach to the Accept.
+                AuthResult::Accept { attributes: attrs }
+            }
+
+            Err(e) => {
+                error!(session_id, error = ?e, "continue_eap_tls: TLS processing error");
+                AuthResult::Reject
+            }
+        }
     }
 
     /// Continue EAP-TEAP authentication
@@ -563,11 +610,14 @@ impl EapAuthHandler {
 
                             let success_packet = EapPacket::success(identifier);
 
-                            if let Ok(_eap_attrs) =
-                                radius_proto::eap::eap_to_radius_attributes(&success_packet)
-                            {
-                                // Could add MS-MPPE keys here from MSK
-                                return AuthResult::Accept;
+                            match radius_proto::eap::eap_to_radius_attributes(&success_packet) {
+                                Ok(eap_attrs) => {
+                                    // Could add MS-MPPE keys here from MSK
+                                    return AuthResult::Accept { attributes: eap_attrs };
+                                }
+                                Err(e) => {
+                                    error!(session_id, error = ?e, "continue_eap_teap: failed to wrap EAP-Success");
+                                }
                             }
                         }
                     }

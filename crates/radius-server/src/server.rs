@@ -120,8 +120,13 @@ pub enum ServerError {
 /// Authentication result for multi-round authentication
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthResult {
-    /// Authentication succeeded
-    Accept,
+    /// Authentication succeeded.
+    ///
+    /// `attributes` are added to the Access-Accept verbatim, on top of any
+    /// the AuthHandler returns from `get_accept_attributes`. EAP methods
+    /// use this to attach the EAP-Success EAP-Message (RFC 3748 §4.2);
+    /// for PAP/CHAP success pass an empty Vec.
+    Accept { attributes: Vec<Attribute> },
     /// Authentication failed
     Reject,
     /// Server needs more information (Access-Challenge)
@@ -133,6 +138,14 @@ pub enum AuthResult {
         /// Additional attributes to include in challenge
         attributes: Vec<Attribute>,
     },
+}
+
+impl AuthResult {
+    /// Shorthand for `AuthResult::Accept { attributes: vec![] }` — use when
+    /// the response carries no protocol-specific attributes (typical PAP/CHAP).
+    pub fn accept() -> Self {
+        AuthResult::Accept { attributes: Vec::new() }
+    }
 }
 
 /// Authentication handler trait
@@ -192,7 +205,7 @@ pub trait AuthHandler: Send + Sync {
         // Default implementation: simple PAP authentication
         if let Some(pwd) = password {
             if self.authenticate(username, pwd) {
-                AuthResult::Accept
+                AuthResult::accept()
             } else {
                 AuthResult::Reject
             }
@@ -1142,7 +1155,7 @@ impl RadiusServer {
                 .auth_handler
                 .authenticate_chap(&username, &chap_response, &challenge)
             {
-                AuthResult::Accept
+                AuthResult::accept()
             } else {
                 AuthResult::Reject
             }
@@ -1159,7 +1172,7 @@ impl RadiusServer {
 
         // Handle authentication result
         match auth_result {
-            AuthResult::Accept => {
+            AuthResult::Accept { attributes: extra_attrs } => {
                 info!(
                     username = %username,
                     client_ip = %source_ip,
@@ -1190,6 +1203,12 @@ impl RadiusServer {
 
                 // Add attributes from auth handler
                 for attr in config.auth_handler.get_accept_attributes(&username) {
+                    response.add_attribute(attr);
+                }
+
+                // Plus any extra attributes the AuthResult carries
+                // (e.g., EAP-Success EAP-Message from an EAP handler).
+                for attr in extra_attrs {
                     response.add_attribute(attr);
                 }
 
