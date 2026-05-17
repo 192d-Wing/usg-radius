@@ -16,7 +16,7 @@ use radius_proto::auth::{
     calculate_accounting_request_authenticator, calculate_response_authenticator,
     decrypt_user_password,
 };
-use radius_proto::verify_message_authenticator;
+use radius_proto::{calculate_message_authenticator, verify_message_authenticator};
 use radius_proto::{
     ChapChallenge, ChapResponse, Code, Packet, PacketError, ValidationMode, validate_packet,
     verify_chap_response,
@@ -41,6 +41,60 @@ fn copy_proxy_state(request: &Packet, response: &mut Packet) {
             response.add_attribute(attr.clone());
         }
     }
+}
+
+/// RFC 3579 §3.2: every Access-Accept / Access-Challenge / Access-Reject that
+/// carries an EAP-Message attribute MUST also include a valid
+/// Message-Authenticator. Computed per RFC 2869 §5.14: HMAC-MD5 over the full
+/// packet bytes with the Authenticator field set to the *request* Authenticator
+/// and the Message-Authenticator attribute value set to all zeros.
+///
+/// This function appends a zeroed Message-Authenticator attribute (if EAP-Message
+/// is present and no MA already exists), computes the HMAC, and patches the value
+/// in place. Must be called BEFORE calculate_response_authenticator so that
+/// Response-Authenticator covers the final MA bytes.
+fn add_message_authenticator_if_eap(
+    response: &mut Packet,
+    request_authenticator: &[u8; 16],
+    secret: &[u8],
+) -> Result<(), PacketError> {
+    let has_eap = response
+        .attributes
+        .iter()
+        .any(|a| a.attr_type == AttributeType::EapMessage as u8);
+    if !has_eap {
+        return Ok(());
+    }
+    let already_has_ma = response
+        .attributes
+        .iter()
+        .any(|a| a.attr_type == AttributeType::MessageAuthenticator as u8);
+    if !already_has_ma {
+        response.add_attribute(
+            radius_proto::Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16])?,
+        );
+    }
+
+    // Build the HMAC input: same as on-wire bytes but with Authenticator =
+    // request.authenticator. Packet::encode() writes self.authenticator, so
+    // swap it in temporarily.
+    let original_auth = response.authenticator;
+    response.authenticator = *request_authenticator;
+    let packet_bytes = response.encode()?;
+    response.authenticator = original_auth;
+
+    let mac = calculate_message_authenticator(&packet_bytes, secret);
+
+    // Patch the MA attribute value (it's the last one we added, but search to be
+    // safe in case caller already added other attrs after it).
+    if let Some(ma_attr) = response
+        .attributes
+        .iter_mut()
+        .find(|a| a.attr_type == AttributeType::MessageAuthenticator as u8)
+    {
+        ma_attr.value = mac.to_vec();
+    }
+    Ok(())
 }
 
 #[derive(Error, Debug)]
@@ -1141,6 +1195,16 @@ impl RadiusServer {
 
                 copy_proxy_state(request, &mut response);
 
+                // RFC 3579 §3.2: add Message-Authenticator if response carries
+                // EAP-Message. Must happen BEFORE Response-Authenticator so the
+                // latter covers the final MA bytes.
+                add_message_authenticator_if_eap(
+                    &mut response,
+                    &request.authenticator,
+                    secret,
+                )
+                .map_err(|_| ServerError::AuthFailed)?;
+
                 // Calculate and set Response Authenticator using client-specific secret
                 let response_auth =
                     calculate_response_authenticator(&response, &request.authenticator, secret);
@@ -1190,6 +1254,16 @@ impl RadiusServer {
 
                 copy_proxy_state(request, &mut response);
 
+                // RFC 3579 §3.2: add Message-Authenticator if response carries
+                // EAP-Message. Must happen BEFORE Response-Authenticator so the
+                // latter covers the final MA bytes.
+                add_message_authenticator_if_eap(
+                    &mut response,
+                    &request.authenticator,
+                    secret,
+                )
+                .map_err(|_| ServerError::AuthFailed)?;
+
                 // Calculate and set Response Authenticator using client-specific secret
                 let response_auth =
                     calculate_response_authenticator(&response, &request.authenticator, secret);
@@ -1233,6 +1307,16 @@ impl RadiusServer {
                 }
 
                 copy_proxy_state(request, &mut response);
+
+                // RFC 3579 §3.2: add Message-Authenticator if response carries
+                // EAP-Message. Must happen BEFORE Response-Authenticator so the
+                // latter covers the final MA bytes.
+                add_message_authenticator_if_eap(
+                    &mut response,
+                    &request.authenticator,
+                    secret,
+                )
+                .map_err(|_| ServerError::AuthFailed)?;
 
                 // Calculate and set Response Authenticator using client-specific secret
                 let response_auth =

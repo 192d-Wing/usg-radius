@@ -10,6 +10,7 @@ use radius_proto::eap::{EapPacket, EapSessionManager, EapState, EapType};
 use radius_proto::{Attribute, Packet};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use tracing::{debug, error, warn};
 
 use crate::server::{AuthHandler, AuthResult};
 
@@ -206,32 +207,60 @@ impl EapAuthHandler {
         session_id
     }
 
-    /// Handle EAP-Identity exchange
+    /// Handle EAP-Identity exchange.
+    ///
+    /// Decides which EAP method to propose to the peer based on what was
+    /// configured: prefers EAP-TEAP when a TEAP TLS context exists, falls
+    /// back to EAP-TLS, then EAP-MD5. The session-manager write lock is
+    /// released before calling `start_eap_*` because those methods reacquire
+    /// the same lock to bump the identifier counter — std::sync::RwLock is
+    /// not reentrant.
     fn handle_identity(&self, username: &str, session_id: &str) -> AuthResult {
-        let mut manager = self.session_manager.write().unwrap();
+        // Pick the preferred method up-front so we can release the session
+        // lock before calling start_eap_*.
+        #[cfg(feature = "tls")]
+        let preferred = {
+            let configs = self.tls_configs.read().unwrap();
+            if configs.keys().any(|k| k.starts_with("teap_")) {
+                Some(EapType::Teap)
+            } else if configs.contains_key("") {
+                Some(EapType::Tls)
+            } else {
+                None
+            }
+        };
+        #[cfg(not(feature = "tls"))]
+        let preferred = Some(EapType::Md5Challenge);
 
-        if let Some(session) = manager.get_session_mut(session_id) {
+        // Mutate session state, then drop the lock.
+        {
+            let mut manager = self.session_manager.write().unwrap();
+            let Some(session) = manager.get_session_mut(session_id) else {
+                warn!(session_id, "handle_identity: session not found");
+                return AuthResult::Reject;
+            };
             session.identity = Some(username.to_string());
             let _ = session.transition(EapState::IdentityReceived);
-
-            // Request EAP method
             let _ = session.transition(EapState::MethodRequested);
+            session.eap_method = preferred;
+        } // session_manager write lock released here
 
-            // For now, default to EAP-TLS if available, otherwise EAP-MD5
+        debug!(username, session_id, method = ?preferred, "handle_identity dispatch");
+
+        match preferred {
             #[cfg(feature = "tls")]
-            {
-                session.eap_method = Some(EapType::Tls);
-                return self.start_eap_tls(username, session_id);
-            }
-
+            Some(EapType::Teap) => self.start_eap_teap(username, session_id),
+            #[cfg(feature = "tls")]
+            Some(EapType::Tls) => self.start_eap_tls(username, session_id),
             #[cfg(not(feature = "tls"))]
-            {
-                session.eap_method = Some(EapType::Md5Challenge);
-                return self.start_eap_md5(username, session_id);
+            Some(EapType::Md5Challenge) => self.start_eap_md5(username, session_id),
+            _ => {
+                error!(
+                    "handle_identity: no EAP method configured (configure_tls / configure_teap not called)"
+                );
+                AuthResult::Reject
             }
         }
-
-        AuthResult::Reject
     }
 
     /// Start EAP-MD5 Challenge authentication
@@ -245,49 +274,55 @@ impl EapAuthHandler {
     /// Start EAP-TLS authentication
     #[cfg(feature = "tls")]
     fn start_eap_tls(&self, _username: &str, session_id: &str) -> AuthResult {
-        // Get TLS config for user's realm (or default)
         let configs = self.tls_configs.read().unwrap();
-        let tls_config = configs.get("").or_else(|| configs.values().next());
+        let Some(config) = configs.get("").or_else(|| configs.values().next()) else {
+            error!(session_id, "start_eap_tls: no TLS config registered");
+            return AuthResult::Reject;
+        };
+        let config = StdArc::clone(config);
+        drop(configs);
 
-        if let Some(config) = tls_config {
-            // Create EAP-TLS server for this session
-            let mut tls_server = EapTlsServer::new(StdArc::clone(config));
-
-            if tls_server.initialize_connection().is_ok() {
-                // Store TLS session
-                let mut tls_sessions = self.tls_sessions.write().unwrap();
-                tls_sessions.insert(session_id.to_string(), tls_server);
-
-                // Create EAP-TLS Start packet
-                let start_packet = EapTlsPacket::start();
-                let identifier = {
-                    let mut manager = self.session_manager.write().unwrap();
-                    if let Some(session) = manager.get_session_mut(session_id) {
-                        session.next_identifier()
-                    } else {
-                        0
-                    }
-                };
-
-                let eap_packet = start_packet.to_eap_request(identifier);
-
-                // Convert EAP packet to RADIUS attributes
-                if let Ok(eap_attrs) = radius_proto::eap::eap_to_radius_attributes(&eap_packet) {
-                    return AuthResult::Challenge {
-                        message: Some("EAP-TLS authentication".to_string()),
-                        state: session_id.as_bytes().to_vec(),
-                        attributes: eap_attrs,
-                    };
-                }
-            }
+        let mut tls_server = EapTlsServer::new(config);
+        if let Err(e) = tls_server.initialize_connection() {
+            error!(session_id, error = ?e, "start_eap_tls: initialize_connection failed");
+            return AuthResult::Reject;
         }
 
-        AuthResult::Reject
+        {
+            let mut tls_sessions = self.tls_sessions.write().unwrap();
+            tls_sessions.insert(session_id.to_string(), tls_server);
+        }
+
+        let identifier = {
+            let mut manager = self.session_manager.write().unwrap();
+            match manager.get_session_mut(session_id) {
+                Some(s) => s.next_identifier(),
+                None => {
+                    error!(session_id, "start_eap_tls: session vanished before identifier bump");
+                    return AuthResult::Reject;
+                }
+            }
+        };
+
+        let eap_packet = EapTlsPacket::start().to_eap_request(identifier);
+        match radius_proto::eap::eap_to_radius_attributes(&eap_packet) {
+            Ok(eap_attrs) => {
+                debug!(session_id, identifier, "start_eap_tls: sending EAP-TLS Start");
+                AuthResult::Challenge {
+                    message: Some("EAP-TLS authentication".to_string()),
+                    state: session_id.as_bytes().to_vec(),
+                    attributes: eap_attrs,
+                }
+            }
+            Err(e) => {
+                error!(session_id, error = ?e, "start_eap_tls: eap_to_radius_attributes failed");
+                AuthResult::Reject
+            }
+        }
     }
 
     /// Start EAP-TEAP authentication
     #[cfg(feature = "tls")]
-    #[allow(dead_code)]
     fn start_eap_teap(&self, username: &str, session_id: &str) -> AuthResult {
         // Get TEAP TLS config for user's realm (or default)
         let configs = self.tls_configs.read().unwrap();
@@ -344,13 +379,24 @@ impl EapAuthHandler {
             );
 
             // Convert EAP packet to RADIUS attributes
-            if let Ok(eap_attrs) = radius_proto::eap::eap_to_radius_attributes(&eap_packet) {
-                return AuthResult::Challenge {
-                    message: Some("EAP-TEAP authentication".to_string()),
-                    state: session_id.as_bytes().to_vec(),
-                    attributes: eap_attrs,
-                };
+            match radius_proto::eap::eap_to_radius_attributes(&eap_packet) {
+                Ok(eap_attrs) => {
+                    debug!(session_id, identifier, "start_eap_teap: sending EAP-TEAP Start");
+                    return AuthResult::Challenge {
+                        message: Some("EAP-TEAP authentication".to_string()),
+                        state: session_id.as_bytes().to_vec(),
+                        attributes: eap_attrs,
+                    };
+                }
+                Err(e) => {
+                    error!(session_id, error = ?e, "start_eap_teap: eap_to_radius_attributes failed");
+                }
             }
+        } else {
+            error!(
+                session_id,
+                "start_eap_teap: no TEAP TLS config registered (configure_teap was never called)"
+            );
         }
 
         AuthResult::Reject
@@ -603,16 +649,36 @@ impl AuthHandler for EapAuthHandler {
                 #[cfg(feature = "tls")]
                 {
                     match eap_packet.eap_type {
+                        // First inbound EAP packet: peer's EAP-Response/Identity.
+                        // Start the configured method (TEAP > TLS > MD5).
+                        Some(EapType::Identity) => {
+                            self.handle_identity(&username, &session_id)
+                        }
                         Some(EapType::Tls) => {
                             self.continue_eap_tls(&username, &session_id, &eap_packet)
                         }
                         Some(EapType::Teap) => {
                             self.continue_eap_teap(&username, &session_id, &eap_packet)
                         }
-                        _ => {
-                            // Unknown or unsupported EAP type
-                            // Try TLS as fallback
-                            self.continue_eap_tls(&username, &session_id, &eap_packet)
+                        // RFC 3748 §5.3.1: EAP-Nak (legacy=type 3 / expanded=254)
+                        // means the peer rejected our proposed method and suggests
+                        // alternatives in the data payload. TODO: honor the
+                        // suggestion; for now reject with a logged reason so the
+                        // failure is debuggable instead of silent.
+                        Some(EapType::Nak) => {
+                            warn!(
+                                username, session_id,
+                                proposed = ?eap_packet.data,
+                                "EAP-Nak received from peer; method negotiation not yet implemented"
+                            );
+                            AuthResult::Reject
+                        }
+                        other => {
+                            warn!(
+                                username, session_id, eap_type = ?other,
+                                "Unsupported EAP type from peer"
+                            );
+                            AuthResult::Reject
                         }
                     }
                 }
