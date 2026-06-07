@@ -1,8 +1,4 @@
 # cargo-audit configuration.
-#
-# The advisories below are ignored with justification. Both are transitive,
-# feature-gated dependencies that are NOT compiled into anything this project
-# ships, and neither has a fix available via a dependency update.
 [advisories]
 ignore = [
     # rsa "Marvin Attack" timing side-channel. `rsa` is pulled ONLY by the
@@ -11,11 +7,4 @@ ignore = [
     # so the MySQL driver and `rsa` are never compiled. There is also no patched
     # release of `rsa` available upstream. `cargo tree -i rsa` is empty.
     "RUSTSEC-2023-0071",
-
-    # rustls-pemfile is unmaintained (superseded by rustls-pki-types). It is pulled
-    # ONLY by the optional `tls` feature (EAP-TLS), which is not enabled in the
-    # shipped container image (built with --features observability). 2.2.0 is the
-    # final release, so there is nothing to update to; migrating off it is tracked
-    # separately. This is an informational "unmaintained" warning, not a vulnerability.
-    "RUSTSEC-2025-0134",
 ]

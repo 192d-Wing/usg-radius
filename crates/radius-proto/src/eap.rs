@@ -1092,9 +1092,11 @@ pub mod eap_tls {
             EapError::IoError(format!("Failed to open certificate file '{}': {}", path, e))
         })?;
 
+        use pki_types::{CertificateDer, pem::PemObject};
+
         let mut reader = BufReader::new(file);
 
-        let certs = rustls_pemfile::certs(&mut reader)
+        let certs = CertificateDer::pem_reader_iter(&mut reader)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| {
                 EapError::CertificateError(format!("Failed to parse certificates: {}", e))
@@ -1136,13 +1138,19 @@ pub mod eap_tls {
         let file = File::open(path)
             .map_err(|e| EapError::IoError(format!("Failed to open key file '{}': {}", path, e)))?;
 
+        use pki_types::{PrivateKeyDer, pem::PemObject};
+
         let mut reader = BufReader::new(file);
 
-        // Try to read any private key (PKCS#8, RSA, EC, etc.)
-        let key = rustls_pemfile::private_key(&mut reader)
-            .map_err(|e| EapError::CertificateError(format!("Failed to parse private key: {}", e)))?
+        // Read the first private key (PKCS#8, RSA, or SEC1/EC). `None` means no
+        // private key section was present; `Some(Err(_))` means a parse failure.
+        let key = PrivateKeyDer::pem_reader_iter(&mut reader)
+            .next()
             .ok_or_else(|| {
                 EapError::CertificateError(format!("No private key found in '{}'", path))
+            })?
+            .map_err(|e| {
+                EapError::CertificateError(format!("Failed to parse private key: {}", e))
             })?;
 
         Ok(key.secret_der().to_vec())

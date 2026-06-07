@@ -33,9 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   postgres only) — the code uses only the runtime `sqlx::query` API, so this
   removes `sqlx-macros-core` from the build. The MySQL driver and its `rsa`
   dependency (unpatched RUSTSEC-2023-0071) are never compiled.
-- Added `.cargo/audit.toml` documenting the two remaining advisories
-  (`rsa`, `rustls-pemfile`), both feature-gated transitive deps not present in any
-  shipped artifact and with no update available.
+- Migrated the EAP-TLS PEM loaders off the unmaintained `rustls-pemfile`
+  (RUSTSEC-2025-0134) to `rustls-pki-types`' PEM reader API; `rustls-pemfile` is
+  no longer a dependency.
+- Added `.cargo/audit.toml` documenting the one remaining advisory (`rsa`), a
+  feature-gated transitive dep (sqlx MySQL driver) not compiled in any shipped
+  artifact and with no upstream fix available.
 
 ### Added
 

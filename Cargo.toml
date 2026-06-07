@@ -22,9 +22,9 @@ sha2 = "0.10"
 
 # TLS (for EAP-TLS, EAP-TTLS, PEAP)
 rustls = "0.23"
-rustls-pemfile = "2.0"
 x509-parser = "0.18"
-pki-types = { package = "rustls-pki-types", version = "1.0" }
+# `std` enables the PEM reader API (replaces the unmaintained rustls-pemfile).
+pki-types = { package = "rustls-pki-types", version = "1.12", features = ["std"] }
 
 # Error handling
 thiserror = "2.0"
