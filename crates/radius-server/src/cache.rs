@@ -89,6 +89,11 @@ impl RequestCache {
     /// Internal constructor with optional background task
     fn new_internal(ttl: Duration, max_entries: usize, start_background: bool) -> Self {
         let cache: Arc<DashMap<RequestFingerprint, CacheEntry>> = Arc::new(DashMap::new());
+
+        // Only spawn the background cleanup task when requested AND a Tokio runtime
+        // is available — calling `RequestCache::new` outside a runtime (e.g. in
+        // benchmarks or synchronous tests) must not panic.
+        let start_background = start_background && tokio::runtime::Handle::try_current().is_ok();
         let cleanup_running = Arc::new(AtomicBool::new(start_background));
 
         // Spawn background cleanup task only if requested
