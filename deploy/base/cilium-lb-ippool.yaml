@@ -1,0 +1,24 @@
+---
+# Dual-stack VIP pool for the RADIUS anycast LoadBalancer Service.
+#
+# Cilium LB-IPAM assigns one address from each block (IPv4 + IPv6) to any Service
+# whose labels match `serviceSelector`. The addresses below are placeholders from
+# documentation ranges — override them per environment in the overlay.
+#
+# API note: this is the Cilium 1.16 schema (cilium.io/v2alpha1). On Cilium >= 1.17
+# the LB-IPAM/BGP CRDs graduated to cilium.io/v2 — bump apiVersion accordingly.
+apiVersion: cilium.io/v2alpha1
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: usg-radius-vip
+  labels:
+    app.kubernetes.io/part-of: usg-radius
+spec:
+  serviceSelector:
+    matchLabels:
+      app.kubernetes.io/name: usg-radius-server
+  blocks:
+    # IPv4 anycast VIP (single address). Replace with your routed VIP.
+    - cidr: "203.0.113.10/32"
+    # IPv6 anycast VIP (single address). Replace with your routed VIP.
+    - cidr: "2001:db8:radius::10/128"

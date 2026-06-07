@@ -1,7 +1,0 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: radius
-  labels:
-    name: radius
-    app: radius-server

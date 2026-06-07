@@ -5,9 +5,6 @@ use crate::accounting::Session;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "ha")]
-use radius_proto::eap::EapSession;
-
 /// Cached session entry with local TTL
 #[derive(Debug, Clone)]
 struct CachedSession<T> {
@@ -32,7 +29,7 @@ impl<T> CachedSession<T> {
 ///
 /// This manager provides session storage with two levels:
 /// 1. **Local cache**: Fast in-memory cache (DashMap)
-/// 2. **Backend storage**: Persistent/distributed storage (Valkey/Memory)
+/// 2. **Backend storage**: Backend storage (in-memory)
 ///
 /// # Write-Through Caching
 ///
@@ -93,7 +90,7 @@ impl SharedSessionManager {
     ///
     /// # Arguments
     ///
-    /// * `backend` - Storage backend (Valkey, Memory, etc.)
+    /// * `backend` - Storage backend (in-memory)
     pub fn new(backend: Arc<dyn StateBackend>) -> Self {
         Self {
             backend,
@@ -109,81 +106,6 @@ impl SharedSessionManager {
             local_cache: Arc::new(dashmap::DashMap::new()),
             cache_ttl,
         }
-    }
-
-    /// Store an EAP session (write-through to backend + local cache)
-    #[cfg(feature = "ha")]
-    pub async fn store_eap(
-        &self,
-        session_id: &str,
-        session: &EapSession,
-        ttl: Option<Duration>,
-    ) -> Result<(), StateError> {
-        // Serialize session
-        let bytes = serde_json::to_vec(session).map_err(|e| {
-            StateError::SerializationError(format!("Failed to serialize EAP session: {}", e))
-        })?;
-
-        // Store in backend
-        let key = format!("eap_session:{}", session_id);
-        self.backend.set(&key, &bytes, ttl).await?;
-
-        // Update local cache
-        self.local_cache.insert(key, CachedSession::new(bytes));
-
-        Ok(())
-    }
-
-    /// Get an EAP session (check local cache first, then backend)
-    #[cfg(feature = "ha")]
-    pub async fn get_eap(&self, session_id: &str) -> Result<Option<EapSession>, StateError> {
-        let key = format!("eap_session:{}", session_id);
-
-        // 1. Check local cache first (fast path)
-        if let Some(cached) = self.local_cache.get(&key) {
-            if !cached.is_expired(self.cache_ttl) {
-                // Cache hit - deserialize and return
-                let session = serde_json::from_slice(&cached.session).map_err(|e| {
-                    StateError::SerializationError(format!(
-                        "Failed to deserialize EAP session: {}",
-                        e
-                    ))
-                })?;
-                return Ok(Some(session));
-            } else {
-                // Expired - remove from cache
-                drop(cached);
-                self.local_cache.remove(&key);
-            }
-        }
-
-        // 2. Cache miss - fetch from backend
-        if let Some(bytes) = self.backend.get(&key).await? {
-            let session = serde_json::from_slice(&bytes).map_err(|e| {
-                StateError::SerializationError(format!("Failed to deserialize EAP session: {}", e))
-            })?;
-
-            // 3. Update local cache
-            self.local_cache.insert(key, CachedSession::new(bytes));
-
-            Ok(Some(session))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Delete an EAP session (from both cache and backend)
-    #[cfg(feature = "ha")]
-    pub async fn delete_eap(&self, session_id: &str) -> Result<(), StateError> {
-        let key = format!("eap_session:{}", session_id);
-
-        // Remove from backend
-        self.backend.delete(&key).await?;
-
-        // Remove from local cache
-        self.local_cache.remove(&key);
-
-        Ok(())
     }
 
     /// Store an accounting session (write-through to backend + local cache)

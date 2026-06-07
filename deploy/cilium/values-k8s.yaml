@@ -1,0 +1,43 @@
+# Cilium Helm values for the USG RADIUS anycast deployment (full k8s).
+#
+# Install/upgrade:
+#   helm repo add cilium https://helm.cilium.io
+#   helm upgrade --install cilium cilium/cilium --version 1.16.x \
+#       --namespace kube-system -f deploy/cilium/values-k8s.yaml
+#
+# The key requirements for this deployment:
+#   * kubeProxyReplacement: Cilium owns service load-balancing (needed for BGP + DSR).
+#   * loadBalancer.mode=dsr: Direct Server Return — the NAS source IP is preserved
+#     and the LB path is NOT SNATed. RADIUS client auth depends on the real source IP.
+#   * bgpControlPlane: advertise the LoadBalancer VIP via BGP (L3 anycast).
+#   * dual-stack: IPv4 + IPv6 VIPs.
+
+kubeProxyReplacement: true
+
+# Set to your control-plane endpoint when kube-proxy is fully replaced.
+# k8sServiceHost: <api-server-ip>
+# k8sServicePort: 6443
+
+loadBalancer:
+  # Direct Server Return: no SNAT on the LoadBalancer path, source IP preserved.
+  mode: dsr
+  # geneve dispatch routes DSR replies correctly across L3 boundaries.
+  dsrDispatch: geneve
+
+bgpControlPlane:
+  enabled: true
+
+# Dual-stack.
+ipv4:
+  enabled: true
+ipv6:
+  enabled: true
+
+# Pod egress masquerade stays on (pods reaching external services); the DSR LB
+# ingress path is not masqueraded. Verify with: cilium-dbg bpf lb list.
+enableIPv4Masquerade: true
+enableIPv6Masquerade: true
+
+# LB-IPAM + BGP announce the VIP; no L2 announcements needed for L3 anycast.
+l2announcements:
+  enabled: false

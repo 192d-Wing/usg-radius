@@ -342,7 +342,7 @@ We welcome contributions! See our [Contributing Guide](CONTRIBUTING.md) for:
 
 ## 📝 License
 
-This project is licensed under the AGPL-3.0-or-later license.
+This project is licensed under the Apache-2.0 license.
 
 See [LICENSE](LICENSE) file for details.
 

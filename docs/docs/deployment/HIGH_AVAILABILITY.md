@@ -1,510 +1,122 @@
-# High Availability Deployment Guide
+# Availability & Scaling
 
-This guide covers deploying usg-radius in a High Availability (HA) configuration with multiple RADIUS servers sharing state through Valkey.
+USG RADIUS achieves availability and horizontal scale through Kubernetes, not through a
+shared-state backend. The server is **stateless**: there is no external state store, no
+cluster-wide session store, and no distributed rate limiting. Each pod handles requests
+independently. This document explains the model; for hands-on deployment steps see the
+canonical guide, [`deploy/README.md`](../../../deploy/README.md), and the overlays under
+[`deploy/overlays/k3s`](../../../deploy/overlays/k3s) and
+[`deploy/overlays/k8s`](../../../deploy/overlays/k8s).
 
 ## Table of Contents
 
-1. [Architecture Overview](#architecture-overview)
-2. [Prerequisites](#prerequisites)
-3. [Valkey Setup](#valkey-setup)
-4. [Server Configuration](#server-configuration)
-5. [Health Checks & Monitoring](#health-checks--monitoring)
-6. [Load Balancer Configuration](#load-balancer-configuration)
-7. [Kubernetes Deployment](#kubernetes-deployment)
-8. [Docker Compose Example](#docker-compose-example)
-9. [Troubleshooting](#troubleshooting)
+1. [Model Overview](#model-overview)
+2. [Stateless Pods + ReplicaSet](#stateless-pods--replicaset)
+3. [Cilium BGP L3 Anycast VIP](#cilium-bgp-l3-anycast-vip)
+4. [Source-IP Preservation (ETP=Local + DSR)](#source-ip-preservation-etplocal--dsr)
+5. [Health Checks](#health-checks)
+6. [Failure Behavior](#failure-behavior)
 
-## Architecture Overview
+## Model Overview
 
 ```
-                     ┌─────────────────┐
-                     │  Load Balancer  │
-                     │  (HAProxy/nginx)│
-                     └────────┬────────┘
-                              │
-          ┌───────────────────┼───────────────────┐
-          │                   │                   │
-    ┌─────▼─────┐       ┌─────▼─────┐       ┌─────▼─────┐
-    │  RADIUS   │       │  RADIUS   │       │  RADIUS   │
-    │  Server 1 │       │  Server 2 │       │  Server 3 │
-    │  :1812    │       │  :1812    │       │  :1812    │
-    └─────┬─────┘       └─────┬─────┘       └─────┬─────┘
-          │                   │                   │
-          └───────────────────┼───────────────────┘
-                              │
-                     ┌────────▼────────┐
-                     │     Valkey      │
-                     │  (Shared State) │
-                     └─────────────────┘
+            NAS / clients (IPv4 + IPv6)
+                     │  UDP 1812 (auth) / 1813 (acct)  ->  Anycast VIP (one v4 + one v6)
+                     ▼
+            Upstream router  ── ECMP ──┐  (VIP learned via BGP from each Ready node)
+                     │                 │
+        ┌────────────┴───┐   ┌─────────┴──────┐   nodes advertise the VIP only while
+        │ node A (Cilium)│   │ node B (Cilium)│   they host a Ready radius pod
+        └────────┬───────┘   └────────┬───────┘
+                 ▼                     ▼
+          usg-radius-server pods (stateless Deployment, dual-stack)
 ```
 
-### Key Components
+- **No shared state.** Pods do not exchange EAP, accounting, dedup, or rate-limit state.
+- **Scale = replicas.** Add capacity by increasing the Deployment's replica count.
+- **Availability = anycast.** Every Ready node advertises the same VIP; the router ECMPs
+  traffic across them, and unhealthy nodes withdraw their route automatically.
 
-- **RADIUS Servers**: Multiple instances sharing state
-- **Valkey**: Distributed state backend for sessions, cache, and rate limiting
-- **Load Balancer**: Distributes requests across servers
-- **Health Endpoints**: Kubernetes-compatible health checks
-- **Metrics Endpoint**: Prometheus-compatible metrics
+## Stateless Pods + ReplicaSet
 
-### Shared State
+The RADIUS server runs as a Kubernetes `Deployment`. The ReplicaSet keeps the desired
+number of pods running and reschedules them on node or pod failure.
 
-All servers share:
-- **EAP Sessions**: Multi-round authentication state
-- **Accounting Sessions**: Session tracking for billing
-- **Request Cache**: Duplicate request detection (60s TTL)
-- **Rate Limits**: Global and per-client rate limiting
+- **Scaling**: raise `spec.replicas` (or apply an HPA) to add throughput. Each replica is
+  independent, so capacity scales close to linearly with replica count, bounded by the
+  upstream router's ECMP fan-out and per-flow hashing.
+- **Rolling updates**: standard Kubernetes rolling updates apply. Because pods are
+  stateless, a pod can be drained, replaced, or rescheduled with no session hand-off.
+- **No backend dependency**: there is nothing to provision, secure, or fail over beyond
+  the pods themselves.
 
-## Prerequisites
+## Cilium BGP L3 Anycast VIP
 
-- Valkey server (or Redis-compatible server)
-- 3+ RADIUS server instances for production HA
-- Load balancer (HAProxy, nginx, or hardware load balancer)
-- Monitoring system (Prometheus + Grafana recommended)
+The service is exposed on an **L3 anycast VIP** — a single IPv4 address and a single IPv6
+address (dual-stack) — advertised by **Cilium's BGP control plane** from every node that
+currently hosts a Ready radius pod.
 
-## Valkey Setup
+- The VIP, BGP ASNs, and peers are configured in the overlay and Cilium IPPool/BGP
+  resources under `deploy/`.
+- The upstream router learns the VIP from multiple nodes and load-balances inbound RADIUS
+  traffic across them using **ECMP** — this is true L3 anycast, not active/standby.
+- Cilium install-time Helm values live in
+  [`deploy/cilium/values-k3s.yaml`](../../../deploy/cilium/values-k3s.yaml) and
+  [`deploy/cilium/values-k8s.yaml`](../../../deploy/cilium/values-k8s.yaml).
 
-### Installation
+Verify advertisement with:
 
 ```bash
-# Using Docker
-docker run -d \
-  --name valkey \
-  -p 6379:6379 \
-  valkey/valkey:latest
-
-# Using Docker with persistence
-docker run -d \
-  --name valkey \
-  -p 6379:6379 \
-  -v valkey-data:/data \
-  valkey/valkey:latest --save 60 1 --loglevel warning
+cilium bgp peers
+cilium bgp routes advertised ipv4 unicast
+cilium bgp routes advertised ipv6 unicast
 ```
 
-### Production Configuration
+## Source-IP Preservation (ETP=Local + DSR)
 
-For production, use Valkey with:
-- **Persistence**: AOF or RDB snapshots
-- **Replication**: Master-replica setup
-- **Sentinel**: Automatic failover
-- **Security**: Password authentication, TLS
+RADIUS authorizes clients by source IP/CIDR, so the NAS source address **must** reach the
+server unchanged. Two settings guarantee this:
 
-Example `valkey.conf`:
-```
-# Network
-bind 0.0.0.0
-protected-mode yes
-port 6379
+- **`externalTrafficPolicy: Local`** on the LoadBalancer Service. This preserves the
+  client source IP (no SNAT to a node IP) and makes Cilium advertise the VIP **only from
+  nodes that have a Ready radius pod**. A drained or failed node therefore stops attracting
+  traffic and withdraws its anycast route automatically.
+- **Cilium DSR mode (no SNAT)**, set at Cilium install time in the `cilium/values-*.yaml`
+  files and pinned per-Service via `service.cilium.io/forwarding-mode: dsr`. Direct Server
+  Return keeps the original source IP on the load-balanced path.
 
-# Persistence
-save 900 1
-save 300 10
-save 60 10000
-appendonly yes
-appendfsync everysec
+Without these, every request would appear to come from a node/pod IP and client
+authorization would break.
 
-# Security
-requirepass your_strong_password_here
+## Health Checks
 
-# Memory
-maxmemory 2gb
-maxmemory-policy allkeys-lru
-```
-
-### Valkey Sentinel Setup (Recommended)
+The binary serves health endpoints on **TCP 2812** when built with the `observability`
+cargo feature:
 
 ```bash
-# Start Valkey master
-docker run -d --name valkey-master \
-  -p 6379:6379 \
-  valkey/valkey:latest
-
-# Start Valkey replicas
-docker run -d --name valkey-replica-1 \
-  -p 6380:6379 \
-  valkey/valkey:latest --replicaof valkey-master 6379
-
-# Start Sentinel instances
-docker run -d --name valkey-sentinel-1 \
-  -p 26379:26379 \
-  valkey/valkey:latest --sentinel
+curl http://<pod>:2812/health/live    # liveness: process is running
+curl http://<pod>:2812/health/ready   # readiness: pod is ready to serve
 ```
 
-## Server Configuration
-
-### Environment Variables
-
-```bash
-# RADIUS configuration
-RADIUS_PORT=1812
-RADIUS_SECRET=your_shared_secret
-
-# Valkey configuration
-VALKEY_URL=redis://localhost:6379
-# With authentication:
-# VALKEY_URL=redis://:password@localhost:6379
-# With TLS:
-# VALKEY_URL=rediss://localhost:6379
-
-# Health/Metrics ports (automatic)
-# HEALTH_PORT = RADIUS_PORT + 1000 (e.g., 2812)
-# METRICS_PORT = RADIUS_PORT + 2000 (e.g., 3812)
-```
-
-### Starting Servers
-
-```bash
-# Server 1
-RADIUS_PORT=1812 \
-VALKEY_URL=redis://valkey:6379 \
-cargo run --example ha_cluster_server --features ha
-
-# Server 2 (different host or port)
-RADIUS_PORT=1813 \
-VALKEY_URL=redis://valkey:6379 \
-cargo run --example ha_cluster_server --features ha
-
-# Server 3
-RADIUS_PORT=1814 \
-VALKEY_URL=redis://valkey:6379 \
-cargo run --example ha_cluster_server --features ha
-```
-
-### Configuration File
-
-Create `config.toml`:
-```toml
-[server]
-address = "0.0.0.0:1812"
-secret = "testing123"
-
-[ha]
-enabled = true
-valkey_url = "redis://valkey:6379"
-key_prefix = "usg-radius:"
-max_retries = 3
-retry_delay_ms = 100
-
-[rate_limiting]
-per_client_limit = 100  # requests per second per client
-global_limit = 1000     # requests per second globally
-window_duration_secs = 1
-
-[request_cache]
-ttl_secs = 60  # duplicate detection window
-```
-
-## Health Checks & Monitoring
-
-### Health Check Endpoints
-
-Each server exposes three health check endpoints:
-
-```bash
-# Overall health (JSON response)
-curl http://server:2812/health
-# Response: {"status":"healthy","backend":{"backend_type":"valkey","status":"up"},"cache":{"entries":42}}
-
-# Readiness probe (Kubernetes)
-curl http://server:2812/health/ready
-# Returns 200 if backend is accessible, 503 otherwise
-
-# Liveness probe (Kubernetes)
-curl http://server:2812/health/live
-# Returns 200 if server is running
-```
-
-### Metrics Endpoint
-
-Prometheus-compatible metrics:
-
-```bash
-curl http://server:3812/metrics
-```
-
-Available metrics:
-- `radius_backend_up` - Backend connectivity (1=up, 0=down)
-- `radius_cache_entries` - Local cache size
-- `radius_ratelimit_per_client_limit` - Per-client rate limit
-- `radius_ratelimit_global_limit` - Global rate limit
-- `radius_ratelimit_window_duration_seconds` - Rate limit window
-- `radius_ratelimit_current_global_count` - Current request count
-- `radius_uptime_seconds` - Server uptime
-
-### Prometheus Configuration
-
-`prometheus.yml`:
-```yaml
-scrape_configs:
-  - job_name: 'radius-servers'
-    static_configs:
-      - targets:
-        - 'radius-1:3812'
-        - 'radius-2:3812'
-        - 'radius-3:3812'
-    scrape_interval: 15s
-```
-
-## Load Balancer Configuration
-
-### HAProxy
-
-`haproxy.cfg`:
-```
-global
-    log stdout local0
-    maxconn 4096
-
-defaults
-    log global
-    mode tcp
-    option tcplog
-    timeout connect 5000ms
-    timeout client 50000ms
-    timeout server 50000ms
-
-frontend radius_auth
-    bind *:1812
-    mode udp
-    default_backend radius_servers
-
-backend radius_servers
-    mode udp
-    balance roundrobin
-    option tcp-check
-    server radius1 radius-server-1:1812 check inter 10s rise 2 fall 3
-    server radius2 radius-server-2:1812 check inter 10s rise 2 fall 3
-    server radius3 radius-server-3:1812 check inter 10s rise 2 fall 3
-
-# Health check endpoint
-frontend radius_health
-    bind *:8080
-    mode http
-    default_backend radius_health_servers
-
-backend radius_health_servers
-    mode http
-    balance roundrobin
-    option httpchk GET /health/ready
-    server radius1 radius-server-1:2812 check
-    server radius2 radius-server-2:2812 check
-    server radius3 radius-server-3:2812 check
-```
-
-### nginx (Stream Module)
-
-`nginx.conf`:
-```nginx
-stream {
-    upstream radius_servers {
-        hash $remote_addr consistent;
-        server radius-server-1:1812 max_fails=3 fail_timeout=30s;
-        server radius-server-2:1812 max_fails=3 fail_timeout=30s;
-        server radius-server-3:1812 max_fails=3 fail_timeout=30s;
-    }
-
-    server {
-        listen 1812 udp;
-        proxy_pass radius_servers;
-        proxy_timeout 10s;
-        proxy_responses 1;
-    }
-}
-
-http {
-    upstream radius_health {
-        server radius-server-1:2812;
-        server radius-server-2:2812;
-        server radius-server-3:2812;
-    }
-
-    server {
-        listen 8080;
-
-        location /health {
-            proxy_pass http://radius_health;
-        }
-    }
-}
-```
-
-## Kubernetes Deployment
-
-See [Kubernetes Deployment Example](./kubernetes/README.md) for full manifests.
-
-### Quick Start
-
-```bash
-# Apply all manifests
-kubectl apply -f k8s/
-
-# Check status
-kubectl get pods -n radius
-kubectl get svc -n radius
-
-# View logs
-kubectl logs -f deployment/radius-server -n radius
-```
-
-### Key Features
-
-- **StatefulSet**: Stable network identities for servers
-- **Service**: Load balancing across pods
-- **ConfigMap**: Centralized configuration
-- **Secret**: Valkey credentials
-- **Health Probes**: Automatic restart on failure
-- **HPA**: Horizontal Pod Autoscaler support
-- **NetworkPolicy**: Security isolation
-
-## Docker Compose Example
-
-See [docker-compose.yml](./docker-compose.yml) for full example.
-
-```bash
-# Start cluster
-docker-compose up -d
-
-# Scale servers
-docker-compose up -d --scale radius-server=5
-
-# View logs
-docker-compose logs -f radius-server
-
-# Stop cluster
-docker-compose down
-```
-
-## Troubleshooting
-
-### Backend Connection Issues
-
-**Symptom**: Health checks failing, 503 errors
-
-**Check**:
-```bash
-# Test Valkey connectivity
-redis-cli -h valkey -p 6379 PING
-
-# Check logs
-docker logs radius-server-1 | grep -i valkey
-
-# Verify backend status
-curl http://server:2812/health | jq .backend
-```
-
-**Fix**:
-- Verify `VALKEY_URL` is correct
-- Check Valkey is running and accessible
-- Verify network connectivity
-- Check firewall rules
-
-### Rate Limiting Issues
-
-**Symptom**: Requests being blocked unexpectedly
-
-**Check**:
-```bash
-# View current rate limit counts
-curl http://server:3812/metrics | grep ratelimit
-
-# Check configuration
-echo $RATE_LIMIT_CONFIG
-```
-
-**Fix**:
-- Increase `per_client_limit` or `global_limit`
-- Adjust `window_duration`
-- Check if limits are being shared correctly across cluster
-
-### Session State Not Shared
-
-**Symptom**: EAP authentication fails when switching servers
-
-**Check**:
-```bash
-# Verify Valkey has session data
-redis-cli -h valkey KEYS "usg-radius:eap_session:*"
-
-# Check session manager stats
-curl http://server:2812/health | jq .cache
-```
-
-**Fix**:
-- Verify all servers using same `VALKEY_URL`
-- Check `key_prefix` matches across servers
-- Verify Valkey persistence is enabled
-
-### Performance Issues
-
-**Symptom**: High latency, timeouts
-
-**Check**:
-```bash
-# Check Valkey performance
-redis-cli --latency -h valkey
-
-# Monitor metrics
-curl http://server:3812/metrics | grep cache_entries
-
-# Check backend stats
-redis-cli -h valkey INFO stats
-```
-
-**Fix**:
-- Increase Valkey memory: `maxmemory` setting
-- Enable Valkey clustering for horizontal scaling
-- Adjust local cache TTL: longer TTL = fewer backend queries
-- Add more RADIUS server instances
-
-### Cache Inconsistency
-
-**Symptom**: Stale data being served
-
-**Check**:
-```bash
-# Check cache TTL settings
-grep cache_ttl config.toml
-
-# Monitor cache size
-watch -n 1 'curl -s http://server:3812/metrics | grep cache_entries'
-```
-
-**Fix**:
-- Decrease local cache TTL (default: 30s)
-- Ensure Valkey TTLs are appropriate
-- Force cache clear: restart servers
-
-## Best Practices
-
-1. **Minimum 3 Servers**: Provides redundancy during maintenance
-2. **Monitor Everything**: Use Prometheus + Grafana dashboards
-3. **Set Alerts**: Backend down, high error rate, high latency
-4. **Use Valkey Sentinel**: Automatic failover for Valkey
-5. **Enable Persistence**: AOF + RDB for Valkey
-6. **Test Failover**: Regularly test server and backend failures
-7. **Capacity Planning**: Monitor request rates and scale accordingly
-8. **Security**: Use TLS for Valkey connections in production
-9. **Backup Strategy**: Regular Valkey snapshots
-10. **Documentation**: Keep runbooks for common issues
-
-## Production Checklist
-
-- [ ] Valkey running with persistence enabled
-- [ ] Valkey Sentinel configured for failover
-- [ ] 3+ RADIUS server instances deployed
-- [ ] Load balancer configured with health checks
-- [ ] Prometheus scraping all servers
-- [ ] Grafana dashboards created
-- [ ] Alerts configured (backend down, high latency)
-- [ ] TLS enabled for Valkey connections
-- [ ] Firewall rules configured
-- [ ] Backup/restore tested
-- [ ] Failover scenarios tested
-- [ ] Documentation updated
-- [ ] Monitoring playbooks created
-
-## Additional Resources
-
-- [Valkey Documentation](https://valkey.io/docs/)
-- [HAProxy UDP Load Balancing](https://www.haproxy.com/documentation/)
-- [Kubernetes Best Practices](https://kubernetes.io/docs/concepts/cluster-administration/manage-deployment/)
-- [Prometheus Monitoring](https://prometheus.io/docs/introduction/overview/)
+Kubernetes liveness/readiness probes use these endpoints. Because advertisement is tied to
+pod readiness (via `externalTrafficPolicy: Local`), a pod failing its readiness probe both
+stops receiving pod traffic and causes its node to withdraw the VIP route if it was the
+last Ready pod there.
+
+Prometheus metrics are exposed separately on **TCP 3812** at `/metrics` (also gated behind
+the `observability` feature).
+
+## Failure Behavior
+
+| Failure | Result |
+|---------|--------|
+| One pod crashes | ReplicaSet reschedules it; node withdraws the VIP route if it was the last Ready pod on that node. |
+| One node drains/fails | That node stops advertising the VIP; the router ECMPs remaining nodes. |
+| Rolling update | Pods are replaced one at a time; readiness gates route advertisement, so no traffic lands on not-yet-ready pods. |
+| In-flight multi-round EAP on a failed pod | The exchange restarts on a healthy pod (no shared session state). Keep replica churn low during active EAP. |
+
+## See Also
+
+- [`deploy/README.md`](../../../deploy/README.md) — canonical, step-by-step deployment guide.
+- [DEPLOYMENT.md](./DEPLOYMENT.md) — server CLI/config usage.
+- [QUICKSTART.md](./QUICKSTART.md) — fastest path to a running cluster.

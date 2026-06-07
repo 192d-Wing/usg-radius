@@ -1,20 +1,29 @@
 # USG RADIUS Examples
 
-This directory contains example configurations and deployment files for various use cases.
+This directory contains example configuration files and Rust library examples.
+
+> **Deployment:** USG RADIUS is deployed on Kubernetes (k3s or k8s) with the Cilium CNI.
+> See the canonical guide [`deploy/README.md`](../deploy/README.md) for the full flow
+> (install Cilium with the provided values, build/push the `usg-radius-server` image, edit
+> an overlay, `kubectl apply -k deploy/overlays/<env>`, and verify with `cilium bgp routes`).
 
 ## Directory Structure
 
 ```
 examples/
-├── configs/          # Example configuration files
-│   ├── basic-homelab.json      # Minimal config for testing
-│   ├── small-business.json     # SMB production config
-│   ├── enterprise.json         # Enterprise/high-scale config
-│   └── docker.json             # Docker/container config
-├── docker/           # Docker-related files
-│   └── .env.example            # Environment variables template
-└── systemd/          # Systemd service files
-    └── usg-radius.service      # Systemd unit file
+├── configs/                 # Example configuration files (JSON)
+│   ├── basic-homelab.json   # Minimal config for testing
+│   ├── small-business.json  # SMB production config
+│   ├── enterprise.json      # Enterprise/high-scale config
+│   └── docker.json          # Container/Kubernetes config (env-var driven)
+├── proxy_config.json        # RADIUS proxy configuration example
+├── postgres_schema.sql      # PostgreSQL schema (auth + accounting)
+├── postgres-schema.sql      # PostgreSQL schema (alternate)
+├── eap_server.rs            # EAP-TLS server example (with OCSP/CRL)
+├── eap_teap_server.rs       # EAP-TEAP tunneled-auth server example
+├── ocsp_check.rs            # Standalone OCSP certificate checker
+├── perf_bench.rs            # Performance benchmark tool
+└── proxy_server.rs          # RADIUS proxy server example
 ```
 
 ## Configuration Examples
@@ -31,10 +40,10 @@ examples/
 - No audit logging
 - Weak secrets (NOT for production)
 
-**Start:**
+**Start (local dev):**
 
 ```bash
-usg_radius examples/configs/basic-homelab.json
+cargo run --release -- examples/configs/basic-homelab.json
 ```
 
 ### Small Business (`configs/small-business.json`)
@@ -59,8 +68,8 @@ export RADIUS_VPN_SECRET=$(openssl rand -base64 32)
 export RADIUS_SWITCH_SECRET=$(openssl rand -base64 32)
 export RADIUS_ADMIN_PASSWORD=$(openssl rand -base64 32)
 
-# Start server
-usg_radius examples/configs/small-business.json
+# Start server (local dev)
+cargo run --release -- examples/configs/small-business.json
 ```
 
 ### Enterprise (`configs/enterprise.json`)
@@ -78,122 +87,52 @@ usg_radius examples/configs/small-business.json
 
 **Recommendations:**
 
-- Deploy behind load balancer
-- Use external authentication (LDAP/AD)
-- Configure monitoring and alerting
+- Deploy on Kubernetes with multiple replicas (see [`deploy/README.md`](../deploy/README.md))
+- Use external authentication (LDAP/AD or PostgreSQL)
+- Configure monitoring and alerting (Prometheus `/metrics`)
 - Implement log aggregation
 - Regular secret rotation
 
-### Docker (`configs/docker.json`)
+### Container / Kubernetes (`configs/docker.json`)
 
-**Use case:** Container deployments (Docker, Kubernetes)
+**Use case:** Container deployments (mounted from a Kubernetes Secret)
 
 **Features:**
 
 - All secrets via environment variables
-- Configurable via env vars
 - Designed for immutable infrastructure
-- Works with Docker secrets/Kubernetes secrets
+- Works with Kubernetes Secrets
 
-**Usage:** See [Docker deployment guide](../../DEPLOYMENT.md#docker-deployment)
+**Usage:** Mount as the RADIUS config Secret in your overlay. See
+[`deploy/README.md`](../deploy/README.md).
 
-## Docker Deployment
+## Database Schemas
 
-### Quick Start
+PostgreSQL schemas for the auth and accounting backends are provided:
 
-**1. Copy environment template:**
+- [`postgres_schema.sql`](postgres_schema.sql) — performance-indexed schema for users,
+  attributes, and accounting tables.
+- [`postgres-schema.sql`](postgres-schema.sql) — alternate schema.
 
-```bash
-cp examples/docker/.env.example .env
-```
-
-**2. Edit secrets:**
-
-```bash
-vim .env  # Set strong secrets
-```
-
-**3. Start with Docker Compose:**
+Load with:
 
 ```bash
-docker-compose up -d
+psql -U radius -d radiusdb < examples/postgres_schema.sql
 ```
 
-**4. View logs:**
+## Proxy Configuration
 
-```bash
-docker-compose logs -f
-```
-
-### Environment Variables
-
-See `docker/.env.example` for all available variables.
-
-**Required variables:**
-
-- `RADIUS_SECRET` - Default shared secret
-- `CLIENT_1_SECRET` - Client network 1 secret
-- `CLIENT_2_SECRET` - Client network 2 secret
-- `ADMIN_PASSWORD` - Admin user password
-
-**Optional variables:**
-
-- `CLIENT_1_NETWORK` - Client 1 network CIDR (default: 192.168.1.0/24)
-- `CLIENT_2_NETWORK` - Client 2 network CIDR (default: 10.0.0.0/8)
-- `LOG_LEVEL` - Logging level (default: info)
-- `ADMIN_USERNAME` - Admin username (default: admin)
-
-## Systemd Deployment
-
-### Installation
-
-**1. Copy service file:**
-
-```bash
-sudo cp examples/systemd/usg-radius.service /etc/systemd/system/
-```
-
-**2. Reload systemd:**
-
-```bash
-sudo systemctl daemon-reload
-```
-
-**3. Enable and start:**
-
-```bash
-sudo systemctl enable usg-radius
-sudo systemctl start usg-radius
-```
-
-### Service Management
-
-```bash
-# Status
-sudo systemctl status usg-radius
-
-# Logs
-sudo journalctl -u usg-radius -f
-
-# Restart
-sudo systemctl restart usg-radius
-
-# Stop
-sudo systemctl stop usg-radius
-```
+[`proxy_config.json`](proxy_config.json) is a complete RADIUS proxy configuration (home
+servers, pools, realms, health checks). See the [proxy documentation](../docs/docs/proxy/README.md)
+and the [`proxy_server.rs`](proxy_server.rs) example.
 
 ## Security Best Practices
 
 ### Secrets
 
-**Generate strong secrets:**
-
 ```bash
-# Linux/macOS
+# Generate strong secrets (Linux/macOS)
 openssl rand -base64 32
-
-# Or
-head -c 32 /dev/urandom | base64
 ```
 
 **Requirements:**
@@ -203,36 +142,13 @@ head -c 32 /dev/urandom | base64
 - Unique secret per client
 - Never commit to version control
 - Rotate regularly (quarterly recommended)
+- Store secrets in Kubernetes Secrets (or an external secret manager)
 
-### File Permissions
+### Network
 
-**Configuration file:**
-
-```bash
-chmod 600 /etc/radius/config.json
-chown radius:radius /etc/radius/config.json
-```
-
-**Log directory:**
-
-```bash
-chmod 750 /var/log/radius
-chown radius:radius /var/log/radius
-```
-
-### Firewall
-
-**Only allow RADIUS clients:**
-
-```bash
-# UFW
-sudo ufw allow from 192.168.1.0/24 to any port 1812 proto udp
-sudo ufw deny 1812/udp
-
-# iptables
-sudo iptables -A INPUT -s 192.168.1.0/24 -p udp --dport 1812 -j ACCEPT
-sudo iptables -A INPUT -p udp --dport 1812 -j DROP
-```
+Restrict access to the RADIUS VIP at the upstream router/firewall so only legitimate NAS
+devices can reach UDP 1812 (auth) and 1813 (accounting). Keep the health (TCP 2812) and
+metrics (TCP 3812) endpoints internal.
 
 ## Code Examples
 
@@ -315,8 +231,6 @@ Example RADIUS server with EAP-TEAP tunneled authentication.
 cargo run --example eap_teap_server --features tls
 ```
 
-See the [EAP-TEAP implementation plan](../.claude/plans/stateful-splashing-pumpkin.md) for architecture details.
-
 ### Performance Benchmark (`perf_bench.rs`)
 
 Benchmark tool for measuring RADIUS server performance.
@@ -325,6 +239,16 @@ Benchmark tool for measuring RADIUS server performance.
 
 ```bash
 cargo run --example perf_bench --release
+```
+
+### RADIUS Proxy Server (`proxy_server.rs`)
+
+Example RADIUS proxy that forwards requests to home servers using realm-based routing.
+
+**Run:**
+
+```bash
+cargo run --example proxy_server -- examples/proxy_config.json
 ```
 
 ## Testing
@@ -360,24 +284,6 @@ Sent Access-Request Id 123 from 0.0.0.0:12345 to 127.0.0.1:1812 length 77
 Received Access-Accept Id 123 from 127.0.0.1:1812 to 127.0.0.1:12345 length 20
 ```
 
-### Using Docker
-
-Test Docker deployment:
-
-```bash
-# Build image
-docker build -t usg-radius .
-
-# Run with example config
-docker run --rm \
-  -v $(pwd)/examples/configs/basic-homelab.json:/etc/radius/config.json:ro \
-  --network host \
-  usg-radius
-
-# In another terminal, test with radtest
-radtest admin admin123 localhost 1812 testing123
-```
-
 ## Troubleshooting
 
 ### Configuration Validation
@@ -385,16 +291,10 @@ radtest admin admin123 localhost 1812 testing123
 Validate config before starting:
 
 ```bash
-usg_radius --validate config.json
+usg-radius --validate config.json
 ```
 
 ### Common Issues
-
-**Port permission denied:**
-
-```bash
-sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/usg_radius
-```
 
 **Environment variable not found:**
 
@@ -406,20 +306,16 @@ export RADIUS_SECRET="your_secret"
 **Firewall blocking:**
 
 ```bash
-# Check firewall status
-sudo ufw status
-sudo iptables -L -n | grep 1812
-
 # Test network connectivity
 sudo tcpdump -i any -n port 1812
 ```
 
 ## More Information
 
-- [Full Deployment Guide](../../DEPLOYMENT.md)
-- [Server Configuration Docs](../../docs/docs/configuration/server.md)
-- [Security Best Practices](../../docs/docs/security/overview.md)
-- [Project README](../../README.md)
+- [Deployment Guide](../deploy/README.md)
+- [Server Configuration Docs](../docs/docs/configuration/server.md)
+- [Security Best Practices](../docs/docs/security/overview.md)
+- [Project README](../README.md)
 
 ## Contributing
 

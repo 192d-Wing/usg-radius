@@ -36,9 +36,6 @@ rustls = { workspace = true, optional = true }
 # Async traits (always needed for StateBackend)
 async-trait.workspace = true
 
-# High Availability dependencies
-redis = { workspace = true, optional = true, features = ["tokio-comp", "connection-manager"] }
-
 # HTTP server for health checks and metrics
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
@@ -51,4 +48,4 @@ tempfile.workspace = true
 [features]
 default = []
 tls = ["radius-proto/tls", "dep:rustls"]
-ha = ["radius-proto/serde", "dep:redis", "dep:axum", "dep:tower", "dep:tower-http"]
+observability = ["dep:axum", "dep:tower", "dep:tower-http"]

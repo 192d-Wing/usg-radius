@@ -89,24 +89,25 @@ See [RFC-COMPLIANCE.md](RFC-COMPLIANCE.md) for detailed gap analysis.
 - ✅ LDAP/Active Directory authentication with LDAPS
 - ✅ LDAP connection pooling and failover (multiple servers)
 - ✅ Group membership queries and RADIUS attribute mapping
-- ✅ High Availability with Valkey/Redis state backend
-- ✅ Two-tier caching (local DashMap + distributed backend)
-- ✅ Cluster-wide request deduplication (atomic SET NX)
-- ✅ Distributed rate limiting (atomic INCR)
 - ✅ HTTP health checks (liveness/readiness probes)
 - ✅ Prometheus metrics endpoint
-- ✅ Docker Compose and Kubernetes deployment examples
-- ✅ Comprehensive HA integration tests (11 tests, 100% pass rate)
+- ~~High Availability with a Redis-compatible shared-state backend~~ — **removed.**
+  Availability/scaling now come from stateless pods scaled by Kubernetes behind a Cilium
+  BGP L3 anycast VIP. See [`deploy/README.md`](../../../deploy/README.md).
+- ~~Two-tier caching, cluster-wide request deduplication, distributed rate limiting~~ —
+  **removed** with the shared-state backend (the server is stateless).
+- ~~Compose-based deployment examples~~ — **removed**; Kubernetes (k3s/k8s) + Cilium is the
+  only supported deployment path.
 
 #### Performance & Documentation (v0.7.0)
 
 - ✅ Criterion-based benchmarking suite (370 lines, 8 benchmark categories)
 - ✅ Load testing tool with concurrent client simulation (350 lines)
-- ✅ Quick Start Guide (650 lines - 5-minute single server, 10-minute HA cluster)
-- ✅ FreeRADIUS Migration Guide (950 lines - blue-green deployment strategy)
-- ✅ Performance Guide (850 lines - tuning, scaling, troubleshooting)
-- ✅ Grafana dashboard with 14 pre-configured panels
-- ✅ Documented performance benchmarks (50k RPS single server, 120k RPS HA cluster)
+- ✅ Quick Start Guide (Kubernetes + Cilium deployment flow)
+- ✅ FreeRADIUS Migration Guide (Kubernetes-native cutover strategy)
+- ✅ Performance Guide (tuning, scaling via replicas, troubleshooting)
+- ✅ Grafana dashboard with pre-configured panels (ships under `deploy/monitoring/`)
+- ✅ Documented performance benchmarks (50k RPS single pod; scale out by adding replicas)
 - ✅ Request deduplication bug fix (RFC 2865 compliance)
 - ✅ Load test tool rewrite (manual packet construction)
 - ✅ Comprehensive release documentation
@@ -1153,183 +1154,25 @@ let config = RevocationConfig::disabled();
 - Memory per Response: < 10KB (typical response size)
 - Cache Size: ~1MB (100 cached responses)
 
-### Phase 3: High Availability (IN PROGRESS)
+### Phase 3: High Availability — REMOVED
 
-**Status**: Phase 3A Complete (Week 1/3) ✅
-**Completed**: December 31, 2025
-
-#### Phase 3A: Valkey Integration ✅ COMPLETED
-
-**Implementation**:
-
-- ✅ **StateBackend Trait** - Pluggable storage abstraction
-  - 9 async methods (get, set, delete, exists, keys, set_nx, incr, expire, ping)
-  - Thread-safe and async-compatible
-  - Supports TTL, atomic operations, pattern matching
-- ✅ **MemoryStateBackend** - In-memory HashMap storage (300+ lines)
-  - Default non-HA backend
-  - TTL support with expiration checking
-  - 18 passing unit tests
-  - Thread-safe with tokio::sync::RwLock
-- ✅ **ValkeyStateBackend** - Distributed Valkey/Redis storage (350+ lines)
-  - Connection pooling via ConnectionManager
-  - Automatic retry logic (configurable)
-  - Key prefix for namespace isolation
-  - 9 integration tests (marked #[ignore], require Valkey server)
-- ✅ **StateConfig & ValkeyConfig** - Configuration structures
-  - Builder pattern for easy configuration
-  - Serde support for JSON serialization
-  - Full customization of timeouts, retries, pool size
-- ✅ **Session Serialization** - EapSession and Session structs
-  - Conditional serde derives (zero overhead when disabled)
-  - All EAP types serializable (EapCode, EapType, EapState, EapPacket)
-  - Accounting Session fully serializable
-- ✅ **SharedSessionManager** - Two-tier caching manager (480+ lines)
-  - Write-through caching (local DashMap + backend)
-  - Configurable local cache TTL (default 30s)
-  - EAP and accounting session management
-  - Cluster-wide request deduplication (atomic SET NX)
-  - Distributed rate limiting (atomic INCR)
-  - 7 passing unit tests
-  - Target: >95% cache hit rate
-
-**Files Created**:
-
-- `crates/radius-server/src/state/mod.rs` (150 lines)
-- `crates/radius-server/src/state/error.rs` (70 lines)
-- `crates/radius-server/src/state/config.rs` (280 lines)
-- `crates/radius-server/src/state/memory.rs` (400 lines)
-- `crates/radius-server/src/state/valkey.rs` (420 lines)
-- `crates/radius-server/src/state/session_manager.rs` (500 lines)
-
-**Total**: ~1,900 lines of production code + 25 tests
-
-**Feature Flags**:
-
-- `ha` feature enables Valkey backend and session serialization
-- Backward compatible (default = in-memory only)
-- Dependencies: `async-trait`, `redis` (optional), `serde` (optional)
-
-**Test Results**:
-
-- 25/25 tests passing (18 state backend + 7 session manager)
-- All unit tests green
-- Integration tests require Valkey server
-
-#### Phase 3B: Shared Session State (IN PROGRESS - Week 2/3)
-
-- [ ] Integrate SharedSessionManager with EapAuthHandler
-- [ ] Migrate EAP session storage to use state backend
-- [ ] Integrate SharedSessionManager with AccountingHandler
-- [ ] Migrate accounting session storage to use state backend
-- ✅ Update request cache to use cluster-wide deduplication
-  - SharedRequestCache implementation (360 lines, 8 tests)
-  - Atomic SET NX for race-free duplicate detection
-  - Key format: req_cache:{ip}:{id}:{auth_prefix_hex}
-- ✅ Update rate limiter to use distributed counters
-  - SharedRateLimiter implementation (479 lines, 9 tests)
-  - Atomic INCR operations for distributed counters
-  - Per-client and global rate limits
-  - Sliding window approach with automatic TTL cleanup
-- ✅ Fix ValkeyStateBackend closure capture issues
-  - Corrected all 8 StateBackend method retry logic
-  - Fixed lifetime issues with FnMut closures
-  - All 181 tests passing
-- ✅ Create HA cluster deployment example
-  - examples/ha_cluster_server.rs (~200 lines)
-  - Demonstrates Valkey backend configuration
-  - Shows failover to MemoryStateBackend
-  - Multi-instance deployment guide
-  - Production-ready with comprehensive logging
-
-**Estimated Effort**: 1 week (60% complete - core HA infrastructure ready)
-
-#### Phase 3C: Health Checks & Monitoring (COMPLETE - 100%)
-
-- ✅ HTTP health check server (liveness, readiness probes)
-  - health.rs module (~200 lines, 3 tests)
-  - GET /health - Overall health status with backend + cache info
-  - GET /health/ready - Kubernetes readiness probe
-  - GET /health/live - Kubernetes liveness probe
-  - JSON response format with backend connectivity status
-- ✅ Prometheus metrics endpoint
-  - metrics.rs module (~410 lines, 11 tests)
-  - GET /metrics - Prometheus text format metrics
-  - Backend health metrics (radius_backend_up)
-  - Cache statistics (radius_cache_entries)
-  - Rate limiting metrics (per_client_limit, global_limit, current counts)
-  - Server uptime tracking
-  - Optional rate limiter and cache integration
-- ✅ Valkey connection health monitoring
-  - Backend health checks via SharedSessionManager.health_check()
-  - Automatic health status reporting
-  - 198/198 tests passing
-- ✅ Integration with HA cluster example
-  - Health server on port RADIUS_PORT+1000 (e.g., 2812)
-  - Metrics server on port RADIUS_PORT+2000 (e.g., 3812)
-  - Automatic startup with cluster example
-  - curl-friendly monitoring endpoints
-
-**Estimated Effort**: 1 week (100% complete - monitoring infrastructure production-ready)
-
-#### Phase 3D: Documentation & Examples (COMPLETE - 100%)
-
-- ✅ Complete HA deployment documentation
-  - docs/deployment/HIGH_AVAILABILITY.md (comprehensive guide)
-  - Architecture diagrams and explanations
-  - Troubleshooting section with common issues
-  - Production checklist and best practices
-- ✅ Docker Compose HA cluster example (3 nodes + Valkey)
-  - examples/docker-compose-ha.yml (full stack)
-  - HAProxy load balancer configuration
-  - Prometheus + Grafana monitoring stack
-  - Automatic service discovery
-- ✅ Kubernetes deployment manifests
-  - examples/kubernetes/ directory with all manifests
-  - StatefulSet for Valkey with persistence
-  - Deployment for RADIUS servers with HPA
-  - Complete README with deployment guide
-  - Health probes and resource limits
-  - NetworkPolicy examples for security
-- ✅ HAProxy/nginx configuration examples
-  - examples/haproxy.cfg (UDP load balancing)
-  - Health check integration
-  - Stats endpoint configuration
-- ✅ Integration documentation
-  - Prometheus scrape configs
-  - Grafana datasource setup
-  - Load balancer health checks
-
-**Estimated Effort**: Concurrent with Phase 3C (100% complete)
-
-#### Phase 3E: Integration Testing (COMPLETE - 100%)
-
-- ✅ HA integration tests (cross-server session continuity)
-  - tests/ha_integration_tests.rs (11 comprehensive tests)
-  - Cross-server request deduplication with authenticator verification
-  - Cross-server rate limiting (per-client and global)
-  - Accounting session sharing and deletion
-  - EAP session sharing and deletion
-  - Cache statistics independence
-  - Backend health checks from multiple servers
-  - Rate limiter statistics consistency
-  - Concurrent session access patterns
-  - Rate limit window reset behavior
-  - All 10 tests passing (100% success rate)
-  - Fixed cache coherency issues with proper TTL handling
-  - Fixed RFC 2865 compliance for different authenticator handling
-
-**Estimated Effort**: 2 days (100% complete - comprehensive HA testing ready)
-
-**Total Estimated Effort**: 3 weeks (3 weeks complete - Phase 3 DONE!)
+> **Removed.** The Redis-compatible shared-state HA work (StateBackend trait, the
+> distributed state backend, two-tier caching, cluster-wide deduplication, distributed rate
+> limiting, the `ha` feature, the Compose / external-LB HA examples, and the shared-state HA
+> documentation) is **no longer part of the project**. The RADIUS server
+> is now **stateless**; availability and scaling come from running multiple replicas of a
+> Kubernetes `Deployment` behind a dual-stack Cilium BGP L3 anycast VIP. Source IP is
+> preserved via `externalTrafficPolicy: Local` + Cilium DSR. The HTTP health checks and
+> Prometheus metrics endpoints survive (now behind the `observability` feature, which
+> replaced `ha`). See [`deploy/README.md`](../../../deploy/README.md) and
+> [Availability & Scaling](../deployment/HIGH_AVAILABILITY.md).
 
 ### Phase 4: Additional Backend Support
 
-- [ ] Valkey caching backend
+- ~~Shared-state caching backend~~ — **dropped** (the server is stateless; no shared backend)
 - [ ] REST API authentication backend
 - [ ] Multi-backend fallback chains
 
-**Estimated Effort**: 3 weeks
 
 ## v0.8.0 - RadSec (RADIUS over TLS) (Q1 2026)
 
@@ -1414,11 +1257,8 @@ let config = RevocationConfig::disabled();
 
 ### Packaging
 
-- [ ] Debian/Ubuntu packages
-- [ ] RPM packages (RHEL/CentOS)
-- [ ] Docker images
-- [ ] Kubernetes manifests
-- [ ] systemd service files
+- [ ] Multi-arch container image (`usg-radius-server`) published to a registry
+- [ ] Kubernetes manifests / kustomize overlays (k3s + k8s) and Cilium values
 
 **Estimated Effort**: 2 weeks
 
@@ -1459,14 +1299,11 @@ let config = RevocationConfig::disabled();
 - [ ] Vendor-Specific Attribute (VSA) plugins
 - [ ] Custom attribute definitions
 - [ ] Policy engine
-- [ ] Geographic distribution
 
 ### Integration
 
 - [ ] Kubernetes operator
 - [ ] Terraform provider
-- [ ] Ansible role
-- [ ] Cloud-native deployment (AWS, GCP, Azure)
 
 ---
 

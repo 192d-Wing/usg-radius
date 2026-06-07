@@ -23,8 +23,8 @@ This guide helps you migrate from FreeRADIUS 3.x to USG RADIUS with minimal down
 |---------|-------------|
 | **Memory Safety** | Rust guarantees eliminate buffer overflows, use-after-free, and data races |
 | **Performance** | 5-10x faster throughput (50k+ RPS vs FreeRADIUS ~10k RPS) |
-| **Built-in HA** | Native Valkey/Redis support for multi-server clusters |
-| **Container-Native** | Docker/Kubernetes-ready with health checks and metrics |
+| **Cloud-Native HA** | Stateless server scaled by Kubernetes replicas behind a Cilium BGP L3 anycast VIP — no shared-state backend to run |
+| **Container-Native** | Kubernetes-ready image with health checks and Prometheus metrics |
 | **Modern Config** | JSON configuration instead of custom DSL |
 | **Type Safety** | Compile-time checking prevents configuration errors |
 | **Observability** | Prometheus metrics and structured JSON logging built-in |
@@ -67,9 +67,9 @@ This guide helps you migrate from FreeRADIUS 3.x to USG RADIUS with minimal down
 | Load balancing | ✅ | ✅ (4 algorithms) |
 | Failover | ✅ | ✅ (automatic) |
 | **High Availability** |
-| Multiple servers | ⚠️ Manual | ✅ Built-in |
-| Shared state | ❌ | ✅ Valkey/Redis |
-| Session failover | ❌ | ✅ |
+| Multiple servers | ⚠️ Manual | ✅ Kubernetes replicas |
+| Shared state | ❌ | ❌ (stateless by design) |
+| Availability model | External LB | ✅ Cilium BGP L3 anycast VIP |
 
 ### Configuration Format
 
@@ -117,54 +117,51 @@ alice Cleartext-Password := "password123"
 
 ## Migration Strategy
 
-### Recommended Approach: Blue-Green Deployment
+### Recommended Approach: Kubernetes-Native Parallel Cutover
+
+USG RADIUS does not sit behind a UDP load balancer. It is deployed on Kubernetes and
+exposed on a **Cilium BGP L3 anycast VIP** (dual-stack). The cleanest cutover is to stand
+up the new VIP alongside the existing FreeRADIUS server, then shift traffic by repointing
+NAS devices (or by adjusting BGP advertisement), realm by realm or NAS by NAS. Because the
+VIP preserves the client source IP (`externalTrafficPolicy: Local` + Cilium DSR), the new
+server authorizes clients exactly as before.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ Phase 1: Parallel Run (1 week)                              │
+│ Phase 1: Stand up new VIP in parallel                       │
 │                                                              │
-│  ┌─────────────┐       ┌─────────────┐                     │
-│  │ FreeRADIUS  │  50%  │ USG RADIUS  │  50%                │
-│  │ (existing)  │◄──────┤ (new)       │                     │
-│  └─────────────┘       └─────────────┘                     │
-│         │                      │                             │
-│         └──────────┬───────────┘                             │
-│                    │                                          │
-│            ┌───────▼────────┐                                │
-│            │  Load Balancer  │                                │
-│            └────────────────┘                                │
-└─────────────────────────────────────────────────────────────┘
+│   FreeRADIUS (existing IP)        USG RADIUS VIP (new)       │
+│   10.0.1.10:1812                  anycast v4 + v6 :1812      │
+│        ▲                                ▲                     │
+│        │  (NAS still points here)       │  (validation NAS)  │
+└────────┼────────────────────────────────┼───────────────────┘
+         │                                 │
+┌────────┼─────────────────────────────────────────────────────┐
+│ Phase 2: Shift NAS pointers (per NAS / per realm)            │
+│                                                              │
+│   Move each NAS's RADIUS server entry from the FreeRADIUS    │
+│   IP to the USG RADIUS VIP. Roll back a NAS by repointing.   │
+└──────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────────────────────────────────┐
-│ Phase 2: Gradual Shift (2 weeks)                            │
+┌──────────────────────────────────────────────────────────────┐
+│ Phase 3: Complete migration                                  │
 │                                                              │
-│  ┌─────────────┐       ┌─────────────┐                     │
-│  │ FreeRADIUS  │  10%  │ USG RADIUS  │  90%                │
-│  │ (legacy)    │◄──────┤ (primary)   │                     │
-│  └─────────────┘       └─────────────┘                     │
-└─────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────┐
-│ Phase 3: Complete Migration                                 │
-│                                                              │
-│                    ┌─────────────┐                          │
-│                    │ USG RADIUS  │  100%                    │
-│                    │ (HA Cluster)│                          │
-│                    └─────────────┘                          │
-│  (FreeRADIUS decommissioned)                                │
-└─────────────────────────────────────────────────────────────┘
+│   All NAS devices point at the USG RADIUS anycast VIP.       │
+│   Scale throughput by adding Deployment replicas.            │
+│   (FreeRADIUS decommissioned)                                │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### Timeline
 
 | Week | Activity | Validation |
 |------|----------|------------|
-| **Week 0** | Assessment | Inventory current config, identify dependencies |
-| **Week 1** | Test environment | Deploy USG RADIUS in staging, run tests |
-| **Week 2** | Parallel production | 50/50 split, monitor metrics |
-| **Week 3** | Gradual shift | 90/10 split, validate edge cases |
-| **Week 4** | Complete migration | 100% USG RADIUS, decommission FreeRADIUS |
-| **Week 5+** | Monitoring | Optimize performance, fine-tune |
+| **Week 0** | Assessment | Inventory current config, NAS list, realms, dependencies |
+| **Week 1** | Test environment | Deploy USG RADIUS VIP in staging, run tests |
+| **Week 2** | Parallel production | New VIP live; point a pilot NAS/realm at it, monitor metrics |
+| **Week 3** | Gradual shift | Repoint remaining NAS devices / realms, validate edge cases |
+| **Week 4** | Complete migration | 100% on USG RADIUS, decommission FreeRADIUS |
+| **Week 5+** | Monitoring | Tune replica count and resource requests, fine-tune |
 
 ---
 
@@ -580,81 +577,49 @@ EOF
 
 ## Deployment Strategies
 
-### Strategy 1: Phased Rollout
+### Strategy 1: Phased NAS Cutover (recommended)
 
 ```bash
-# Week 1: Deploy USG RADIUS alongside FreeRADIUS
-docker-compose up -d usg-radius
+# Week 1: Deploy USG RADIUS on Kubernetes; the anycast VIP comes up alongside FreeRADIUS.
+kubectl apply -k deploy/overlays/k8s
+kubectl -n radius get svc usg-radius-server -o wide   # note the v4 + v6 VIP
 
-# Configure HAProxy to split traffic
-# haproxy.cfg:
-backend radius_servers
-    mode udp
-    balance roundrobin
-    server freeradius 10.0.1.10:1812 weight 50
-    server usg-radius 10.0.1.20:1812 weight 50
+# Week 2: Repoint a pilot NAS / realm from the FreeRADIUS IP to the USG RADIUS VIP.
+#   On the NAS: change its RADIUS server entry from 10.0.1.10 to <VIP>.
+#   Roll back instantly by repointing that NAS back to FreeRADIUS.
 
-# Week 2: Shift to 90/10
-    server freeradius 10.0.1.10:1812 weight 10
-    server usg-radius 10.0.1.20:1812 weight 90
-
-# Week 3: Complete migration
-    server usg-radius-1 10.0.1.20:1812
-    server usg-radius-2 10.0.1.21:1812
-    server usg-radius-3 10.0.1.22:1812
+# Week 3+: Repoint the remaining NAS devices in batches, monitoring metrics each step.
+#   Scale USG RADIUS by adding replicas as load shifts:
+kubectl -n radius scale deploy/usg-radius-server --replicas=4
 ```
+
+Because each NAS is repointed independently, the "weight" is simply how many NAS devices
+you have cut over. Source IP is preserved end to end (ETP=Local + DSR), so client matching
+behaves identically to FreeRADIUS.
 
 ### Strategy 2: Shadow Mode
 
 ```bash
-# Configure FreeRADIUS to log all requests
-# Then replay against USG RADIUS for validation
+# Configure FreeRADIUS to log all requests, then replay against USG RADIUS for validation.
 
 # Capture traffic
 tcpdump -i eth0 -w radius_traffic.pcap udp port 1812
 
-# Replay against USG RADIUS
+# Replay against the USG RADIUS VIP
 tcpreplay --intf=eth1 --multiplier=1.0 radius_traffic.pcap
 
 # Compare logs
 diff freeradius.log usg-radius.log
 ```
 
-### Strategy 3: Canary Deployment
+### Strategy 3: BGP-Weighted Cutover
 
-```bash
-# Route 1% of traffic to USG RADIUS
-# Kubernetes Ingress with weighted routing
-apiVersion: v1
-kind: Service
-metadata:
-  name: radius
-spec:
-  selector:
-    app: radius
-  ports:
-  - port: 1812
-    targetPort: 1812
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  annotations:
-    nginx.ingress.kubernetes.io/canary: "true"
-    nginx.ingress.kubernetes.io/canary-weight: "1"
-spec:
-  rules:
-  - host: radius.example.com
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: usg-radius
-            port:
-              number: 1812
-```
+For a router-driven shift instead of per-NAS changes, advertise the USG RADIUS VIP and
+influence path selection at the upstream router (e.g. local-preference / MED, or by
+controlling which prefixes Cilium advertises). Start by attracting a small share of NAS
+source prefixes to the VIP, then widen it until FreeRADIUS no longer receives traffic.
+This keeps a single advertised RADIUS endpoint while you migrate, and rollback is a routing
+change rather than a config push to every NAS.
 
 ---
 
@@ -679,7 +644,7 @@ curl localhost:2812/health
 **Solutions**:
 1. Increase cache TTL
 2. Tune connection pools (LDAP/PostgreSQL)
-3. Enable HA mode with Valkey for distributed caching
+3. Add Deployment replicas to spread load (the server is stateless and scales horizontally)
 4. Check network latency to backends
 
 ### Issue: Authentication Failures
@@ -755,18 +720,14 @@ wpa_supplicant -c eapol_test.conf -i eth0 -D wired
 If issues arise, rollback quickly:
 
 ```bash
-# Immediate rollback (HAProxy)
-# Edit haproxy.cfg:
-backend radius_servers
-    server freeradius 10.0.1.10:1812 weight 100
-    server usg-radius 10.0.1.20:1812 weight 0 backup
+# Immediate rollback: repoint affected NAS devices back to the FreeRADIUS IP.
+#   (Per-NAS cutover means rollback is just changing the NAS RADIUS server entry back.)
 
-# Kubernetes rollback
-kubectl rollout undo deployment/radius-server
+# BGP-driven cutover: stop advertising the USG RADIUS VIP (or lower its preference)
+#   so traffic returns to FreeRADIUS.
 
-# Docker Compose rollback
-docker-compose down usg-radius
-docker-compose up -d freeradius
+# Roll back a bad USG RADIUS image/config without touching FreeRADIUS:
+kubectl -n radius rollout undo deployment/usg-radius-server
 ```
 
 **Post-Rollback**:
@@ -788,7 +749,7 @@ Before decommissioning FreeRADIUS:
 - [ ] Monitoring dashboards showing healthy metrics
 - [ ] Backend integrations functional (LDAP, PostgreSQL)
 - [ ] Proxy routing working as expected
-- [ ] HA failover tested and validated
+- [ ] Anycast failover tested (drain a node / delete a pod; VIP stays reachable)
 - [ ] Team trained on new system
 - [ ] Documentation updated
 

@@ -27,14 +27,15 @@ Tested on: AWS c5.2xlarge (8 vCPUs, 16 GB RAM)
 | **CPU (8 cores)** | 20% | 45% | 40% | 60% |
 | **Cache Hit Rate** | 95% | 92% | 90% | N/A |
 
-### HA Cluster Performance (3 Nodes + Valkey)
+### Scaling Across Replicas
 
-| Metric | Value | Notes |
-|--------|-------|-------|
-| **Total Throughput** | 120,000 RPS | 3x40k per node |
-| **Latency Overhead** | +0.3ms | Valkey network RTT |
-| **Failover Time** | <100ms | Automatic with HAProxy |
-| **Cross-Server Consistency** | 99.99% | Cache TTL = 30s |
+The server is stateless, so cluster throughput scales by adding replicas to the Kubernetes
+Deployment. Inbound RADIUS traffic is distributed across Ready pods via the Cilium BGP L3
+anycast VIP (ECMP at the upstream router). There is no shared-state backend and therefore
+no cross-pod consistency window or backend RTT to account for — aggregate throughput is
+approximately the per-pod figure above multiplied by the replica count, bounded by the
+router's ECMP fan-out and per-flow hashing. See
+[HIGH_AVAILABILITY.md](./HIGH_AVAILABILITY.md).
 
 ### Comparison with FreeRADIUS
 
@@ -139,7 +140,7 @@ done
 cargo install flamegraph
 
 # Profile the server
-sudo cargo flamegraph --bin usg-radius-workspace -- config.json
+sudo cargo flamegraph --bin usg-radius -- config.json
 
 # Generate interactive flamegraph
 # Opens: flamegraph.svg
@@ -153,7 +154,7 @@ sudo apt-get install valgrind
 
 # Run with memory profiling
 valgrind --tool=massif --massif-out-file=massif.out \
-  ./target/release/usg-radius-workspace config.json
+  ./target/release/usg-radius config.json
 
 # Analyze results
 ms_print massif.out
@@ -205,36 +206,27 @@ sudo sysctl -p
 
 ```bash
 # Pin RADIUS to specific cores for better cache locality
-taskset -c 0-7 ./target/release/usg-radius-workspace config.json
+taskset -c 0-7 ./target/release/usg-radius config.json
 ```
 
 ### 2. Application Tuning
 
-#### Cache Configuration
+#### Request Cache
+
+The server keeps an in-memory request cache for duplicate detection (per pod). Tune its
+TTL to the RADIUS retransmit window:
 
 ```json
 {
-  "state_backend": {
-    "type": "valkey",
-    "url": "redis://valkey:6379",
-    "cache_ttl_secs": 30,  // ⚡ Lower = more consistent, higher = faster
-    "max_retries": 3,
-    "retry_delay_ms": 100,
-    "connection_timeout_ms": 3000,
-    "pool_size": 50  // ⚡ Increase for high concurrency
-  }
+  "request_cache_ttl": 60,  // ⚡ Duplicate-detection window, in seconds
+  "request_cache_max_entries": 10000
 }
 ```
 
 **Tuning Guidelines**:
-- **cache_ttl_secs**:
-  - 10s = High consistency, moderate performance
-  - 30s = Balanced (default)
-  - 60s = High performance, lower consistency
-- **pool_size**:
-  - Formula: `concurrent_requests / 10`
-  - Minimum: 10
-  - Maximum: 100
+- **request_cache_ttl**: match your NAS retransmit/timeout window (commonly 30–60s).
+- **request_cache_max_entries**: cap to bound memory; size for your peak concurrent
+  in-flight requests per pod.
 
 #### Rate Limiting
 
@@ -304,9 +296,9 @@ RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data" \
   cargo build --release
 
 # Step 2: Run typical workload
-./target/release/usg-radius-workspace config.json &
+./target/release/usg-radius config.json &
 cargo run --bin radius_load_test -- --duration 60
-killall usg-radius-workspace
+killall usg-radius
 
 # Step 3: Merge profiling data
 llvm-profdata merge -o /tmp/pgo-data/merged.profdata /tmp/pgo-data
@@ -338,64 +330,42 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 # Expected improvement: 5-10% faster
 ```
 
-### 4. HA Cluster Tuning
+### 4. Kubernetes Resource & Replica Tuning
 
-#### Valkey Configuration
+Because the server is stateless, cluster tuning is mostly about right-sizing pods and
+choosing a replica count. There is no shared-state backend or UDP load balancer to tune.
 
-```conf
-# valkey.conf
-maxmemory 2gb
-maxmemory-policy allkeys-lru  # Evict least recently used
+#### Resource Requests/Limits
 
-# Persistence (affects write performance)
-save 900 1       # Save after 900s if 1+ keys changed
-save 300 10      # Save after 300s if 10+ keys changed
-save 60 10000    # Save after 60s if 10000+ keys changed
+Set CPU/memory requests close to observed steady-state usage (simple auth pods are tiny —
+tens of MB) and headroom limits for bursts. Per-pod throughput tracks CPU; see the
+[vertical scaling](#vertical-scaling-single-server) table for the per-pod RPS you can expect
+at a given CPU allocation.
 
-# Disable for maximum performance (risky)
-# save ""
-
-# Append-only file for durability
-appendonly yes
-appendfsync everysec  # Balance safety and performance
+```yaml
+resources:
+  requests:
+    cpu: "1"
+    memory: "128Mi"
+  limits:
+    cpu: "4"
+    memory: "512Mi"
 ```
 
-**Tuning**:
-- **Development**: Disable persistence (`save ""`)
-- **Production**: Use AOF with `everysec`
-- **High Performance**: Use replication instead of persistence
+#### Replica Count
 
-#### HAProxy Configuration
-
-```conf
-# haproxy.cfg
-global
-    maxconn 100000  # ⚡ Maximum concurrent connections
-
-defaults
-    timeout connect 1s
-    timeout client 3s   # ⚡ Match RADIUS timeout
-    timeout server 3s
-
-frontend radius_auth
-    bind *:1812
-    mode udp
-    maxconn 100000
-    default_backend radius_servers_udp
-
-backend radius_servers_udp
-    mode udp
-    balance leastconn  # ⚡ Route to least loaded server
-    option udp-check
-    server radius1 radius-server-1:1812 check inter 5s
-    server radius2 radius-server-2:1812 check inter 5s
-    server radius3 radius-server-3:1812 check inter 5s
+```bash
+kubectl -n radius scale deploy/usg-radius-server --replicas=4
 ```
 
-**Algorithms**:
-- `roundrobin` - Even distribution
-- `leastconn` - Best for varying request complexity
-- `source` - Sticky sessions (session affinity)
+Inbound traffic is spread across Ready pods by the Cilium BGP L3 anycast VIP (ECMP at the
+router). Add replicas to add throughput; remove them to reclaim capacity. Keep enough
+replicas that losing one node still leaves headroom.
+
+#### Node-Level Tuning
+
+Apply the [OS tuning](#1-operating-system-tuning) (file descriptors, UDP buffers) to the
+nodes hosting radius pods, since each pod uses the host network path for UDP.
 
 ---
 
@@ -417,26 +387,31 @@ backend radius_servers_udp
 - Memory is rarely the bottleneck (50-200 MB typical)
 - Network bandwidth more important than CPU for simple auth
 
-### Horizontal Scaling (HA Cluster)
+### Horizontal Scaling (Add Replicas)
+
+The server is stateless, so scaling out is simply adding replicas to the Deployment.
+Because there is no shared-state backend, scaling is near-linear — the limiting factors are
+the upstream router's ECMP fan-out and per-flow hashing, plus per-node NIC/CPU.
 
 ```
-1 server  → 50,000 RPS
-2 servers → 95,000 RPS (95% efficiency)
-3 servers → 135,000 RPS (90% efficiency)
-4 servers → 170,000 RPS (85% efficiency)
+1 replica  → ~50,000 RPS
+2 replicas → ~100,000 RPS
+3 replicas → ~150,000 RPS
+4 replicas → ~200,000 RPS
 ```
 
-**Efficiency Loss Reasons**:
-1. Valkey becomes bottleneck (shared state)
-2. HAProxy overhead (~5%)
-3. Network latency between nodes
+```bash
+kubectl -n radius scale deploy/usg-radius-server --replicas=4
+```
 
-**Solutions**:
-1. **Valkey Cluster**: Shard across multiple Valkey instances
-2. **Regional Deployment**: Separate clusters per region
-3. **Read Replicas**: For read-heavy workloads
+**Notes**:
+1. Spread replicas across nodes (anti-affinity) so each advertises the VIP and ECMP can
+   balance across them.
+2. There is no central bottleneck to shard — no shared-state store, no UDP load balancer.
+3. Effective per-client distribution depends on the router's per-flow hash; a single NAS's
+   traffic may pin to one path.
 
-### Geographic Distribution
+### Multi-Cluster / Geographic Distribution
 
 ```
         ┌──────────────┐
@@ -451,15 +426,17 @@ backend radius_servers_udp
 └────────┘  └────────┘  └────────┘
 ```
 
+Run an independent stateless deployment (its own anycast VIP) per region. Because pods
+share no state, regions are fully independent.
+
 **Benefits**:
-- Lower latency (users route to nearest region)
-- Higher availability (region failover)
-- Better performance (reduced network hops)
+- Lower latency (NAS devices point at the nearest region's VIP)
+- Higher availability (region-level failover)
+- No cross-region state replication to manage
 
 **Implementation**:
-- Use Valkey Cluster with replication
-- Configure DNS-based routing
-- Deploy HAProxy per region
+- Deploy `deploy/overlays/<env>` per cluster with a region-local VIP
+- Use GeoDNS or per-region NAS configuration to route to the nearest VIP
 
 ---
 
@@ -483,9 +460,8 @@ cargo run --bin radius_load_test -- --verbose
 |-------|-----------|----------|
 | **Backend Slow** | `curl /health` shows high DB latency | Optimize queries, add indexes, increase pool size |
 | **Cache Misses** | Low cache hit rate in metrics | Increase cache TTL, add more memory |
-| **Network** | High RTT to Valkey | Deploy Valkey closer to servers |
-| **CPU Bound** | `top` shows 100% CPU | Vertical scaling or add more nodes |
-| **Disk I/O** | `iostat` shows high await | Use SSD, disable Valkey persistence |
+| **Backend Network** | High RTT to PostgreSQL/LDAP | Place backends closer to the cluster |
+| **CPU Bound** | `top` shows 100% CPU | Larger CPU limits or add replicas |
 
 ### Symptom: Low Throughput
 
@@ -521,7 +497,7 @@ while true; do
 done
 
 # Profile with Valgrind
-valgrind --leak-check=full ./target/release/usg-radius-workspace config.json
+valgrind --leak-check=full ./target/release/usg-radius config.json
 ```
 
 #### Causes & Solutions
@@ -546,9 +522,6 @@ psql -U radius -h localhost -d radiusdb -c "SELECT 1;"
 
 # LDAP
 ldapsearch -H ldaps://ldap.example.com -D bind_dn -w password -b base_dn "(uid=test)"
-
-# Valkey
-redis-cli -h valkey ping
 ```
 
 #### Solutions
@@ -556,7 +529,7 @@ redis-cli -h valkey ping
 1. **Increase timeouts**:
    ```json
    {
-     "state_backend": {
+     "auth_handler": {
        "connection_timeout_ms": 5000,
        "acquire_timeout_secs": 10
      }
@@ -587,7 +560,7 @@ redis-cli -h valkey ping
 
 ### ✅ Do
 
-1. **Enable HA for production**: Shared state prevents single point of failure
+1. **Run multiple replicas in production**: spreads load and survives node/pod loss
 2. **Use connection pooling**: Reuse connections to backends
 3. **Monitor metrics**: Track RPS, latency, cache hit rate
 4. **Profile before optimizing**: Measure to find real bottlenecks
@@ -634,10 +607,10 @@ histogram_quantile(0.99, rate(radius_request_duration_seconds_bucket[5m]))
 # Cache hit rate
 radius_cache_hits_total / (radius_cache_hits_total + radius_cache_misses_total)
 
-# Backend health
-radius_backend_up
+# Per-pod request rate (split by pod)
+sum by (pod) (rate(radius_requests_total[5m]))
 ```
 
 ---
 
-**Next Steps**: See [QUICKSTART.md](./QUICKSTART.md) to deploy and [HIGH_AVAILABILITY.md](./HIGH_AVAILABILITY.md) for cluster configuration.
+**Next Steps**: See [QUICKSTART.md](./QUICKSTART.md) to deploy and [HIGH_AVAILABILITY.md](./HIGH_AVAILABILITY.md) for the availability and scaling model.

@@ -1,12 +1,12 @@
-//! Prometheus metrics exporter for HA deployments
+//! Prometheus metrics exporter
 //!
 //! Provides HTTP endpoint for Prometheus metrics scraping.
-//! Exports metrics about backend health, cache statistics, rate limiting,
-//! and session management.
+//! Exports metrics about backend health, cache statistics, and
+//! session management.
 
-#[cfg(feature = "ha")]
+#[cfg(feature = "observability")]
 use crate::state::SharedSessionManager;
-#[cfg(feature = "ha")]
+#[cfg(feature = "observability")]
 use axum::{
     Router,
     extract::State,
@@ -14,22 +14,22 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-#[cfg(feature = "ha")]
+#[cfg(feature = "observability")]
 use std::sync::Arc;
-#[cfg(feature = "ha")]
+#[cfg(feature = "observability")]
 use std::time::SystemTime;
-#[cfg(feature = "ha")]
+#[cfg(feature = "observability")]
 use tower_http::trace::TraceLayer;
 
 /// Prometheus metrics in text format
-#[cfg(feature = "ha")]
+#[cfg(feature = "observability")]
 #[derive(Debug, Clone)]
 pub struct PrometheusMetrics {
     /// Metrics content in Prometheus text format
     pub content: String,
 }
 
-#[cfg(feature = "ha")]
+#[cfg(feature = "observability")]
 impl PrometheusMetrics {
     /// Create new Prometheus metrics
     pub fn new() -> Self {
@@ -77,7 +77,7 @@ impl PrometheusMetrics {
     }
 }
 
-#[cfg(feature = "ha")]
+#[cfg(feature = "observability")]
 impl Default for PrometheusMetrics {
     fn default() -> Self {
         Self::new()
@@ -85,43 +85,21 @@ impl Default for PrometheusMetrics {
 }
 
 /// Metrics server state
-#[cfg(feature = "ha")]
+#[cfg(feature = "observability")]
 #[derive(Clone)]
 pub struct MetricsState {
     session_manager: Arc<SharedSessionManager>,
-    rate_limiter: Option<Arc<crate::ratelimit_ha::SharedRateLimiter>>,
-    request_cache: Option<Arc<crate::cache_ha::SharedRequestCache>>,
     start_time: SystemTime,
 }
 
-#[cfg(feature = "ha")]
+#[cfg(feature = "observability")]
 impl MetricsState {
     /// Create new metrics state
     pub fn new(session_manager: Arc<SharedSessionManager>) -> Self {
         Self {
             session_manager,
-            rate_limiter: None,
-            request_cache: None,
             start_time: SystemTime::now(),
         }
-    }
-
-    /// Create new metrics state with rate limiter
-    pub fn with_rate_limiter(
-        mut self,
-        rate_limiter: Arc<crate::ratelimit_ha::SharedRateLimiter>,
-    ) -> Self {
-        self.rate_limiter = Some(rate_limiter);
-        self
-    }
-
-    /// Create new metrics state with request cache
-    pub fn with_request_cache(
-        mut self,
-        request_cache: Arc<crate::cache_ha::SharedRequestCache>,
-    ) -> Self {
-        self.request_cache = Some(request_cache);
-        self
     }
 
     /// Collect all metrics
@@ -133,9 +111,6 @@ impl MetricsState {
 
         // Cache metrics
         self.collect_cache_metrics(&mut metrics);
-
-        // Rate limiter metrics
-        self.collect_rate_limiter_metrics(&mut metrics).await;
 
         // Uptime metric
         self.collect_uptime_metrics(&mut metrics);
@@ -152,7 +127,7 @@ impl MetricsState {
 
         metrics.add_metric_with_labels(
             "radius_backend_up",
-            &[("backend", "valkey")],
+            &[("backend", "memory")],
             backend_up,
             "Backend connectivity status (1 = up, 0 = down)",
         );
@@ -169,41 +144,6 @@ impl MetricsState {
         );
     }
 
-    /// Collect rate limiter metrics
-    async fn collect_rate_limiter_metrics(&self, metrics: &mut PrometheusMetrics) {
-        if let Some(ref rate_limiter) = self.rate_limiter {
-            let stats = rate_limiter.get_stats();
-
-            // Rate limit configuration
-            metrics.add_metric(
-                "radius_ratelimit_per_client_limit",
-                stats.per_client_limit,
-                "Per-client rate limit (requests per window)",
-            );
-
-            metrics.add_metric(
-                "radius_ratelimit_global_limit",
-                stats.global_limit,
-                "Global rate limit (requests per window)",
-            );
-
-            metrics.add_metric(
-                "radius_ratelimit_window_duration_seconds",
-                stats.window_duration_secs,
-                "Rate limit window duration in seconds",
-            );
-
-            // Current window counts
-            if let Ok(global_count) = rate_limiter.get_global_count().await {
-                metrics.add_metric(
-                    "radius_ratelimit_current_global_count",
-                    global_count,
-                    "Current global request count in active window",
-                );
-            }
-        }
-    }
-
     /// Collect uptime metrics
     fn collect_uptime_metrics(&self, metrics: &mut PrometheusMetrics) {
         let uptime = self.start_time.elapsed().unwrap_or_default().as_secs();
@@ -213,7 +153,7 @@ impl MetricsState {
 }
 
 /// Metrics endpoint handler
-#[cfg(feature = "ha")]
+#[cfg(feature = "observability")]
 async fn metrics_handler(State(state): State<MetricsState>) -> Response {
     let metrics = state.collect_metrics().await;
 
@@ -226,7 +166,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> Response {
 }
 
 /// Create metrics HTTP server
-#[cfg(feature = "ha")]
+#[cfg(feature = "observability")]
 pub fn create_metrics_server(session_manager: Arc<SharedSessionManager>) -> Router {
     let state = MetricsState::new(session_manager);
 
@@ -237,7 +177,7 @@ pub fn create_metrics_server(session_manager: Arc<SharedSessionManager>) -> Rout
 }
 
 /// Start metrics HTTP server on the specified address
-#[cfg(feature = "ha")]
+#[cfg(feature = "observability")]
 pub async fn start_metrics_server(
     session_manager: Arc<SharedSessionManager>,
     addr: std::net::SocketAddr,
@@ -252,7 +192,7 @@ pub async fn start_metrics_server(
     Ok(())
 }
 
-#[cfg(all(test, feature = "ha"))]
+#[cfg(all(test, feature = "observability"))]
 mod tests {
     use super::*;
     use crate::state::MemoryStateBackend;
@@ -329,7 +269,7 @@ mod tests {
         state.collect_backend_metrics(&mut metrics).await;
 
         assert!(metrics.content.contains("radius_backend_up"));
-        assert!(metrics.content.contains("backend=\"valkey\""));
+        assert!(metrics.content.contains("backend=\"memory\""));
         assert!(metrics.content.contains(" 1")); // MemoryStateBackend is always up
     }
 
@@ -372,47 +312,5 @@ mod tests {
         assert!(metrics.content.contains("radius_backend_up"));
         assert!(metrics.content.contains("radius_cache_entries"));
         assert!(metrics.content.contains("radius_uptime_seconds"));
-    }
-
-    #[tokio::test]
-    async fn test_metrics_with_rate_limiter() {
-        use crate::ratelimit_ha::{SharedRateLimitConfig, SharedRateLimiter};
-        use std::time::Duration;
-
-        let backend = Arc::new(MemoryStateBackend::new());
-        let session_manager = Arc::new(SharedSessionManager::new(backend));
-
-        let rate_limiter_config = SharedRateLimitConfig {
-            per_client_limit: 100,
-            global_limit: 1000,
-            window_duration: Duration::from_secs(60),
-        };
-
-        let rate_limiter = Arc::new(SharedRateLimiter::new(
-            Arc::clone(&session_manager),
-            rate_limiter_config,
-        ));
-
-        let state = MetricsState::new(session_manager).with_rate_limiter(rate_limiter);
-
-        let metrics = state.collect_metrics().await;
-
-        // Should contain rate limiter metrics
-        assert!(
-            metrics
-                .content
-                .contains("radius_ratelimit_per_client_limit")
-        );
-        assert!(metrics.content.contains("radius_ratelimit_global_limit"));
-        assert!(
-            metrics
-                .content
-                .contains("radius_ratelimit_window_duration_seconds")
-        );
-        assert!(
-            metrics
-                .content
-                .contains("radius_ratelimit_current_global_count")
-        );
     }
 }

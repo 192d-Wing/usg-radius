@@ -6,7 +6,7 @@ resolver = "2"
 version = "0.7.0"
 edition = "2024"
 authors = ["John Edward Willman V <john.willman.1@us.af.mil>"]
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 repository = "https://github.com/192d-Cyberspace-Control-Squadron/usg-radius"
 
 [workspace.dependencies]
@@ -46,9 +46,6 @@ dashmap = "6.1"
 # Async traits
 async-trait = "0.1"
 
-# State backends
-redis = { version = "0.27", default-features = false }
-
 # Regular expressions
 regex = "1.10"
 
@@ -56,7 +53,10 @@ regex = "1.10"
 chrono = "0.4"
 
 # HTTP client (for CRL/OCSP fetching)
-reqwest = { version = "0.12", features = ["blocking"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "rustls-tls",
+] }
 url = "2.5"
 
 # HTTP server (for health checks and metrics)
@@ -116,7 +116,7 @@ path = "tools/radius_load_test.rs"
 [features]
 default = []
 tls = ["radius-proto/tls", "radius-server/tls"]
-ha = ["radius-server/ha"]
+observability = ["radius-server/observability"]
 revocation = ["radius-proto/revocation"]
 
 [dev-dependencies]

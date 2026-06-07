@@ -1,0 +1,49 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# k3s overlay (e.g. homelab / edge). k3s must be installed WITHOUT its bundled
+# networking so Cilium can own it — see this directory's README.md.
+resources:
+  - ../../base
+
+images:
+  - name: usg-radius-server
+    newName: usg-radius-server
+    newTag: latest
+
+replicas:
+  - name: usg-radius-server
+    count: 2
+
+patches:
+  # Homelab VIP addresses.
+  - target:
+      kind: CiliumLoadBalancerIPPool
+      name: usg-radius-vip
+    patch: |-
+      - op: replace
+        path: /spec/blocks
+        value:
+          - cidr: "192.168.50.10/32"
+          - cidr: "fd00:50::10/128"
+  # Homelab BGP local ASN and upstream peer (e.g. your router running BGP).
+  - target:
+      kind: CiliumBGPClusterConfig
+      name: usg-radius-bgp
+    patch: |-
+      - op: replace
+        path: /spec/bgpInstances/0/localASN
+        value: 65001
+      - op: replace
+        path: /spec/bgpInstances/0/peers
+        value:
+          - name: router-v4
+            peerASN: 64512
+            peerAddress: "192.168.50.1"
+            peerConfigRef:
+              name: usg-radius-peer
+          - name: router-v6
+            peerASN: 64512
+            peerAddress: "fd00:50::1"
+            peerConfigRef:
+              name: usg-radius-peer

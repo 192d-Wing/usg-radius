@@ -1,0 +1,81 @@
+---
+# Cilium BGP control plane (BGP v2 API, Cilium 1.16 / cilium.io/v2alpha1).
+#
+# Every selected node peers with the upstream router(s) and advertises the RADIUS
+# LoadBalancer VIP. Because the Service uses externalTrafficPolicy: Local, Cilium
+# only advertises the VIP from nodes that currently have a Ready radius pod, so the
+# router learns the VIP via ECMP from exactly those nodes = L3 anycast.
+#
+# Replace the placeholder ASNs and peerAddress values per environment (overlay).
+# The upstream router must accept multiple equal-cost paths (ECMP / BGP multipath)
+# for the VIP to be truly anycast rather than active/standby.
+apiVersion: cilium.io/v2alpha1
+kind: CiliumBGPClusterConfig
+metadata:
+  name: usg-radius-bgp
+  labels:
+    app.kubernetes.io/part-of: usg-radius
+spec:
+  # Empty matchLabels selects all nodes. Narrow this (e.g. a node label) if only
+  # some nodes should peer/advertise.
+  nodeSelector:
+    matchLabels: {}
+  bgpInstances:
+    - name: "usg-radius"
+      localASN: 65000
+      peers:
+        # IPv4 BGP session to the upstream router.
+        - name: "upstream-v4"
+          peerASN: 64512
+          peerAddress: "192.0.2.1"
+          peerConfigRef:
+            name: usg-radius-peer
+        # IPv6 BGP session to the upstream router. Remove if your router carries
+        # both AFIs over a single (v4 or v6) session.
+        - name: "upstream-v6"
+          peerASN: 64512
+          peerAddress: "2001:db8:net::1"
+          peerConfigRef:
+            name: usg-radius-peer
+---
+apiVersion: cilium.io/v2alpha1
+kind: CiliumBGPPeerConfig
+metadata:
+  name: usg-radius-peer
+  labels:
+    app.kubernetes.io/part-of: usg-radius
+spec:
+  timers:
+    holdTimeSeconds: 9
+    keepAliveTimeSeconds: 3
+  gracefulRestart:
+    enabled: true
+    restartTimeSeconds: 15
+  families:
+    - afi: ipv4
+      safi: unicast
+      advertisements:
+        matchLabels:
+          advertise: "radius-vip"
+    - afi: ipv6
+      safi: unicast
+      advertisements:
+        matchLabels:
+          advertise: "radius-vip"
+---
+apiVersion: cilium.io/v2alpha1
+kind: CiliumBGPAdvertisement
+metadata:
+  name: usg-radius-vip
+  labels:
+    advertise: "radius-vip"
+    app.kubernetes.io/part-of: usg-radius
+spec:
+  advertisements:
+    - advertisementType: "Service"
+      service:
+        addresses:
+          - LoadBalancerIP
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: usg-radius-server

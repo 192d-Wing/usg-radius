@@ -1,14 +1,19 @@
 # USG RADIUS Deployment Guide
 
-This guide covers deploying USG RADIUS in various environments.
+USG RADIUS is deployed **only** on Kubernetes (k3s or k8s) with the Cilium CNI. The server
+runs as a stateless `Deployment`; scaling and availability come from the ReplicaSet plus an
+L3 anycast VIP advertised by Cilium's BGP control plane. Compose-based deployments, systemd
+units, external load balancers, and bare-metal installs are no longer supported.
+
+This guide covers the server's CLI and configuration. For deployment mechanics see the
+canonical reference [`deploy/README.md`](../../../deploy/README.md), the
+[Quick Start](./QUICKSTART.md), and [Availability & Scaling](./HIGH_AVAILABILITY.md).
 
 ## Table of Contents
 
 - [Command Line Interface](#command-line-interface)
-- [Quick Start](#quick-start)
-- [Docker Deployment](#docker-deployment)
-- [Systemd Deployment](#systemd-deployment)
-- [Production Checklist](#production-checklist)
+- [Deploying on Kubernetes](#deploying-on-kubernetes)
+- [Configuration](#configuration)
 - [Security Hardening](#security-hardening)
 - [Monitoring](#monitoring)
 - [Troubleshooting](#troubleshooting)
@@ -17,10 +22,13 @@ This guide covers deploying USG RADIUS in various environments.
 
 ## Command Line Interface
 
+The container image is `usg-radius-server` and the binary inside it is `usg-radius`. The
+same binary is used for local development and validation.
+
 ### Usage
 
 ```text
-usg_radius [OPTIONS] [CONFIG]
+usg-radius [OPTIONS] [CONFIG]
 ```
 
 ### Arguments
@@ -38,23 +46,13 @@ usg_radius [OPTIONS] [CONFIG]
 **Check version:**
 
 ```bash
-usg_radius --version
-```
-
-**Output:**
-
-```text
-USG RADIUS Server v0.1.0
-RFC 2865 RADIUS Authentication Server
-
-Repository: https://github.com/192d-Cyberspace-Control-Squadron/usg-radius
-License: AGPL-3.0-or-later
+usg-radius --version
 ```
 
 **Validate configuration:**
 
 ```bash
-usg_radius --validate /etc/radius/config.json
+usg-radius --validate /etc/radius/config.json
 ```
 
 **Output:**
@@ -77,359 +75,80 @@ Authorized clients:
   ✗ 203.0.113.100 - Remote NAS (disabled for testing)
 ```
 
-**Start server with custom config:**
+**Start server with a config file:**
 
 ```bash
-usg_radius /etc/radius/config.json
+usg-radius /etc/radius/config.json
 ```
 
-**Start server with default config:**
+For local development you can run the same binary via Cargo:
 
 ```bash
-usg_radius
-# Uses config.json in current directory
-```
-
----
-
-## Quick Start
-
-### Prerequisites
-
-- Rust 1.70+ (for building from source)
-- Linux system (production deployments)
-- Network access to RADIUS clients (NAS devices)
-
-### Build from Source
-
-```bash
-# Clone repository
-git clone https://github.com/192d-Cyberspace-Control-Squadron/usg-radius.git
-cd usg-radius
-
-# Build release binary
-cargo build --release
-
-# Binary location
-./target/release/usg_radius
-```
-
-### Test Configuration
-
-```bash
-# Copy example config
-cp config.example.json config.json
-
-# Edit configuration
-vim config.json
-
-# Test configuration (doesn't start server)
 cargo run --release -- --validate config.json
-
-# Run server
-cargo run --release
+cargo run --release -- config.json
 ```
 
 ---
 
-## Docker Deployment
+## Deploying on Kubernetes
 
-### Option 1: Docker Compose (Recommended)
+The full flow is documented in [`deploy/README.md`](../../../deploy/README.md). In brief:
 
-**Step 1: Create environment file**
+1. Install Cilium with the provided values
+   ([`deploy/cilium/values-k3s.yaml`](../../../deploy/cilium/values-k3s.yaml) or
+   [`values-k8s.yaml`](../../../deploy/cilium/values-k8s.yaml)) — these enable DSR mode
+   (no SNAT), the BGP control plane, and dual-stack.
+2. Build and push the multi-arch image:
 
-```bash
-cp examples/docker/.env.example .env
-vim .env  # Edit secrets
-```
+   ```bash
+   docker buildx build --platform linux/amd64,linux/arm64 \
+     -t <registry>/usg-radius-server:<tag> --push .
+   ```
 
-**Step 2: Start service**
+3. Edit the overlay (`deploy/overlays/k3s` or `deploy/overlays/k8s`): image, VIP CIDRs,
+   BGP ASNs/peers, and the RADIUS config Secret.
+4. Apply:
 
-```bash
-docker-compose up -d
-```
+   ```bash
+   kubectl apply -k deploy/overlays/k8s    # or deploy/overlays/k3s
+   ```
 
-**Step 3: View logs**
+Why the networking settings matter: RADIUS authorizes clients by **source IP**, so the NAS
+address must reach the server unchanged. `externalTrafficPolicy: Local` preserves the
+source IP and makes Cilium advertise the VIP only from nodes with a Ready pod, and Cilium
+**DSR mode (no SNAT)** keeps the original source IP on the load-balanced path. See
+[Availability & Scaling](./HIGH_AVAILABILITY.md) for the full model.
 
-```bash
-docker-compose logs -f radius
-```
+### Ports
 
-**Step 4: Stop service**
+| Port | Proto | Purpose                | Exposed on VIP |
+|------|-------|------------------------|----------------|
+| 1812 | UDP   | RADIUS authentication  | yes            |
+| 1813 | UDP   | RADIUS accounting      | yes            |
+| 2812 | TCP   | health (`/health/*`)   | no (ClusterIP) |
+| 3812 | TCP   | metrics (`/metrics`)   | no (ClusterIP) |
 
-```bash
-docker-compose down
-```
-
-### Option 2: Docker Run
-
-```bash
-# Build image
-docker build -t usg-radius .
-
-# Run container
-docker run -d \
-  --name usg-radius \
-  --network host \
-  -v $(pwd)/config.json:/etc/radius/config.json:ro \
-  -v radius-logs:/var/log/radius \
-  -e RADIUS_SECRET=your_secret_here \
-  usg-radius
-```
-
-### Docker Production Deployment
-
-**Use Docker secrets:**
-
-```bash
-# Create secrets
-echo "your_radius_secret" | docker secret create radius_secret -
-
-# Update docker-compose.yml to use secrets
-version: '3.8'
-services:
-  radius:
-    secrets:
-      - radius_secret
-    environment:
-      - RADIUS_SECRET_FILE=/run/secrets/radius_secret
-
-secrets:
-  radius_secret:
-    external: true
-```
-
-**Health checks:**
-
-Docker Compose includes health checks. Monitor with:
-
-```bash
-docker inspect --format='{{.State.Health.Status}}' usg-radius
-```
+Health and metrics endpoints are served by the binary when built with the `observability`
+cargo feature.
 
 ---
 
-## Systemd Deployment
+## Configuration
 
-### Installation
-
-**Step 1: Build binary**
-
-```bash
-cargo build --release
-sudo cp target/release/usg_radius /usr/local/bin/
-sudo chmod 755 /usr/local/bin/usg_radius
-```
-
-**Step 2: Create user and directories**
+Configuration is supplied as a JSON file, mounted into the pod from a Kubernetes Secret.
+Generate strong secrets and never commit them to version control:
 
 ```bash
-sudo useradd -r -s /bin/false radius
-sudo mkdir -p /etc/radius /var/lib/radius /var/log/radius
-sudo chown radius:radius /etc/radius /var/lib/radius /var/log/radius
-sudo chmod 750 /etc/radius /var/lib/radius /var/log/radius
+openssl rand -base64 32
 ```
 
-**Step 3: Install configuration**
+Validate any config before rolling it out:
 
 ```bash
-sudo cp config.json /etc/radius/config.json
-sudo chown radius:radius /etc/radius/config.json
-sudo chmod 600 /etc/radius/config.json
+usg-radius --validate config.json
 ```
 
-**Step 4: Install systemd service**
-
-```bash
-sudo cp examples/systemd/usg-radius.service /etc/systemd/system/
-sudo systemctl daemon-reload
-```
-
-**Step 5: Enable and start**
-
-```bash
-sudo systemctl enable usg-radius
-sudo systemctl start usg-radius
-```
-
-### Management
-
-```bash
-# Check status
-sudo systemctl status usg-radius
-
-# View logs
-sudo journalctl -u usg-radius -f
-
-# Restart service
-sudo systemctl restart usg-radius
-
-# Stop service
-sudo systemctl stop usg-radius
-
-# Disable service
-sudo systemctl disable usg-radius
-```
-
-### Port Binding (<1024)
-
-RADIUS uses port 1812 by default, which requires privileges. Options:
-
-**Option 1: Use capabilities (recommended)**
-
-```bash
-sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/usg_radius
-```
-
-**Option 2: Run as root (not recommended)**
-
-Modify systemd service:
-
-```ini
-[Service]
-User=root
-Group=root
-```
-
-**Option 3: Use high port (>1024)**
-
-Configure clients to use custom port:
-
-```json
-{
-  "listen_port": 11812
-}
-```
-
----
-
-## Production Checklist
-
-### Pre-Deployment
-
-- [ ] **Configuration validated**
-
-  ```bash
-  usg_radius --validate /etc/radius/config.json
-  ```
-
-- [ ] **Strong secrets generated**
-
-  ```bash
-  openssl rand -base64 32
-  ```
-
-- [ ] **Secrets stored securely**
-  - Use environment variables
-  - Never commit to version control
-  - Use secret management (Vault, AWS Secrets Manager)
-
-- [ ] **File permissions configured**
-
-  ```bash
-  chmod 600 /etc/radius/config.json
-  chown radius:radius /etc/radius/config.json
-  ```
-
-- [ ] **Firewall rules configured**
-
-  ```bash
-  # UFW example
-  sudo ufw allow from 192.168.1.0/24 to any port 1812 proto udp
-
-  # iptables example
-  sudo iptables -A INPUT -s 192.168.1.0/24 -p udp --dport 1812 -j ACCEPT
-  sudo iptables -A INPUT -p udp --dport 1812 -j DROP
-  ```
-
-- [ ] **Logging configured**
-  - Audit log path set
-  - Log rotation configured (logrotate)
-  - Log aggregation setup
-
-- [ ] **Monitoring configured**
-  - Health checks
-  - Alert on failures
-  - Metrics collection
-
-### Post-Deployment
-
-- [ ] **Test authentication**
-
-  ```bash
-  # Using radtest (from freeradius-utils package)
-  radtest username password localhost 1812 testing123
-  ```
-
-- [ ] **Verify audit logs**
-
-  ```bash
-  tail -f /var/log/radius/audit.log
-  ```
-
-- [ ] **Check resource usage**
-
-  ```bash
-  # CPU and memory
-  top -p $(pgrep usg_radius)
-
-  # Network connections
-  sudo ss -ulnp | grep 1812
-  ```
-
-- [ ] **Verify client connectivity**
-  - Test from each RADIUS client network
-  - Verify source IP validation
-  - Test rate limiting
-
-- [ ] **Document deployment**
-  - Record configuration decisions
-  - Document network topology
-  - List all RADIUS clients
-  - Create runbook for common issues
-
----
-
-## Security Hardening
-
-### Network Security
-
-**1. Firewall Configuration**
-
-Only allow RADIUS clients:
-
-```bash
-# Example: Allow specific networks
-sudo ufw allow from 192.168.1.0/24 to any port 1812 proto udp
-sudo ufw allow from 10.0.0.0/8 to any port 1812 proto udp
-sudo ufw deny 1812/udp
-```
-
-**2. Network Isolation**
-
-- Deploy RADIUS server in management VLAN
-- Use VPN for remote RADIUS clients
-- Never expose to public internet
-
-**3. IPsec/TLS**
-
-For future RadSec support (RADIUS over TLS).
-
-### Application Security
-
-**1. Configuration Security**
-
-```json
-{
-  "strict_rfc_compliance": true,
-  "request_cache_ttl": 60,
-  "audit_log_path": "/var/log/radius/audit.log"
-}
-```
-
-**2. Rate Limiting**
-
-Tune based on your needs:
+**Rate limiting** (per-pod; there is no cluster-wide rate limiting in the stateless model):
 
 ```json
 {
@@ -440,282 +159,119 @@ Tune based on your needs:
 }
 ```
 
-**3. Secret Management**
+**Hardening options**:
 
-```bash
-# Generate strong secrets
-openssl rand -base64 32
-
-# Use environment variables
-export RADIUS_SECRET=$(openssl rand -base64 32)
-
-# Or use secret management
-vault kv get -field=radius_secret secret/radius
+```json
+{
+  "strict_rfc_compliance": true,
+  "request_cache_ttl": 60,
+  "audit_log_path": "/var/log/radius/audit.log"
+}
 ```
 
-### System Security
+Secrets can be injected via environment variables referenced in the config (e.g.
+`RADIUS_SECRET`), sourced from a Kubernetes Secret.
 
-**1. SELinux/AppArmor**
+---
 
-Consider creating custom policies for additional isolation.
+## Security Hardening
 
-**2. File Permissions**
+### Network Security
 
-```bash
-# Config file (secrets inside)
-chmod 600 /etc/radius/config.json
-chown radius:radius /etc/radius/config.json
+- Restrict the VIP at the upstream router / firewall so only legitimate RADIUS clients
+  (NAS devices) can reach UDP 1812/1813.
+- Keep health (2812) and metrics (3812) endpoints internal (ClusterIP only) — they are not
+  exposed on the VIP.
+- Deploy in a management network segment; never expose RADIUS to the public internet.
+- Use Kubernetes `NetworkPolicy` to limit which namespaces/pods can reach the health and
+  metrics ports.
 
-# Log directory
-chmod 750 /var/log/radius
-chown radius:radius /var/log/radius
+### Application Security
 
-# Binary
-chmod 755 /usr/local/bin/usg_radius
-chown root:root /usr/local/bin/usg_radius
-```
+- Enable `strict_rfc_compliance`.
+- Tune per-client and global rate limits to mitigate DoS.
+- Use unique, strong shared secrets per client; rotate regularly.
+- Store all secrets in Kubernetes Secrets (or an external secret manager), not in images.
 
-**3. Resource Limits**
+### Image Security
 
-Systemd service includes resource limits. For manual deployment:
-
-```bash
-# /etc/security/limits.conf
-radius soft nofile 65536
-radius hard nofile 65536
-radius soft nproc 512
-radius hard nproc 512
-```
+The image is built on an Iron Bank hardened Alpine base via cargo-chef and is multi-arch
+(amd64/arm64). Pin image tags by digest in the overlay and scan images in your registry.
 
 ---
 
 ## Monitoring
 
-### Log Monitoring
-
-**Structured logs:**
-
-```bash
-# View all logs
-sudo journalctl -u usg-radius -f
-
-# Filter by level
-sudo journalctl -u usg-radius -p warning -f
-
-# View audit log
-tail -f /var/log/radius/audit.log | jq
-```
-
-**Log rotation:**
-
-```bash
-# /etc/logrotate.d/radius
-/var/log/radius/audit.log {
-    daily
-    rotate 90
-    compress
-    delaycompress
-    notifempty
-    create 0640 radius radius
-    sharedscripts
-    postrotate
-        systemctl reload usg-radius
-    endscript
-}
-```
-
 ### Health Checks
 
-**Systemd:**
+Kubernetes liveness/readiness probes use the health endpoints on TCP 2812:
 
 ```bash
-# Check service status
-systemctl is-active usg-radius
-
-# Check for crashes
-journalctl -u usg-radius --since "1 hour ago" | grep -i error
+curl http://<pod>:2812/health/live
+curl http://<pod>:2812/health/ready
 ```
 
-**Docker:**
-
-```bash
-# Health status
-docker inspect --format='{{.State.Health.Status}}' usg-radius
-
-# Container logs
-docker logs -f usg-radius
-```
+Because VIP advertisement is gated on pod readiness, a pod failing readiness both stops
+receiving traffic and causes its node to withdraw the anycast route when it was the last
+Ready pod there.
 
 ### Metrics
 
-Monitor these key metrics:
+Prometheus metrics are exposed on TCP 3812 at `/metrics`:
 
-- Authentication success rate
-- Authentication failures (potential attacks)
-- Rate limit violations
-- Request latency
-- Memory usage
-- CPU usage
-- Network throughput
+```bash
+curl http://<pod>:3812/metrics
+```
 
-**Future:** Prometheus metrics endpoint planned for v1.0.
+An optional Grafana dashboard ships under `deploy/monitoring/`. Key signals to track:
+authentication success/failure rate, rate-limit rejections, request latency, and per-pod
+CPU/memory.
+
+### Logs
+
+The server emits structured logs to stdout; collect them with your cluster's log pipeline:
+
+```bash
+kubectl -n radius logs -f deploy/usg-radius-server
+```
 
 ---
 
 ## Troubleshooting
 
-### Server Won't Start
+### Pods not receiving traffic
 
-**Problem:** Port permission denied
+- Confirm the Service has a dual-stack EXTERNAL-IP: `kubectl -n radius get svc usg-radius-server -o wide`.
+- Confirm BGP is up and the VIP is advertised: `cilium bgp peers` and
+  `cilium bgp routes advertised ipv4 unicast` / `ipv6 unicast`.
+- Confirm at least one node has a Ready radius pod (advertisement is node-selective via
+  `externalTrafficPolicy: Local`).
 
-```
-Error: Permission denied (os error 13)
-```
+### Authentication failures
 
-**Solution:** Use capabilities or run as root (port <1024)
+- Verify the client's **source IP** matches a configured client CIDR — with ETP=Local +
+  DSR the server sees the real NAS IP. If you see a node/pod IP in the logs, DSR/ETP is
+  misconfigured (check `cilium/values-*.yaml` and the Service annotation
+  `service.cilium.io/forwarding-mode: dsr`).
+- Verify the shared secret matches and the user exists in the configured backend.
 
-```bash
-sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/usg_radius
-```
-
----
-
-**Problem:** Port already in use
-
-```
-Error: Address already in use (os error 98)
-```
-
-**Solution:** Check for other RADIUS servers
-
-```bash
-sudo lsof -i :1812
-sudo ss -ulnp | grep 1812
-```
-
----
-
-**Problem:** Config file not found
-
-```
-Error: No such file or directory
-```
-
-**Solution:** Specify full path
-
-```bash
-usg_radius /etc/radius/config.json
-```
-
-### Authentication Failures
-
-**Problem:** All auth requests fail
-
-**Check:**
-
-1. Client IP authorized in config
-2. Correct shared secret
-3. User exists in config
-4. Firewall allows client
-
-```bash
-# View audit log
-tail -f /var/log/radius/audit.log
-
-# Check client authorization
-grep "unauthorized_client" /var/log/radius/audit.log
-```
-
----
-
-**Problem:** Rate limiting
+### Rate limiting
 
 ```
 Rate limit exceeded for client X.X.X.X
 ```
 
-**Solution:** Adjust rate limits or investigate DoS attack
+Adjust `rate_limit_per_client_rps` (per pod) or investigate a possible DoS. Remember limits
+are enforced per pod, so effective per-client capacity scales with replica count and the
+router's per-flow hashing.
 
-```json
-{
-  "rate_limit_per_client_rps": 200
-}
-```
+### Config not found / invalid
 
-### Performance Issues
-
-**Problem:** High CPU usage
-
-**Check:**
-
-- Too many authentication requests (DoS attack?)
-- Rate limiting configured?
-- Request cache working?
+Validate and check the mounted Secret:
 
 ```bash
-# Monitor CPU
-top -p $(pgrep usg_radius)
-
-# Check request rate
-grep "auth_attempt" /var/log/radius/audit.log | wc -l
-```
-
----
-
-**Problem:** High memory usage
-
-**Check:**
-
-- Request cache size
-- Number of clients/users
-
-```json
-{
-  "request_cache_max_entries": 10000
-}
-```
-
-### Network Issues
-
-**Problem:** Clients can't reach server
-
-**Check:**
-
-1. Firewall rules
-2. Network routing
-3. Listen address correct
-
-```bash
-# Verify listening
-sudo ss -ulnp | grep 1812
-
-# Test network
-sudo tcpdump -i any -n port 1812
-
-# Check routes
-ip route
-```
-
-### Configuration Issues
-
-**Problem:** Environment variables not expanding
-
-```
-Error: Environment variable not found: RADIUS_SECRET
-```
-
-**Solution:** Export variables before starting
-
-```bash
-export RADIUS_SECRET="your_secret"
-usg_radius /etc/radius/config.json
-```
-
-For systemd, use EnvironmentFile:
-
-```ini
-[Service]
-EnvironmentFile=/etc/radius/environment
+usg-radius --validate /etc/radius/config.json
+kubectl -n radius describe pod <pod>   # check volume mounts and env
 ```
 
 ---
@@ -724,19 +280,5 @@ EnvironmentFile=/etc/radius/environment
 
 - **Documentation**: https://github.com/192d-Cyberspace-Control-Squadron/usg-radius
 - **Issues**: https://github.com/192d-Cyberspace-Control-Squadron/usg-radius/issues
+- **Deployment reference**: [`deploy/README.md`](../../../deploy/README.md)
 - **RFC 2865**: https://tools.ietf.org/html/rfc2865
-
----
-
-## Next Steps
-
-After successful deployment:
-
-1. Integrate with authentication backend (LDAP/AD) - future feature
-2. Set up monitoring and alerting
-3. Configure log aggregation
-4. Implement backup and disaster recovery
-5. Document operational procedures
-6. Train operations team
-7. Schedule regular security audits
-8. Plan for high availability deployment
