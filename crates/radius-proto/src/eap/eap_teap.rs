@@ -1370,7 +1370,7 @@ pub trait InnerMethodHandler: Send + Sync {
 ///
 /// ```no_run
 /// # use radius_proto::eap::eap_teap::*;
-/// let handler = BasicPasswordAuthHandler::new();
+/// let handler = BasicPasswordAuthHandler::new("alice".to_string(), "password".to_string());
 /// // Process authentication TLVs...
 /// ```
 pub struct BasicPasswordAuthHandler {

@@ -116,7 +116,7 @@ name = "radius_load_test"
 path = "tools/radius_load_test.rs"
 
 [features]
-default = []
+default = ["observability", "tls"]
 tls = ["radius-proto/tls", "radius-server/tls"]
 observability = ["radius-server/observability"]
 revocation = ["radius-proto/revocation"]

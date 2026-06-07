@@ -954,7 +954,7 @@ impl AuthHandler for ChallengeAuthHandler {
             if let Some(pwd) = password
                 && pwd == self.pin
             {
-                return AuthResult::Accept;
+                return AuthResult::accept();
             }
         }
 
@@ -2087,8 +2087,8 @@ async fn test_proxy_state_echoed_on_access_accept() {
     let mut handler = SimpleAuthHandler::new();
     handler.add_user("psuser", "pspass");
 
-    let server_config = ServerConfig::from_config(config, Arc::new(handler))
-        .expect("server config");
+    let server_config =
+        ServerConfig::from_config(config, Arc::new(handler)).expect("server config");
     let server = RadiusServer::new(server_config).await.expect("server");
     let server_addr = server.local_addr().expect("server addr");
 
@@ -2118,8 +2118,8 @@ async fn test_proxy_state_echoed_on_access_reject() {
     let mut handler = SimpleAuthHandler::new();
     handler.add_user("psuser", "rightpass");
 
-    let server_config = ServerConfig::from_config(config, Arc::new(handler))
-        .expect("server config");
+    let server_config =
+        ServerConfig::from_config(config, Arc::new(handler)).expect("server config");
     let server = RadiusServer::new(server_config).await.expect("server");
     let server_addr = server.local_addr().expect("server addr");
 
@@ -2150,8 +2150,8 @@ async fn test_proxy_state_echoed_on_access_challenge() {
     let mut handler = ChallengeAuthHandler::new();
     handler.add_user("challengeuser", "password");
 
-    let server_config = ServerConfig::from_config(config, Arc::new(handler))
-        .expect("server config");
+    let server_config =
+        ServerConfig::from_config(config, Arc::new(handler)).expect("server config");
     let server = RadiusServer::new(server_config).await.expect("server");
     let server_addr = server.local_addr().expect("server addr");
 
@@ -2193,8 +2193,13 @@ async fn test_proxy_state_echoed_on_accounting_response() {
     sleep(Duration::from_millis(100)).await;
 
     let secret = b"testing123";
-    let mut packet =
-        create_accounting_request(AcctStatusType::Start, "session-proxy-1", "psuser", 4, secret);
+    let mut packet = create_accounting_request(
+        AcctStatusType::Start,
+        "session-proxy-1",
+        "psuser",
+        4,
+        secret,
+    );
     let expected = add_three_proxy_states(&mut packet);
     // Recompute Accounting Request authenticator after adding Proxy-State.
     packet.authenticator = calculate_accounting_request_authenticator(&packet, secret);
@@ -2222,8 +2227,8 @@ async fn test_proxy_state_order_preserved_with_many_values() {
     let mut handler = SimpleAuthHandler::new();
     handler.add_user("psuser", "pspass");
 
-    let server_config = ServerConfig::from_config(config, Arc::new(handler))
-        .expect("server config");
+    let server_config =
+        ServerConfig::from_config(config, Arc::new(handler)).expect("server config");
     let server = RadiusServer::new(server_config).await.expect("server");
     let server_addr = server.local_addr().expect("server addr");
 

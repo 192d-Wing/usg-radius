@@ -37,9 +37,9 @@ ENV OPENSSL_STATIC=1
 COPY --from=planner /build/recipe.json recipe.json
 # Cook only the dependencies for the feature set we ship (observability =
 # health + Prometheus metrics HTTP servers; no Redis/HA).
-RUN cargo chef cook --release -p radius-server --features observability --recipe-path recipe.json
+RUN cargo chef cook --release -p radius-server --no-default-features --features observability --recipe-path recipe.json
 COPY . .
-RUN cargo build --release -p radius-server --features observability --bin usg-radius \
+RUN cargo build --release -p radius-server --no-default-features --features observability --bin usg-radius \
     && strip target/release/usg-radius
 
 # ---- runtime: minimal Iron Bank Alpine, non-root ----

@@ -33,3 +33,9 @@ config.json
 # Log files
 *.log
 /var/log/
+# Local TLS test material — NEVER commit private keys.
+# Scoped to /certs/ at repo root so tests/pki/ fixtures stay tracked.
+/certs/
+
+# Local test scratch
+examples/configs/local-test.json

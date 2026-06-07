@@ -207,6 +207,39 @@ pub struct Config {
     /// Proxy configuration for RADIUS proxying
     #[serde(default)]
     pub proxy: Option<crate::proxy::ProxyConfig>,
+
+    /// EAP / EAP-TLS / EAP-TEAP configuration. When set, the server uses
+    /// EapAuthHandler instead of the plain SimpleAuthHandler.
+    #[serde(default)]
+    pub eap: Option<EapConfig>,
+}
+
+/// EAP configuration block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EapConfig {
+    /// TLS certificate configuration shared by EAP-TLS and EAP-TEAP.
+    pub tls: EapTlsConfig,
+    /// Enable EAP-TLS (Type 13). Default: false.
+    #[serde(default)]
+    pub enable_tls: bool,
+    /// Enable EAP-TEAP (Type 55, RFC 7170). Default: true.
+    #[serde(default = "default_true")]
+    pub enable_teap: bool,
+}
+
+/// TLS certificate paths for EAP-TLS / EAP-TEAP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EapTlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
+    #[serde(default)]
+    pub ca_path: Option<String>,
+    #[serde(default)]
+    pub require_client_cert: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_listen_address() -> String {
@@ -251,6 +284,7 @@ impl Default for Config {
             ldap: None,
             postgres: None,
             proxy: None,
+            eap: None,
         }
     }
 }
@@ -421,6 +455,7 @@ impl Config {
             ldap: None,
             postgres: None,
             proxy: None,
+            eap: None,
         }
     }
 }

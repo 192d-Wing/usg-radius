@@ -208,7 +208,7 @@ async fn test_e2e_simple_auth_chap_success() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Create and send CHAP request
-    let secret = b"testing123";
+    let _secret = b"testing123";
     let request = create_chap_request("testuser", "testpass", 1, 42);
     let response = send_and_receive(request, server_addr)
         .await
@@ -246,7 +246,7 @@ async fn test_e2e_simple_auth_chap_failure() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Wrong password
-    let secret = b"testing123";
+    let _secret = b"testing123";
     let request = create_chap_request("testuser", "wrongpass", 1, 42);
     let response = send_and_receive(request, server_addr)
         .await

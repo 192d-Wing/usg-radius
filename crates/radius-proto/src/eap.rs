@@ -752,8 +752,14 @@ pub mod eap_tls {
                     return Err(EapError::InvalidLength(self.fragments.len()));
                 }
 
-                // Return complete data
-                Ok(Some(self.fragments.clone()))
+                // Take the assembled message and reset for the next inbound
+                // exchange. Without clearing here, subsequent EAP-TLS rounds
+                // would prepend the previous handshake message to fresh data
+                // and confuse the TLS state machine
+                // (e.g., rustls would see two stacked ClientHellos).
+                let complete = std::mem::take(&mut self.fragments);
+                self.expected_length = None;
+                Ok(Some(complete))
             } else {
                 Ok(None)
             }
@@ -1397,6 +1403,28 @@ pub mod eap_tls {
                 .as_ref()
                 .map(|c| !c.is_handshaking())
                 .unwrap_or(false)
+        }
+
+        /// True if there are still outgoing TLS fragments queued from a
+        /// previous response that the peer hasn't received yet. The peer
+        /// sends an EAP-TLS ACK (empty payload) after each non-final
+        /// fragment; the caller should send the next queued fragment in
+        /// that case instead of asking rustls for more data.
+        pub fn has_pending_fragments(&self) -> bool {
+            self.context.has_pending_fragments()
+        }
+
+        /// Pop the next outgoing TLS fragment, advancing the cursor.
+        /// Returns `None` when no fragments remain.
+        pub fn next_outgoing_fragment(&mut self) -> Option<EapTlsPacket> {
+            self.context.get_next_fragment().cloned()
+        }
+
+        /// Queue a TLS message for transmission, splitting into fragments
+        /// of at most `max_fragment_size` bytes. Resets the fragment cursor
+        /// to zero. Caller then pulls fragments with `next_outgoing_fragment`.
+        pub fn queue_outgoing_tls(&mut self, tls_data: Vec<u8>, max_fragment_size: usize) {
+            self.context.queue_tls_data(tls_data, max_fragment_size);
         }
 
         /// Extract keys after successful handshake

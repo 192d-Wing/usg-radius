@@ -46,6 +46,6 @@ hex.workspace = true
 tempfile.workspace = true
 
 [features]
-default = []
+default = ["observability", "tls"]
 tls = ["radius-proto/tls", "dep:rustls"]
 observability = ["dep:axum", "dep:tower", "dep:tower-http"]
