@@ -638,12 +638,19 @@ async fn test_ipv6_support() {
     // Try to send request over IPv6
     let result = send_radius_request(&packet, server_addr).await;
 
-    // If we get a routing error, IPv6 isn't fully configured, skip test
-    if let Err(ref e) = result
-        && (e.to_string().contains("No route to host") || e.to_string().contains("HostUnreachable"))
-    {
-        println!("IPv6 routing not configured, skipping test");
-        return;
+    // If IPv6 isn't available/configured (common on CI runners), skip rather than
+    // fail. Covers routing errors and a total lack of IPv6 support
+    // (EAFNOSUPPORT -> "Address family not supported").
+    if let Err(ref e) = result {
+        let msg = e.to_string();
+        if msg.contains("No route to host")
+            || msg.contains("HostUnreachable")
+            || msg.contains("Address family not supported")
+            || msg.contains("AddrNotAvailable")
+        {
+            println!("IPv6 not configured on this host, skipping test: {msg}");
+            return;
+        }
     }
 
     let response = result.expect("Failed to send request over IPv6");

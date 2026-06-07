@@ -16,12 +16,18 @@
 ARG IB_ALPINE=registry1.dso.mil/ironbank/opensource/alpinelinux/alpine:3.22
 
 # ---- chef: Rust toolchain + cargo-chef (cached base for planner/builder) ----
+# Alpine's packaged Rust is too old for this project's dependency tree, so install
+# a pinned modern toolchain via rustup. Alpine is musl-native, so rustup selects the
+# *-unknown-linux-musl host toolchain automatically (per build platform under buildx).
 FROM ${IB_ALPINE} AS chef
 USER root
+ARG RUST_VERSION=1.92.0
+ENV PATH="/root/.cargo/bin:${PATH}"
 RUN apk add --no-cache \
-        build-base musl-dev pkgconfig \
+        build-base musl-dev pkgconfig curl ca-certificates \
         openssl-dev openssl-libs-static \
-        rust cargo \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain "${RUST_VERSION}" \
     && cargo install cargo-chef --locked
 WORKDIR /build
 
