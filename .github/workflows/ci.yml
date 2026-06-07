@@ -55,7 +55,9 @@ jobs:
         run: cargo test --test '*'
 
       - name: Run doc tests
-        run: cargo test --doc
+        # --workspace: the root package is binary-only (no lib), so a bare
+        # `cargo test --doc` errors with "no library targets found".
+        run: cargo test --workspace --doc
 
   fmt:
     name: Rustfmt
