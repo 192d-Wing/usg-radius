@@ -129,4 +129,4 @@ cargo doc --workspace --no-deps --open
 
 ## License
 
-All crates are licensed under AGPL-3.0-or-later.
+All crates are licensed under Apache-2.0.

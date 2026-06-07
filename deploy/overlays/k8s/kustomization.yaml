@@ -1,0 +1,48 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Production k8s overlay. Set the real image, VIP CIDRs, and BGP ASNs/peers here.
+resources:
+  - ../../base
+
+images:
+  - name: usg-radius-server
+    newName: registry1.dso.mil/usg-radius/usg-radius-server
+    newTag: v0.7.0
+
+replicas:
+  - name: usg-radius-server
+    count: 3
+
+patches:
+  # Production VIP addresses.
+  - target:
+      kind: CiliumLoadBalancerIPPool
+      name: usg-radius-vip
+    patch: |-
+      - op: replace
+        path: /spec/blocks
+        value:
+          - cidr: "198.51.100.10/32"
+          - cidr: "2001:db8:prod::10/128"
+  # Production BGP local ASN and upstream peers.
+  - target:
+      kind: CiliumBGPClusterConfig
+      name: usg-radius-bgp
+    patch: |-
+      - op: replace
+        path: /spec/bgpInstances/0/localASN
+        value: 65010
+      - op: replace
+        path: /spec/bgpInstances/0/peers
+        value:
+          - name: upstream-v4
+            peerASN: 64512
+            peerAddress: "10.0.0.1"
+            peerConfigRef:
+              name: usg-radius-peer
+          - name: upstream-v6
+            peerASN: 64512
+            peerAddress: "fd00::1"
+            peerConfigRef:
+              name: usg-radius-peer

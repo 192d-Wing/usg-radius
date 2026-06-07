@@ -8,7 +8,7 @@
 //! - Rate limiter overhead
 //! - Concurrent request handling
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use radius_proto::{
     attributes::Attribute,
     packet::{Code, Packet},
@@ -36,10 +36,13 @@ fn bench_packet_encode(c: &mut Criterion) {
 
                     // Add additional attributes
                     for i in 0..n {
-                        packet.add_attribute(Attribute::string(
-                            31, // Calling-Station-Id
-                            format!("client-{}", i),
-                        ).unwrap());
+                        packet.add_attribute(
+                            Attribute::string(
+                                31, // Calling-Station-Id
+                                format!("client-{}", i),
+                            )
+                            .unwrap(),
+                        );
                     }
 
                     black_box(packet.encode().unwrap())

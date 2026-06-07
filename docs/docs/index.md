@@ -2,7 +2,7 @@
 
 A high-performance RADIUS (Remote Authentication Dial-In User Service) server implementation in Rust, fully compliant with RFC 2865 and related standards.
 
-![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)
+![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)
 ![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)
 
@@ -197,7 +197,7 @@ We welcome contributions! Please see our [Contributing Guide](https://github.com
 
 ## License
 
-This project is licensed under the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later).
+This project is licensed under the Apache License 2.0 (Apache-2.0).
 
 ## Contact
 

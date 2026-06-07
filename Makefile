@@ -1,114 +1,75 @@
-.PHONY: help test test-unit test-integration test-all \
-        docker-up docker-down docker-logs docker-status \
-        ldap-up ldap-down ldap-test ldap-logs \
-        postgres-up postgres-down postgres-test postgres-logs \
-        clean build release
+.PHONY: help build release test test-unit test-observability lint fmt \
+        image image-push kustomize-build k8s-apply k8s-delete clean
 
-# Default target
+# Image coordinates (override on the CLI: make image IMAGE=reg/usg-radius-server TAG=v0.7.0)
+IMAGE    ?= usg-radius-server
+TAG      ?= latest
+PLATFORMS ?= linux/amd64,linux/arm64
+OVERLAY  ?= deploy/overlays/k8s
+
 help:
 	@echo "USG RADIUS - Available targets:"
 	@echo ""
-	@echo "  Building:"
-	@echo "    build         - Build the project in debug mode"
-	@echo "    release       - Build the project in release mode"
+	@echo "  Building (Rust):"
+	@echo "    build              - Debug build"
+	@echo "    release            - Release build"
 	@echo ""
 	@echo "  Testing:"
-	@echo "    test          - Run all unit tests"
-	@echo "    test-unit     - Run unit tests only (no Docker required)"
-	@echo "    test-integration - Run integration tests (requires Docker)"
-	@echo "    test-all      - Run all tests (unit + integration)"
+	@echo "    test               - Run all unit tests (cargo test --workspace)"
+	@echo "    test-observability - Run tests including the health/metrics endpoints"
+	@echo "    lint / fmt         - clippy / rustfmt"
 	@echo ""
-	@echo "  Docker Services:"
-	@echo "    docker-up     - Start all test services (LDAP + PostgreSQL)"
-	@echo "    docker-down   - Stop all test services"
-	@echo "    docker-status - Show status of test services"
-	@echo "    docker-logs   - Show logs from all test services"
+	@echo "  Container image (multi-arch, Iron Bank Alpine base):"
+	@echo "    image              - buildx build $(IMAGE):$(TAG) for $(PLATFORMS) (load)"
+	@echo "    image-push         - buildx build + push $(IMAGE):$(TAG) for $(PLATFORMS)"
 	@echo ""
-	@echo "  LDAP Testing:"
-	@echo "    ldap-up       - Start LDAP test service"
-	@echo "    ldap-down     - Stop LDAP test service"
-	@echo "    ldap-test     - Run LDAP integration tests"
-	@echo "    ldap-logs     - Show LDAP service logs"
+	@echo "  Kubernetes (k3s/k8s + Cilium):"
+	@echo "    kustomize-build    - Render manifests for OVERLAY=$(OVERLAY)"
+	@echo "    k8s-apply          - kubectl apply -k $(OVERLAY)"
+	@echo "    k8s-delete         - kubectl delete -k $(OVERLAY)"
 	@echo ""
-	@echo "  PostgreSQL Testing:"
-	@echo "    postgres-up   - Start PostgreSQL test service"
-	@echo "    postgres-down - Stop PostgreSQL test service"
-	@echo "    postgres-test - Run PostgreSQL integration tests"
-	@echo "    postgres-logs - Show PostgreSQL service logs"
-	@echo ""
-	@echo "  Cleanup:"
-	@echo "    clean         - Clean build artifacts and Docker volumes"
-	@echo ""
+	@echo "    clean              - cargo clean"
 
-# Build targets
+# --- Rust ---
 build:
 	cargo build
 
 release:
 	cargo build --release
 
-# Test targets
 test: test-unit
 
 test-unit:
 	cargo test --workspace
 
-test-integration: docker-up
-	@echo "Waiting for services to be ready..."
-	@sleep 5
-	cargo test --test ldap_integration_tests --test postgres_integration_tests -- --ignored --test-threads=1
+# Health/metrics endpoints live behind the `observability` feature.
+test-observability:
+	cargo test -p radius-server --features observability
 
-test-all: test-unit test-integration
+lint:
+	cargo clippy --workspace --all-targets -- -D warnings
 
-# Docker service management
-docker-up:
-	docker-compose -f docker-compose.test.yml up -d
-	@echo "Waiting for services to be ready..."
-	@sleep 5
-	@docker-compose -f docker-compose.test.yml ps
+fmt:
+	cargo fmt --all
 
-docker-down:
-	docker-compose -f docker-compose.test.yml down
+# --- Container image ---
+# Multi-arch builds require `docker buildx` and (for Iron Bank base images)
+# `docker login registry1.dso.mil`.
+image:
+	docker buildx build --platform $(PLATFORMS) -t $(IMAGE):$(TAG) --load .
 
-docker-status:
-	docker-compose -f docker-compose.test.yml ps
+image-push:
+	docker buildx build --platform $(PLATFORMS) -t $(IMAGE):$(TAG) --push .
 
-docker-logs:
-	docker-compose -f docker-compose.test.yml logs
+# --- Kubernetes ---
+kustomize-build:
+	kubectl kustomize $(OVERLAY)
 
-# LDAP-specific targets
-ldap-up:
-	docker-compose -f docker-compose.test.yml up -d openldap
-	@echo "Waiting for LDAP to be ready..."
-	@sleep 5
-	@docker-compose -f docker-compose.test.yml ps openldap
+k8s-apply:
+	kubectl apply -k $(OVERLAY)
 
-ldap-down:
-	docker-compose -f docker-compose.test.yml down openldap
+k8s-delete:
+	kubectl delete -k $(OVERLAY)
 
-ldap-test: ldap-up
-	cargo test --test ldap_integration_tests -- --ignored --test-threads=1
-
-ldap-logs:
-	docker-compose -f docker-compose.test.yml logs -f openldap
-
-# PostgreSQL-specific targets
-postgres-up:
-	docker-compose -f docker-compose.test.yml up -d postgres
-	@echo "Waiting for PostgreSQL to be ready..."
-	@sleep 3
-	@docker-compose -f docker-compose.test.yml ps postgres
-
-postgres-down:
-	docker-compose -f docker-compose.test.yml down postgres
-
-postgres-test: postgres-up
-	cargo test --test postgres_integration_tests -- --ignored --test-threads=1
-
-postgres-logs:
-	docker-compose -f docker-compose.test.yml logs -f postgres
-
-# Cleanup
 clean:
 	cargo clean
-	docker-compose -f docker-compose.test.yml down -v

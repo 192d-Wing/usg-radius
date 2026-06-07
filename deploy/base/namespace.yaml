@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: radius
+  labels:
+    app.kubernetes.io/name: usg-radius
+    app.kubernetes.io/part-of: usg-radius
+    # Enforce the "restricted" Pod Security Standard — the server runs fully
+    # unprivileged (non-root, no added capabilities, ports > 1024).
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

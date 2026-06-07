@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed - Kubernetes-only deployment (k3s/k8s + Cilium)
+
+- **Single deployment path**: the project now targets **Kubernetes (k3s or k8s) with
+  the Cilium CNI** exclusively. New Kustomize tree under [`deploy/`](deploy/) (base +
+  `overlays/k3s` and `overlays/k8s`), Cilium Helm values in `deploy/cilium/`.
+- **L3 anycast VIP via Cilium BGP**: the RADIUS VIP is a **dual-stack (IPv4 + IPv6)**
+  LoadBalancer advertised by Cilium's BGP control plane (ECMP from every node with a
+  Ready pod). `externalTrafficPolicy: Local` + Cilium **DSR mode** preserve the NAS
+  source IP with no SNAT (required for source-IP client authorization) and gate the
+  anycast advertisement on pod readiness.
+- **Stateless scaling**: availability/scaling are handled by the Kubernetes
+  ReplicaSet, not by a shared-state backend.
+- **Health/metrics in the binary**: the server now starts the `/health/*` (2812/tcp)
+  and `/metrics` (3812/tcp) HTTP servers itself, bound dual-stack `[::]`, behind the
+  new `observability` cargo feature (replaces `ha`). Accounting port 1813/udp added.
+
+### Security
+
+- Updated dependencies to clear `cargo audit` findings: `aws-lc-sys` 0.35→0.41
+  (5 advisories), `rustls-webpki` 0.103.8→0.103.13 (4 advisories), `bytes`
+  1.11.0→1.11.1, `time` 0.3.44→0.3.47, and `rand` (RUSTSEC-2026-0097), plus
+  `rustls`/`tokio`/`hyper` bumps.
+- Dropped the sqlx `macros` feature (build with `default-features = false`,
+  postgres only) — the code uses only the runtime `sqlx::query` API, so this
+  removes `sqlx-macros-core` from the build. The MySQL driver and its `rsa`
+  dependency (unpatched RUSTSEC-2023-0071) are never compiled.
+- Migrated the EAP-TLS PEM loaders off the unmaintained `rustls-pemfile`
+  (RUSTSEC-2025-0134) to `rustls-pki-types`' PEM reader API; `rustls-pemfile` is
+  no longer a dependency.
+- Added `.cargo/audit.toml` documenting the one remaining advisory (`rsa`), a
+  feature-gated transitive dep (sqlx MySQL driver) not compiled in any shipped
+  artifact and with no upstream fix available.
+
+### Added
+
+- Multi-arch (`linux/amd64` + `linux/arm64`) container image `usg-radius-server`,
+  built on the Iron Bank hardened Alpine base with **cargo-chef** dependency caching
+  (see [`Dockerfile`](Dockerfile)).
+
+### Removed
+
+- **Redis/Valkey HA backend** and all distributed shared-state code (`state/valkey.rs`,
+  `cache_ha.rs`, `ratelimit_ha.rs`, the `ha` feature, the `ha_cluster_server` example).
+- **Docker Compose** (single + HA), **systemd** units, and **HAProxy** configs/docs.
+- The flat `examples/kubernetes/` manifests (superseded by `deploy/`).
+
+### Notes
+
+- `reqwest` is now built with `rustls-tls` (no OpenSSL) to keep the musl image clean.
+- Removed the Docker Compose-based integration-test harness (`docker-compose.test.yml`,
+  `scripts/run_integration_tests.sh`, `tests/INTEGRATION_TESTS.md`) and the tests that
+  depended on it: the `--ignored` LDAP/PostgreSQL integration tests
+  (`tests/ldap_integration_tests.rs`, `tests/postgres_integration_tests.rs`) and the
+  HA integration tests (`tests/ha_integration_tests.rs`, which exercised the removed
+  Redis/Valkey backend).
+
 ## [0.7.0] - 2026-01-01
 
 ### Added - Performance & Documentation Phase

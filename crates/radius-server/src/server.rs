@@ -16,11 +16,11 @@ use radius_proto::auth::{
     calculate_accounting_request_authenticator, calculate_response_authenticator,
     decrypt_user_password,
 };
-use radius_proto::{calculate_message_authenticator, verify_message_authenticator};
 use radius_proto::{
     ChapChallenge, ChapResponse, Code, Packet, PacketError, ValidationMode, validate_packet,
     verify_chap_response,
 };
+use radius_proto::{calculate_message_authenticator, verify_message_authenticator};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,9 +70,10 @@ fn add_message_authenticator_if_eap(
         .iter()
         .any(|a| a.attr_type == AttributeType::MessageAuthenticator as u8);
     if !already_has_ma {
-        response.add_attribute(
-            radius_proto::Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16])?,
-        );
+        response.add_attribute(radius_proto::Attribute::new(
+            AttributeType::MessageAuthenticator as u8,
+            vec![0u8; 16],
+        )?);
     }
 
     // Build the HMAC input: same as on-wire bytes but with Authenticator =
@@ -144,7 +145,9 @@ impl AuthResult {
     /// Shorthand for `AuthResult::Accept { attributes: vec![] }` — use when
     /// the response carries no protocol-specific attributes (typical PAP/CHAP).
     pub fn accept() -> Self {
-        AuthResult::Accept { attributes: Vec::new() }
+        AuthResult::Accept {
+            attributes: Vec::new(),
+        }
     }
 }
 
@@ -1172,7 +1175,9 @@ impl RadiusServer {
 
         // Handle authentication result
         match auth_result {
-            AuthResult::Accept { attributes: extra_attrs } => {
+            AuthResult::Accept {
+                attributes: extra_attrs,
+            } => {
                 info!(
                     username = %username,
                     client_ip = %source_ip,
@@ -1217,12 +1222,8 @@ impl RadiusServer {
                 // RFC 3579 §3.2: add Message-Authenticator if response carries
                 // EAP-Message. Must happen BEFORE Response-Authenticator so the
                 // latter covers the final MA bytes.
-                add_message_authenticator_if_eap(
-                    &mut response,
-                    &request.authenticator,
-                    secret,
-                )
-                .map_err(|_| ServerError::AuthFailed)?;
+                add_message_authenticator_if_eap(&mut response, &request.authenticator, secret)
+                    .map_err(|_| ServerError::AuthFailed)?;
 
                 // Calculate and set Response Authenticator using client-specific secret
                 let response_auth =
@@ -1276,12 +1277,8 @@ impl RadiusServer {
                 // RFC 3579 §3.2: add Message-Authenticator if response carries
                 // EAP-Message. Must happen BEFORE Response-Authenticator so the
                 // latter covers the final MA bytes.
-                add_message_authenticator_if_eap(
-                    &mut response,
-                    &request.authenticator,
-                    secret,
-                )
-                .map_err(|_| ServerError::AuthFailed)?;
+                add_message_authenticator_if_eap(&mut response, &request.authenticator, secret)
+                    .map_err(|_| ServerError::AuthFailed)?;
 
                 // Calculate and set Response Authenticator using client-specific secret
                 let response_auth =
@@ -1330,12 +1327,8 @@ impl RadiusServer {
                 // RFC 3579 §3.2: add Message-Authenticator if response carries
                 // EAP-Message. Must happen BEFORE Response-Authenticator so the
                 // latter covers the final MA bytes.
-                add_message_authenticator_if_eap(
-                    &mut response,
-                    &request.authenticator,
-                    secret,
-                )
-                .map_err(|_| ServerError::AuthFailed)?;
+                add_message_authenticator_if_eap(&mut response, &request.authenticator, secret)
+                    .map_err(|_| ServerError::AuthFailed)?;
 
                 // Calculate and set Response Authenticator using client-specific secret
                 let response_auth =

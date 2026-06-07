@@ -6,6 +6,76 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
+/// Start the health-check and Prometheus metrics HTTP servers.
+///
+/// Driven entirely by environment variables so it maps cleanly onto a Kubernetes
+/// ConfigMap/Secret:
+///   * `HEALTH_PORT`  — health endpoints (`/health/live`, `/health/ready`). Default
+///     `listen_port + 1000`.
+///   * `METRICS_PORT` — Prometheus `/metrics`. Default `listen_port + 2000`.
+///
+/// Both servers bind dual-stack (`[::]`) so the kubelet can probe the pod over IPv4
+/// or IPv6. Only compiled with the `observability` feature (pulls in axum). The
+/// server is stateless; the session manager is backed by in-memory storage.
+#[cfg(feature = "observability")]
+async fn start_observability(listen_port: u16) {
+    use radius_server::state::{MemoryStateBackend, SharedSessionManager};
+    use std::env;
+
+    let health_port = env::var("HEALTH_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(listen_port.saturating_add(1000));
+    let metrics_port = env::var("METRICS_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(listen_port.saturating_add(2000));
+
+    let session_manager = Arc::new(SharedSessionManager::new(Arc::new(
+        MemoryStateBackend::new(),
+    )));
+
+    spawn_http_server(
+        "health",
+        health_port,
+        Arc::clone(&session_manager),
+        radius_server::start_health_server,
+    );
+    spawn_http_server(
+        "metrics",
+        metrics_port,
+        session_manager,
+        radius_server::start_metrics_server,
+    );
+}
+
+/// Spawn one of the auxiliary HTTP servers (health or metrics) on `[::]:port`.
+#[cfg(feature = "observability")]
+fn spawn_http_server<F, Fut>(
+    name: &'static str,
+    port: u16,
+    session_manager: Arc<radius_server::state::SharedSessionManager>,
+    run: F,
+) where
+    F: FnOnce(Arc<radius_server::state::SharedSessionManager>, std::net::SocketAddr) -> Fut
+        + Send
+        + 'static,
+    Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send,
+{
+    let bind = format!("[::]:{port}");
+    match bind.parse::<std::net::SocketAddr>() {
+        Ok(addr) => {
+            info!("Starting {name} server on {bind}");
+            tokio::spawn(async move {
+                if let Err(e) = run(session_manager, addr).await {
+                    warn!("{name} server error: {e}");
+                }
+            });
+        }
+        Err(e) => warn!("Invalid {name} bind address {bind}: {e}"),
+    }
+}
+
 /// USG RADIUS Server - RFC 2865 RADIUS Authentication Server
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -210,46 +280,24 @@ async fn main() {
         }
     };
 
+    // Start health-check + metrics HTTP servers and connect the state backend.
+    // Kubernetes liveness/readiness probes depend on the health endpoints; with
+    // externalTrafficPolicy: Local the readiness state gates whether Cilium
+    // advertises the anycast VIP from this node.
+    #[cfg(feature = "observability")]
+    start_observability(config.listen_port).await;
+
     info!("");
     info!("Server started successfully!");
     info!("Press Ctrl+C to stop");
     info!("");
-
-    // Spawn a minimal HTTP health server for Kubernetes probes (requires `ha` feature,
-    // which is enabled by default). Bound to HEALTH_LISTEN_ADDR (default 0.0.0.0:8080).
-    #[cfg(feature = "ha")]
-    {
-    let health_addr = std::env::var("HEALTH_LISTEN_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-    tokio::spawn(async move {
-        match health_addr.parse::<std::net::SocketAddr>() {
-            Ok(addr) => {
-                use axum::{routing::get, Router};
-                let app = Router::new()
-                    .route("/healthz", get(|| async { "ok" }))
-                    .route("/readyz", get(|| async { "ok" }))
-                    .route("/livez", get(|| async { "ok" }));
-                match tokio::net::TcpListener::bind(addr).await {
-                    Ok(listener) => {
-                        info!("Health server listening on {}", addr);
-                        if let Err(e) = axum::serve(listener, app).await {
-                            error!("Health server error: {}", e);
-                        }
-                    }
-                    Err(e) => error!("Failed to bind health server on {}: {}", addr, e),
-                }
-            }
-            Err(e) => error!("Invalid HEALTH_LISTEN_ADDR: {}", e),
-        }
-    });
-    }
 
     // Run server with graceful shutdown on SIGTERM/SIGINT (Kubernetes sends SIGTERM
     // then waits terminationGracePeriodSeconds before SIGKILL).
     let shutdown = async {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
             let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
             tokio::select! {

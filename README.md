@@ -103,6 +103,34 @@ cargo run
 cargo run
 ```
 
+> The steps above are for **local development**. For running in production, see
+> **Deployment** below.
+
+## Deployment (Kubernetes + Cilium)
+
+The only supported deployment target is **Kubernetes (k3s or k8s) with the Cilium
+CNI**. The server runs as a stateless `Deployment`; scaling and availability come
+from the ReplicaSet, and the RADIUS VIP is exposed as a **dual-stack (IPv4 + IPv6)
+L3 anycast VIP** advertised by Cilium's BGP control plane — preserving the NAS
+source IP via `externalTrafficPolicy: Local` and Cilium DSR (no SNAT).
+
+Manifests live under [`deploy/`](deploy/) (Kustomize base + `overlays/k3s` and
+`overlays/k8s`). Build the multi-arch image (Iron Bank Alpine base) and apply an
+overlay:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t <registry>/usg-radius-server:<tag> --push .
+
+kubectl apply -k deploy/overlays/k8s     # or deploy/overlays/k3s
+```
+
+See **[deploy/README.md](deploy/README.md)** for the full guide (Cilium install
+values, BGP peering, dual-stack VIPs, and verification).
+
+> Docker Compose, systemd, HAProxy, and the Redis/Valkey HA backend have been
+> removed in favor of this Kubernetes-native, stateless model.
+
 ## Configuration
 
 The server uses a JSON configuration file with full JSON Schema validation available.
@@ -339,7 +367,7 @@ RUST_LOG=debug cargo run
 
 ## License
 
-This project is licensed under the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later).
+This project is licensed under the Apache License 2.0 (Apache-2.0). See the [LICENSE](LICENSE) file for details.
 
 ## Contributing
 

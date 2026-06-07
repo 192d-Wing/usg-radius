@@ -5,7 +5,7 @@ use std::fmt;
 /// Errors that can occur during state backend operations
 #[derive(Debug)]
 pub enum StateError {
-    /// Connection error (Valkey/Redis unreachable)
+    /// Connection error (backend unreachable)
     ConnectionError(String),
 
     /// Command timeout
@@ -48,18 +48,5 @@ impl From<std::io::Error> for StateError {
 impl From<serde_json::Error> for StateError {
     fn from(err: serde_json::Error) -> Self {
         StateError::SerializationError(format!("JSON error: {}", err))
-    }
-}
-
-#[cfg(feature = "ha")]
-impl From<redis::RedisError> for StateError {
-    fn from(err: redis::RedisError) -> Self {
-        if err.is_connection_refusal() || err.is_connection_dropped() {
-            StateError::ConnectionError(format!("Redis connection error: {}", err))
-        } else if err.is_timeout() {
-            StateError::Timeout(format!("Redis timeout: {}", err))
-        } else {
-            StateError::BackendError(format!("Redis error: {}", err))
-        }
     }
 }

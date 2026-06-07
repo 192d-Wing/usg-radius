@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Base manifests for the USG RADIUS server on Kubernetes (k3s or k8s) with Cilium.
+# Stateless: scaling/availability come from the Deployment replicas + Cilium BGP
+# anycast. Overlays (overlays/k3s, overlays/k8s) set the image, VIP CIDRs, and ASNs.
+namespace: radius
+
+resources:
+  - namespace.yaml
+  - radius-config.secret.yaml
+  - radius-deployment.yaml
+  - radius-service-lb.yaml
+  - radius-service-internal.yaml
+  - cilium-lb-ippool.yaml
+  - cilium-bgp.yaml

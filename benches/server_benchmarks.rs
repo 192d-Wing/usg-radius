@@ -1,10 +1,14 @@
+// The optional `ldap_benchmark` cfg gates a benchmark that needs a live LDAP
+// server; it is not a declared Cargo feature, so allow the unknown-cfg lint here.
+#![allow(unexpected_cfgs)]
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use radius_server::cache::{RequestCache, RequestFingerprint};
 use radius_server::ratelimit::{RateLimitConfig, RateLimiter};
 use std::hint::black_box;
 use std::net::IpAddr;
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 
 // Cache benchmarks
 fn bench_cache_duplicate_check(c: &mut Criterion) {

@@ -47,7 +47,6 @@ pub mod accounting;
 pub mod audit;
 pub mod buffer_pool;
 pub mod cache;
-pub mod cache_ha;
 pub mod config;
 pub mod eap_auth;
 pub mod health;
@@ -56,26 +55,23 @@ pub mod metrics;
 pub mod postgres_auth;
 pub mod proxy;
 pub mod ratelimit;
-pub mod ratelimit_ha;
 pub mod server;
 pub mod state;
 
 pub use accounting::{AccountingHandler, AccountingResult, Session, SimpleAccountingHandler};
 pub use audit::{AuditEntry, AuditEventType, AuditLogger};
 pub use cache::{RequestCache, RequestFingerprint};
-pub use cache_ha::SharedRequestCache;
 pub use config::{Client, Config, ConfigError, User};
 pub use eap_auth::EapAuthHandler;
 pub use ldap_auth::{LdapAuthHandler, LdapConfig, LdapError};
 pub use postgres_auth::{PostgresAuthHandler, PostgresConfig, PostgresError};
 pub use ratelimit::{RateLimitConfig, RateLimiter};
-pub use ratelimit_ha::{SharedRateLimitConfig, SharedRateLimiter};
 pub use server::{
     AuthHandler, AuthResult, RadiusServer, ServerConfig, ServerError, SimpleAuthHandler,
 };
 
-// HA-specific exports
-#[cfg(feature = "ha")]
+// Observability exports (health + metrics HTTP servers)
+#[cfg(feature = "observability")]
 pub use health::{HealthCheckState, HealthStatus, create_health_server, start_health_server};
-#[cfg(feature = "ha")]
+#[cfg(feature = "observability")]
 pub use metrics::{MetricsState, PrometheusMetrics, create_metrics_server, start_metrics_server};

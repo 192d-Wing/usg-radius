@@ -1,0 +1,118 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: usg-radius-server
+  namespace: radius
+  labels:
+    app.kubernetes.io/name: usg-radius-server
+    app.kubernetes.io/part-of: usg-radius
+spec:
+  # Scaling and availability are handled by Kubernetes: multiple replicas spread
+  # across nodes, each advertised as an anycast endpoint by Cilium BGP. The server
+  # is stateless (no Redis/shared state).
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: usg-radius-server
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: usg-radius-server
+        app.kubernetes.io/part-of: usg-radius
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3812"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Spread replicas across nodes so the anycast VIP is advertised from as many
+      # nodes as possible (and survives a node loss).
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: usg-radius-server
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: usg-radius-server
+          # Override the registry/tag in the overlay (kustomize images:).
+          image: usg-radius-server:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - /etc/radius/config.json
+          ports:
+            - containerPort: 1812
+              protocol: UDP
+              name: radius-auth
+            - containerPort: 1813
+              protocol: UDP
+              name: radius-acct
+            - containerPort: 2812
+              protocol: TCP
+              name: health
+            - containerPort: 3812
+              protocol: TCP
+              name: metrics
+          env:
+            - name: RUST_LOG
+              value: "radius_server=info,info"
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            # With externalTrafficPolicy: Local, readiness gates whether Cilium
+            # advertises the anycast VIP from this node — a NotReady pod withdraws
+            # the route from its node automatically.
+            httpGet:
+              path: /health/ready
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/radius
+              readOnly: true
+            - name: logs
+              mountPath: /var/log/radius
+      volumes:
+        - name: config
+          secret:
+            secretName: radius-config
+            items:
+              - key: config.json
+                path: config.json
+        - name: logs
+          emptyDir: {}
+      terminationGracePeriodSeconds: 30

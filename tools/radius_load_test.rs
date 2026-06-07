@@ -12,8 +12,8 @@
 
 use clap::Parser;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -66,12 +66,14 @@ struct Stats {
 impl Stats {
     fn record_sent(&self, bytes: usize) {
         self.total_sent.fetch_add(1, Ordering::Relaxed);
-        self.total_bytes_sent.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.total_bytes_sent
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     fn record_received(&self, bytes: usize, latency_us: u64, is_accept: bool) {
         self.total_received.fetch_add(1, Ordering::Relaxed);
-        self.total_bytes_received.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.total_bytes_received
+            .fetch_add(bytes as u64, Ordering::Relaxed);
 
         if is_accept {
             self.total_accept.fetch_add(1, Ordering::Relaxed);
@@ -122,17 +124,34 @@ impl Stats {
         println!("  Errors:   {}", errors);
         println!("\nResponses:");
         if received > 0 {
-            println!("  Accept:   {} ({:.1}%)", accepts, (accepts as f64 / received as f64) * 100.0);
-            println!("  Reject:   {} ({:.1}%)", rejects, (rejects as f64 / received as f64) * 100.0);
+            println!(
+                "  Accept:   {} ({:.1}%)",
+                accepts,
+                (accepts as f64 / received as f64) * 100.0
+            );
+            println!(
+                "  Reject:   {} ({:.1}%)",
+                rejects,
+                (rejects as f64 / received as f64) * 100.0
+            );
         }
         println!("\nPerformance:");
         println!("  RPS:      {:.2}", rps);
         if sent > 0 {
-            println!("  Success:  {:.2}%", (received as f64 / sent as f64) * 100.0);
+            println!(
+                "  Success:  {:.2}%",
+                (received as f64 / sent as f64) * 100.0
+            );
         }
         println!("\nThroughput:");
-        println!("  Sent:     {:.2} Mbps ({} bytes)", throughput_mbps_sent, bytes_sent);
-        println!("  Received: {:.2} Mbps ({} bytes)", throughput_mbps_recv, bytes_received);
+        println!(
+            "  Sent:     {:.2} Mbps ({} bytes)",
+            throughput_mbps_sent, bytes_sent
+        );
+        println!(
+            "  Received: {:.2} Mbps ({} bytes)",
+            throughput_mbps_recv, bytes_received
+        );
 
         if !latencies.is_empty() {
             println!("\nLatency (microseconds):");
@@ -141,7 +160,10 @@ impl Stats {
             println!("  P95:  {}", latencies[(latencies.len() * 95) / 100]);
             println!("  P99:  {}", latencies[(latencies.len() * 99) / 100]);
             println!("  Max:  {}", latencies[latencies.len() - 1]);
-            println!("  Avg:  {:.2}", latencies.iter().sum::<u64>() as f64 / latencies.len() as f64);
+            println!(
+                "  Avg:  {:.2}",
+                latencies.iter().sum::<u64>() as f64 / latencies.len() as f64
+            );
         }
     }
 }
@@ -281,7 +303,11 @@ async fn main() {
     println!("Server:      {}", args.server);
     println!("Clients:     {}", args.clients);
     println!("Duration:    {}s", args.duration);
-    println!("Target RPS:  {} per client ({} total)", args.rps, args.rps * args.clients as u64);
+    println!(
+        "Target RPS:  {} per client ({} total)",
+        args.rps,
+        args.rps * args.clients as u64
+    );
     println!("Timeout:     {}ms", args.timeout);
     println!("\nStarting test...\n");
 

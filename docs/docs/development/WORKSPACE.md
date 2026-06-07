@@ -86,7 +86,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 authors = ["..."]
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 # Shared dependencies

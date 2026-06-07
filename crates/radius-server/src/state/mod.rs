@@ -1,35 +1,23 @@
-//! Shared state backend abstraction for High Availability
+//! Shared state backend abstraction
 //!
 //! This module provides a pluggable state backend system for storing session
-//! and cache data across a RADIUS server cluster. It supports both in-memory
-//! and distributed backends (Valkey/Redis).
+//! and cache data. The server is stateless and scaled via Kubernetes
+//! ReplicaSets, so only an in-memory backend is provided.
 //!
 //! # Architecture
 //!
 //! The state backend system uses a trait-based abstraction that allows
 //! switching between different storage implementations:
 //!
-//! - **MemoryStateBackend**: Local in-memory storage (default, no HA)
-//! - **ValkeyStateBackend**: Distributed Valkey/Redis storage (HA clusters)
+//! - **MemoryStateBackend**: Local in-memory storage (default)
 //!
 //! # Usage
 //!
 //! ```rust
-//! use radius_server::state::{StateBackend, StateBackendType, StateConfig, ValkeyConfig};
-//! use std::time::Duration;
+//! use radius_server::state::StateConfig;
 //!
-//! // Default: In-memory (no HA)
+//! // Default: In-memory
 //! let config = StateConfig::default();
-//!
-//! // Valkey cluster (HA)
-//! #[cfg(feature = "ha")]
-//! let config = StateConfig::valkey(
-//!     ValkeyConfig::new("redis://localhost:6379")
-//!         .with_key_prefix("usg-radius:")
-//!         .with_connect_timeout(Duration::from_secs(5))
-//!         .with_command_timeout(Duration::from_secs(2))
-//!         .with_max_retries(3)
-//! );
 //! ```
 
 pub mod config;
@@ -37,18 +25,10 @@ pub mod error;
 pub mod memory;
 pub mod session_manager;
 
-#[cfg(feature = "ha")]
-pub mod valkey;
-
-#[cfg(feature = "ha")]
-pub use config::ValkeyConfig;
 pub use config::{StateBackendType, StateConfig};
 pub use error::StateError;
 pub use memory::MemoryStateBackend;
 pub use session_manager::{CacheStats, SharedSessionManager};
-
-#[cfg(feature = "ha")]
-pub use valkey::ValkeyStateBackend;
 
 use async_trait::async_trait;
 use std::time::Duration;
@@ -62,7 +42,6 @@ use std::time::Duration;
 /// # Implementations
 ///
 /// - `MemoryStateBackend`: In-memory HashMap-based storage
-/// - `ValkeyStateBackend`: Valkey/Redis-backed distributed storage
 ///
 /// # Key Design
 ///
@@ -88,7 +67,6 @@ pub trait StateBackend: Send + Sync {
     /// Set a value with optional TTL (time-to-live)
     ///
     /// If `ttl` is `None`, the value never expires (for in-memory backend).
-    /// For Valkey backend, a reasonable default TTL should be used if None.
     async fn set(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> Result<(), StateError>;
 
     /// Delete a key
@@ -145,6 +123,5 @@ pub trait StateBackend: Send + Sync {
     ///
     /// Verifies the backend is reachable and functional.
     /// For in-memory backend, always returns `Ok(())`.
-    /// For Valkey backend, performs a PING command.
     async fn ping(&self) -> Result<(), StateError>;
 }

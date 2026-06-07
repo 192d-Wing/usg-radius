@@ -508,8 +508,11 @@ mod tests {
         let mut packet = Packet::new(Code::AccessRequest, 1, [0u8; 16]);
         packet.add_attribute(Attribute::string(AttributeType::UserName as u8, "test").unwrap());
         packet.add_attribute(
-            Attribute::new(AttributeType::EapMessage as u8, vec![0x02, 0x00, 0x00, 0x05, 0x01])
-                .unwrap(),
+            Attribute::new(
+                AttributeType::EapMessage as u8,
+                vec![0x02, 0x00, 0x00, 0x05, 0x01],
+            )
+            .unwrap(),
         );
         packet.add_attribute(
             Attribute::new(AttributeType::NasIpAddress as u8, vec![127, 0, 0, 1]).unwrap(),
@@ -522,8 +525,11 @@ mod tests {
         let mut packet = Packet::new(Code::AccessRequest, 1, [0u8; 16]);
         packet.add_attribute(Attribute::string(AttributeType::UserName as u8, "test").unwrap());
         packet.add_attribute(
-            Attribute::new(AttributeType::EapMessage as u8, vec![0x02, 0x00, 0x00, 0x05, 0x01])
-                .unwrap(),
+            Attribute::new(
+                AttributeType::EapMessage as u8,
+                vec![0x02, 0x00, 0x00, 0x05, 0x01],
+            )
+            .unwrap(),
         );
         packet.add_attribute(
             Attribute::new(AttributeType::NasIpAddress as u8, vec![127, 0, 0, 1]).unwrap(),

@@ -1,0 +1,10 @@
+# cargo-audit configuration.
+[advisories]
+ignore = [
+    # rsa "Marvin Attack" timing side-channel. `rsa` is pulled ONLY by the
+    # `sqlx-mysql` driver, which is an optional dependency of sqlx. This project
+    # uses PostgreSQL only (sqlx is built with default-features = false, postgres),
+    # so the MySQL driver and `rsa` are never compiled. There is also no patched
+    # release of `rsa` available upstream. `cargo tree -i rsa` is empty.
+    "RUSTSEC-2023-0071",
+]

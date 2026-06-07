@@ -19,7 +19,6 @@ serde_json = { workspace = true, optional = true }
 
 # TLS dependencies (for EAP-TLS, EAP-TTLS, PEAP)
 rustls = { workspace = true, optional = true }
-rustls-pemfile = { workspace = true, optional = true }
 x509-parser = { workspace = true, optional = true }
 pki-types = { workspace = true, optional = true }
 
@@ -35,5 +34,5 @@ hex.workspace = true
 [features]
 default = []
 serde = ["dep:serde", "dep:serde_json"]
-tls = ["dep:rustls", "dep:rustls-pemfile", "dep:x509-parser", "dep:pki-types"]
+tls = ["dep:rustls", "dep:x509-parser", "dep:pki-types"]
 revocation = ["tls", "serde", "dep:reqwest", "dep:url", "dep:chrono", "dep:dashmap"]

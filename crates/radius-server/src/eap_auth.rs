@@ -298,7 +298,10 @@ impl EapAuthHandler {
             match manager.get_session_mut(session_id) {
                 Some(s) => s.next_identifier(),
                 None => {
-                    error!(session_id, "start_eap_tls: session vanished before identifier bump");
+                    error!(
+                        session_id,
+                        "start_eap_tls: session vanished before identifier bump"
+                    );
                     return AuthResult::Reject;
                 }
             }
@@ -307,7 +310,10 @@ impl EapAuthHandler {
         let eap_packet = EapTlsPacket::start().to_eap_request(identifier);
         match radius_proto::eap::eap_to_radius_attributes(&eap_packet) {
             Ok(eap_attrs) => {
-                debug!(session_id, identifier, "start_eap_tls: sending EAP-TLS Start");
+                debug!(
+                    session_id,
+                    identifier, "start_eap_tls: sending EAP-TLS Start"
+                );
                 AuthResult::Challenge {
                     message: Some("EAP-TLS authentication".to_string()),
                     state: session_id.as_bytes().to_vec(),
@@ -381,7 +387,10 @@ impl EapAuthHandler {
             // Convert EAP packet to RADIUS attributes
             match radius_proto::eap::eap_to_radius_attributes(&eap_packet) {
                 Ok(eap_attrs) => {
-                    debug!(session_id, identifier, "start_eap_teap: sending EAP-TEAP Start");
+                    debug!(
+                        session_id,
+                        identifier, "start_eap_teap: sending EAP-TEAP Start"
+                    );
                     return AuthResult::Challenge {
                         message: Some("EAP-TEAP authentication".to_string()),
                         state: session_id.as_bytes().to_vec(),
@@ -418,7 +427,10 @@ impl EapAuthHandler {
     ) -> AuthResult {
         let mut tls_sessions = self.tls_sessions.write().unwrap();
         let Some(tls_server) = tls_sessions.get_mut(session_id) else {
-            error!(session_id, "continue_eap_tls: no TLS session (state expired?)");
+            error!(
+                session_id,
+                "continue_eap_tls: no TLS session (state expired?)"
+            );
             return AuthResult::Reject;
         };
 
@@ -456,7 +468,11 @@ impl EapAuthHandler {
                 return AuthResult::Reject;
             };
             let id = next_id();
-            debug!(session_id, identifier = id, "continue_eap_tls: sending next fragment");
+            debug!(
+                session_id,
+                identifier = id,
+                "continue_eap_tls: sending next fragment"
+            );
             return make_challenge(frag, id).unwrap_or(AuthResult::Reject);
         }
 
@@ -479,7 +495,11 @@ impl EapAuthHandler {
                     return AuthResult::Reject;
                 };
                 let id = next_id();
-                debug!(session_id, identifier = id, "continue_eap_tls: sending first fragment of new TLS message");
+                debug!(
+                    session_id,
+                    identifier = id,
+                    "continue_eap_tls: sending first fragment of new TLS message"
+                );
                 make_challenge(frag, id).unwrap_or(AuthResult::Reject)
             }
 
@@ -496,16 +516,23 @@ impl EapAuthHandler {
                     return AuthResult::Reject;
                 }
                 if tls_server.extract_keys().is_err() {
-                    error!(session_id, "continue_eap_tls: extract_keys failed after handshake");
+                    error!(
+                        session_id,
+                        "continue_eap_tls: extract_keys failed after handshake"
+                    );
                     return AuthResult::Reject;
                 }
-                let identity_verified = if let Some(_peer_certs) = tls_server.get_peer_certificates() {
-                    tls_server.verify_peer_identity(username).unwrap_or(false)
-                } else {
-                    true // server-only authentication
-                };
+                let identity_verified =
+                    if let Some(_peer_certs) = tls_server.get_peer_certificates() {
+                        tls_server.verify_peer_identity(username).unwrap_or(false)
+                    } else {
+                        true // server-only authentication
+                    };
                 if !identity_verified {
-                    warn!(session_id, username, "continue_eap_tls: peer identity verification failed");
+                    warn!(
+                        session_id,
+                        username, "continue_eap_tls: peer identity verification failed"
+                    );
                     return AuthResult::Reject;
                 }
 
@@ -530,7 +557,10 @@ impl EapAuthHandler {
                         return AuthResult::Reject;
                     }
                 };
-                debug!(session_id, username, "continue_eap_tls: handshake complete, EAP-Success");
+                debug!(
+                    session_id,
+                    username, "continue_eap_tls: handshake complete, EAP-Success"
+                );
                 // TODO: derive MS-MPPE keys from the MSK and attach to the Accept.
                 AuthResult::Accept { attributes: attrs }
             }
@@ -613,7 +643,9 @@ impl EapAuthHandler {
                             match radius_proto::eap::eap_to_radius_attributes(&success_packet) {
                                 Ok(eap_attrs) => {
                                     // Could add MS-MPPE keys here from MSK
-                                    return AuthResult::Accept { attributes: eap_attrs };
+                                    return AuthResult::Accept {
+                                        attributes: eap_attrs,
+                                    };
                                 }
                                 Err(e) => {
                                     error!(session_id, error = ?e, "continue_eap_teap: failed to wrap EAP-Success");
@@ -701,9 +733,7 @@ impl AuthHandler for EapAuthHandler {
                     match eap_packet.eap_type {
                         // First inbound EAP packet: peer's EAP-Response/Identity.
                         // Start the configured method (TEAP > TLS > MD5).
-                        Some(EapType::Identity) => {
-                            self.handle_identity(&username, &session_id)
-                        }
+                        Some(EapType::Identity) => self.handle_identity(&username, &session_id),
                         Some(EapType::Tls) => {
                             self.continue_eap_tls(&username, &session_id, &eap_packet)
                         }

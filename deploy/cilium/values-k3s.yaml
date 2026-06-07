@@ -1,0 +1,42 @@
+# Cilium Helm values for the USG RADIUS anycast deployment on k3s.
+#
+# Prereq: install k3s WITHOUT flannel/servelb/network-policy/traefik so Cilium owns
+# networking (see deploy/overlays/k3s/README.md), then:
+#   helm repo add cilium https://helm.cilium.io
+#   helm upgrade --install cilium cilium/cilium --version 1.16.x \
+#       --namespace kube-system -f deploy/cilium/values-k3s.yaml
+#
+# Same requirements as the k8s values, with k3s-specific paths.
+
+kubeProxyReplacement: true
+
+# k3s runs the apiserver on 6443; point Cilium at it since kube-proxy is disabled.
+k8sServiceHost: 127.0.0.1
+k8sServicePort: 6443
+
+# k3s keeps its CNI/runtime state under /var/lib/rancher/k3s.
+cni:
+  binPath: /var/lib/rancher/k3s/data/current/bin
+  confPath: /var/lib/rancher/k3s/agent/etc/cni/net.d
+
+loadBalancer:
+  mode: dsr
+  dsrDispatch: geneve
+
+bgpControlPlane:
+  enabled: true
+
+ipv4:
+  enabled: true
+ipv6:
+  enabled: true
+
+enableIPv4Masquerade: true
+enableIPv6Masquerade: true
+
+l2announcements:
+  enabled: false
+
+operator:
+  # Single-node / small homelab clusters often run one operator replica.
+  replicas: 1

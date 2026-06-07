@@ -1,0 +1,38 @@
+---
+# The anycast RADIUS VIP. Cilium assigns one IPv4 and one IPv6 from the
+# CiliumLoadBalancerIPPool and advertises them via BGP from every node that has a
+# Ready radius pod (because of externalTrafficPolicy: Local).
+apiVersion: v1
+kind: Service
+metadata:
+  name: usg-radius-server
+  namespace: radius
+  labels:
+    app.kubernetes.io/name: usg-radius-server
+    app.kubernetes.io/part-of: usg-radius
+  annotations:
+    # Pin Direct Server Return for this Service so the NAS source IP is preserved
+    # and never SNATed, regardless of the cluster-wide Cilium default.
+    service.cilium.io/forwarding-mode: dsr
+spec:
+  type: LoadBalancer
+  # Dual-stack VIP: one IPv4 + one IPv6 external address.
+  ipFamilyPolicy: RequireDualStack
+  ipFamilies:
+    - IPv4
+    - IPv6
+  # Preserve the client (NAS) source IP — required because RADIUS authorizes
+  # clients by source IP/CIDR — and restrict BGP advertisement to nodes that have
+  # a local Ready endpoint.
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: usg-radius-server
+  ports:
+    - name: radius-auth
+      port: 1812
+      targetPort: radius-auth
+      protocol: UDP
+    - name: radius-acct
+      port: 1813
+      targetPort: radius-acct
+      protocol: UDP

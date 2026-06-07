@@ -638,12 +638,19 @@ async fn test_ipv6_support() {
     // Try to send request over IPv6
     let result = send_radius_request(&packet, server_addr).await;
 
-    // If we get a routing error, IPv6 isn't fully configured, skip test
-    if let Err(ref e) = result
-        && (e.to_string().contains("No route to host") || e.to_string().contains("HostUnreachable"))
-    {
-        println!("IPv6 routing not configured, skipping test");
-        return;
+    // If IPv6 isn't available/configured (common on CI runners), skip rather than
+    // fail. Covers routing errors and a total lack of IPv6 support
+    // (EAFNOSUPPORT -> "Address family not supported").
+    if let Err(ref e) = result {
+        let msg = e.to_string();
+        if msg.contains("No route to host")
+            || msg.contains("HostUnreachable")
+            || msg.contains("Address family not supported")
+            || msg.contains("AddrNotAvailable")
+        {
+            println!("IPv6 not configured on this host, skipping test: {msg}");
+            return;
+        }
     }
 
     let response = result.expect("Failed to send request over IPv6");
@@ -2087,8 +2094,8 @@ async fn test_proxy_state_echoed_on_access_accept() {
     let mut handler = SimpleAuthHandler::new();
     handler.add_user("psuser", "pspass");
 
-    let server_config = ServerConfig::from_config(config, Arc::new(handler))
-        .expect("server config");
+    let server_config =
+        ServerConfig::from_config(config, Arc::new(handler)).expect("server config");
     let server = RadiusServer::new(server_config).await.expect("server");
     let server_addr = server.local_addr().expect("server addr");
 
@@ -2118,8 +2125,8 @@ async fn test_proxy_state_echoed_on_access_reject() {
     let mut handler = SimpleAuthHandler::new();
     handler.add_user("psuser", "rightpass");
 
-    let server_config = ServerConfig::from_config(config, Arc::new(handler))
-        .expect("server config");
+    let server_config =
+        ServerConfig::from_config(config, Arc::new(handler)).expect("server config");
     let server = RadiusServer::new(server_config).await.expect("server");
     let server_addr = server.local_addr().expect("server addr");
 
@@ -2150,8 +2157,8 @@ async fn test_proxy_state_echoed_on_access_challenge() {
     let mut handler = ChallengeAuthHandler::new();
     handler.add_user("challengeuser", "password");
 
-    let server_config = ServerConfig::from_config(config, Arc::new(handler))
-        .expect("server config");
+    let server_config =
+        ServerConfig::from_config(config, Arc::new(handler)).expect("server config");
     let server = RadiusServer::new(server_config).await.expect("server");
     let server_addr = server.local_addr().expect("server addr");
 
@@ -2193,8 +2200,13 @@ async fn test_proxy_state_echoed_on_accounting_response() {
     sleep(Duration::from_millis(100)).await;
 
     let secret = b"testing123";
-    let mut packet =
-        create_accounting_request(AcctStatusType::Start, "session-proxy-1", "psuser", 4, secret);
+    let mut packet = create_accounting_request(
+        AcctStatusType::Start,
+        "session-proxy-1",
+        "psuser",
+        4,
+        secret,
+    );
     let expected = add_three_proxy_states(&mut packet);
     // Recompute Accounting Request authenticator after adding Proxy-State.
     packet.authenticator = calculate_accounting_request_authenticator(&packet, secret);
@@ -2222,8 +2234,8 @@ async fn test_proxy_state_order_preserved_with_many_values() {
     let mut handler = SimpleAuthHandler::new();
     handler.add_user("psuser", "pspass");
 
-    let server_config = ServerConfig::from_config(config, Arc::new(handler))
-        .expect("server config");
+    let server_config =
+        ServerConfig::from_config(config, Arc::new(handler)).expect("server config");
     let server = RadiusServer::new(server_config).await.expect("server");
     let server_addr = server.local_addr().expect("server addr");
 

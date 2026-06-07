@@ -36,7 +36,12 @@ Verify installation:
 
 ## Installation Methods
 
-### From Source (Recommended)
+USG RADIUS is deployed on Kubernetes (k3s or k8s) with the Cilium CNI — this is the only
+supported deployment path. The canonical deployment guide is
+[`deploy/README.md`](../../../deploy/README.md). For local development and testing you can
+build and run the binary directly with Cargo.
+
+### Build the Container Image (for deployment)
 
 1. **Clone the repository:**
 
@@ -45,26 +50,40 @@ Verify installation:
     cd usg-radius
     ```
 
-2. **Build the project:**
+2. **Build and push the multi-arch image** (`usg-radius-server`, binary `usg-radius`,
+   built on a hardened Iron Bank Alpine base via cargo-chef):
 
     ```bash
-    cargo build --release
+    docker buildx build --platform linux/amd64,linux/arm64 \
+      -t <registry>/usg-radius-server:<tag> --push .
     ```
 
-    The compiled binary will be at `target/release/usg_radius`.
-
-3. **Optional: Install to system:**
+3. **Deploy via kustomize:**
 
     ```bash
-    cargo install --path .
+    # Install Cilium with the provided values first (see deploy/README.md), then:
+    kubectl apply -k deploy/overlays/k8s    # or deploy/overlays/k3s
     ```
 
-    This installs the binary to `~/.cargo/bin/usg_radius`.
+    See the [Quick Start](../deployment/QUICKSTART.md) for the full flow (Cilium install,
+    overlay edits, verification with `cilium bgp routes`).
 
-### Pre-built Binaries
+### Build from Source (local development)
 
-!!! info "Coming Soon"
-    Pre-built binaries for common platforms will be available in future releases.
+For local development and testing, build and run the binary with Cargo:
+
+```bash
+cargo build --release
+# Binary at target/release/usg-radius
+./target/release/usg-radius config.json
+```
+
+Enable the `observability` feature to expose health (`/health/*` on TCP 2812) and
+Prometheus metrics (`/metrics` on TCP 3812):
+
+```bash
+cargo build --release --features observability
+```
 
 ## Verification
 
@@ -73,7 +92,7 @@ Verify the installation by checking the version:
 ```bash
 cargo run -- --version
 # or if installed:
-usg_radius --version
+usg-radius --version
 ```
 
 Expected output:
@@ -180,66 +199,13 @@ Received response (20 bytes)
   Response: Access-Accept
 ```
 
-## Running as a Service
+## Running in Production
 
-### Linux (systemd)
-
-Create a systemd service file at `/etc/systemd/system/usg-radius.service`:
-
-```ini
-[Unit]
-Description=USG RADIUS Server
-After=network.target
-
-[Service]
-Type=simple
-User=radius
-Group=radius
-WorkingDirectory=/opt/usg-radius
-ExecStart=/opt/usg-radius/target/release/usg_radius
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable and start the service:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable usg-radius
-sudo systemctl start usg-radius
-sudo systemctl status usg-radius
-```
-
-### Docker
-
-!!! info "Coming Soon"
-    Docker image and compose files will be available in future releases.
-
-## Firewall Configuration
-
-Ensure UDP port 1812 is open:
-
-=== "UFW (Ubuntu)"
-
-    ```bash
-    sudo ufw allow 1812/udp
-    ```
-
-=== "firewalld (RHEL/CentOS)"
-
-    ```bash
-    sudo firewall-cmd --permanent --add-port=1812/udp
-    sudo firewall-cmd --reload
-    ```
-
-=== "iptables"
-
-    ```bash
-    sudo iptables -A INPUT -p udp --dport 1812 -j ACCEPT
-    ```
+Production deployments run on Kubernetes as a stateless `Deployment` exposed on a Cilium
+BGP L3 anycast VIP. See the [Quick Start](../deployment/QUICKSTART.md),
+[Deployment Guide](../deployment/DEPLOYMENT.md), and the canonical
+[`deploy/README.md`](../../../deploy/README.md). Access to the VIP (UDP 1812 auth, 1813
+accounting) is restricted at the upstream router/firewall to legitimate RADIUS clients.
 
 ## Troubleshooting
 
@@ -266,7 +232,7 @@ On Linux, binding to ports below 1024 requires root privileges. Port 1812 doesn'
 sudo cargo run --release
 
 # Or use capabilities
-sudo setcap 'cap_net_bind_service=+ep' target/release/usg_radius
+sudo setcap 'cap_net_bind_service=+ep' target/release/usg-radius
 ```
 
 ### Cannot Connect from Remote Host
