@@ -23,6 +23,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `/metrics` (3812/tcp) HTTP servers itself, bound dual-stack `[::]`, behind the
   new `observability` cargo feature (replaces `ha`). Accounting port 1813/udp added.
 
+### Security
+
+- Updated dependencies to clear `cargo audit` findings: `aws-lc-sys` 0.35→0.41
+  (5 advisories), `rustls-webpki` 0.103.8→0.103.13 (4 advisories), `bytes`
+  1.11.0→1.11.1, `time` 0.3.44→0.3.47, and `rand` (RUSTSEC-2026-0097), plus
+  `rustls`/`tokio`/`hyper` bumps.
+- Dropped the sqlx `macros` feature (build with `default-features = false`,
+  postgres only) — the code uses only the runtime `sqlx::query` API, so this
+  removes `sqlx-macros-core` from the build. The MySQL driver and its `rsa`
+  dependency (unpatched RUSTSEC-2023-0071) are never compiled.
+- Added `.cargo/audit.toml` documenting the two remaining advisories
+  (`rsa`, `rustls-pemfile`), both feature-gated transitive deps not present in any
+  shipped artifact and with no update available.
+
 ### Added
 
 - Multi-arch (`linux/amd64` + `linux/arm64`) container image `usg-radius-server`,

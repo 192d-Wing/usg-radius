@@ -70,11 +70,13 @@ clap = { version = "4.5", features = ["derive", "cargo"] }
 # LDAP
 ldap3 = "0.12"
 
-# Database
-sqlx = { version = "0.8", features = [
+# Database. The `macros` feature is intentionally omitted: the code uses only the
+# runtime `sqlx::query(...)` API (no compile-time `query!`/`FromRow`). Omitting it
+# drops `sqlx-macros-core`, which otherwise pulls every driver (mysql/sqlite) and
+# the unpatched `rsa` crate (RUSTSEC-2023-0071) into the tree.
+sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "postgres",
-    "macros",
     "chrono",
 ] }
 bcrypt = "0.17"
