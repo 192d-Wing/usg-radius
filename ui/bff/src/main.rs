@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/clients", get(handlers::clients))
         .route("/users", get(handlers::users))
         .route("/sessions", get(handlers::sessions))
-        .route("/policy", get(handlers::policy_get))
+        .route("/policy", get(handlers::policy_get).put(handlers::policy_put))
         .route("/dictionary", get(handlers::dictionary))
         .route("/policy/dry-run", post(handlers::policy_dry_run))
         .with_state(state.clone());

@@ -56,30 +56,52 @@ async fn start_observability(config: &Config) {
     // Read-only management API for the operator UI (needs the loaded Config).
     let mgmt_cfg = Arc::new(config.clone());
     // Optional authorization policy (used by the policy API + dry-run; not yet
-    // enforced in the request path). Loaded from POLICY_FILE if set.
-    let policy = match env::var("POLICY_FILE") {
-        Ok(path) => match std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<radius_server::PolicyConfig>(&s).ok())
-        {
-            Some(p) => {
-                info!("Loaded authorization policy from {path}");
-                Arc::new(p)
+    // enforced in the request path). Loaded from POLICY_FILE if set; PUT persists
+    // back to that file. Editable in memory behind an RwLock.
+    let policy_file: Option<std::sync::Arc<str>> = env::var("POLICY_FILE")
+        .ok()
+        .map(|p| std::sync::Arc::from(p.as_str()));
+    let loaded = match &policy_file {
+        // A missing file is fine (first run); but a file that EXISTS and fails to
+        // read/parse is fatal — silently starting with an empty policy would
+        // discard the operator's authorization config (fail-open once enforced).
+        Some(path) if std::path::Path::new(path.as_ref()).exists() => {
+            match std::fs::read_to_string(path.as_ref())
+                .map_err(|e| e.to_string())
+                .and_then(|s| {
+                    serde_json::from_str::<radius_server::PolicyConfig>(&s)
+                        .map_err(|e| e.to_string())
+                }) {
+                Ok(p) => {
+                    info!("Loaded authorization policy from {path}");
+                    p
+                }
+                Err(e) => {
+                    error!("POLICY_FILE {path} exists but could not be loaded: {e}");
+                    process::exit(1);
+                }
             }
-            None => {
-                warn!("Could not read/parse POLICY_FILE {path}; using empty policy");
-                Arc::new(radius_server::PolicyConfig::default())
-            }
-        },
-        Err(_) => Arc::new(radius_server::PolicyConfig::default()),
+        }
+        Some(path) => {
+            info!("POLICY_FILE {path} does not exist yet; starting with an empty policy");
+            radius_server::PolicyConfig::default()
+        }
+        None => radius_server::PolicyConfig::default(),
     };
+    let policy = Arc::new(std::sync::RwLock::new(loaded));
     let bind = format!("[::]:{mgmt_port}");
     match bind.parse::<std::net::SocketAddr>() {
         Ok(addr) => {
             info!("Starting management server on {bind}");
             tokio::spawn(async move {
-                if let Err(e) =
-                    radius_server::start_mgmt_server(mgmt_cfg, session_manager, policy, addr).await
+                if let Err(e) = radius_server::start_mgmt_server(
+                    mgmt_cfg,
+                    session_manager,
+                    policy,
+                    policy_file,
+                    addr,
+                )
+                .await
                 {
                     warn!("management server error: {e}");
                 }
