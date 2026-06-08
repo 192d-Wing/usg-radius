@@ -679,6 +679,40 @@ mod tests {
     }
 
     #[test]
+    fn matches_nested_group_with_not() {
+        // ALL[ EAP-Type == EAP-TLS, NOT( ANY[ NAS-Port-Type == Async ] ) ] — the
+        // shape the recursive UI editor now produces (nested group under a NOT).
+        let cond = Condition::All {
+            conditions: vec![
+                Condition::Attr {
+                    attribute: "EAP-Type".into(),
+                    operator: Operator::Equals,
+                    value: "EAP-TLS".into(),
+                },
+                Condition::Not {
+                    condition: Box::new(Condition::Any {
+                        conditions: vec![Condition::Attr {
+                            attribute: "NAS-Port-Type".into(),
+                            operator: Operator::Equals,
+                            value: "Async".into(),
+                        }],
+                    }),
+                },
+            ],
+        };
+        // EAP-TLS over Ethernet → inner ANY is false, NOT(false)=true, ALL=true.
+        assert!(cond.matches(&ctx(&[
+            ("EAP-Type", "EAP-TLS"),
+            ("NAS-Port-Type", "Ethernet")
+        ])));
+        // EAP-TLS over Async → inner ANY is true, NOT(true)=false, ALL=false.
+        assert!(!cond.matches(&ctx(&[("EAP-Type", "EAP-TLS"), ("NAS-Port-Type", "Async")])));
+        // Wrong EAP type → first leaf fails, ALL=false.
+        assert!(!cond.matches(&ctx(&[("EAP-Type", "PEAP"), ("NAS-Port-Type", "Ethernet")])));
+        assert!(cond.validate().is_ok());
+    }
+
+    #[test]
     fn empty_policy_rejects() {
         let d = PolicyConfig::default().evaluate(&ctx(&[("User-Name", "x")]));
         assert_eq!(d.effect, Effect::Reject);
