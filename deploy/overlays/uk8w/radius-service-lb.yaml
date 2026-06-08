@@ -1,0 +1,34 @@
+---
+# Radius anycast LoadBalancer Service. Labeled `app: radius` so the radius-anycast
+# pool and radius-loadbalancer advertisement select it; mirrors the working tacacs
+# service (externalTrafficPolicy: Local, dual-stack). Cilium assigns 10.10.10.56 +
+# 2601:443:c200:575::56 from the pool.
+apiVersion: v1
+kind: Service
+metadata:
+  name: usg-radius-server
+  namespace: radius
+  labels:
+    app: radius
+    app.kubernetes.io/name: usg-radius-server
+    app.kubernetes.io/part-of: usg-radius
+spec:
+  type: LoadBalancer
+  ipFamilyPolicy: RequireDualStack
+  ipFamilies:
+    - IPv4
+    - IPv6
+  # Preserve the NAS source IP (RADIUS authorizes clients by source IP) and gate
+  # BGP advertisement on a local Ready endpoint.
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: usg-radius-server
+  ports:
+    - name: radius-auth
+      port: 1812
+      targetPort: radius-auth
+      protocol: UDP
+    - name: radius-acct
+      port: 1813
+      targetPort: radius-acct
+      protocol: UDP

@@ -81,34 +81,36 @@ jobs:
   # Build each architecture in parallel on a NATIVE runner (no QEMU), push each
   # by digest, then assemble a single multi-arch manifest in `merge-image`.
   # arm64 uses a GitHub-hosted arm64 runner (free for public repos).
+  # Build each component (server, ui) for each architecture in parallel on a
+  # NATIVE runner (no QEMU), push each by digest, then assemble per-component
+  # multi-arch manifests in `merge-image`.
   build-image:
-    name: Build image (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
+    name: Build ${{ matrix.component.name }} (${{ matrix.arch.name }})
+    runs-on: ${{ matrix.arch.runner }}
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
+        component:
+          - { name: server, suffix: "-server", context: "." }
+          - { name: ui, suffix: "-ui", context: "ui" }
+        arch:
+          - { name: amd64, platform: linux/amd64, runner: ubuntu-latest }
+          - { name: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm }
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Compute lowercase image name
-        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')-server" >> "$GITHUB_ENV"
+        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')${{ matrix.component.suffix }}" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Authenticate to Iron Bank so the Dockerfile's `FROM registry1.dso.mil/...`
-      # base image can be pulled. REPO1 is the robot CLI secret (password),
+      # Authenticate to Iron Bank so the Dockerfiles' `FROM registry1.dso.mil/...`
+      # base images can be pulled. REPO1 is the robot CLI secret (password),
       # REPO1_USER is the robot username.
       - name: Log in to Iron Bank (registry1.dso.mil)
         uses: docker/login-action@v3
@@ -128,11 +130,11 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: .
-          platforms: ${{ matrix.platform }}
+          context: ${{ matrix.component.context }}
+          platforms: ${{ matrix.arch.platform }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.component.name }}-${{ matrix.arch.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component.name }}-${{ matrix.arch.name }}
 
       - name: Export digest
         run: |
@@ -143,27 +145,33 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ matrix.arch }}
+          name: digests-${{ matrix.component.name }}-${{ matrix.arch.name }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
   merge-image:
-    name: Merge & push manifest
+    name: Merge & push ${{ matrix.component.name }} manifest
     needs: build-image
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        component:
+          - { name: server, suffix: "-server" }
+          - { name: ui, suffix: "-ui" }
     steps:
       - name: Compute lowercase image name
-        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')-server" >> "$GITHUB_ENV"
+        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')${{ matrix.component.suffix }}" >> "$GITHUB_ENV"
 
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
-          pattern: digests-*
+          pattern: digests-${{ matrix.component.name }}-*
           merge-multiple: true
 
       - name: Set up Docker Buildx

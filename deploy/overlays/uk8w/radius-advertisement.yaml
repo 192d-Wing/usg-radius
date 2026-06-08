@@ -1,0 +1,20 @@
+---
+# Advertise the radius LoadBalancer VIP over the existing k3s-upstream BGP session.
+# The `advertise: k3s-pod-cidrs` label is what CiliumBGPPeerConfig/upstream-k3s-*
+# selects (same mechanism the dcim/pihole/tacacs advertisements use). We do NOT
+# create a new CiliumBGPClusterConfig — we reuse k3s-upstream.
+apiVersion: cilium.io/v2
+kind: CiliumBGPAdvertisement
+metadata:
+  name: radius-loadbalancer
+  labels:
+    advertise: k3s-pod-cidrs
+spec:
+  advertisements:
+    - advertisementType: Service
+      service:
+        addresses:
+          - LoadBalancerIP
+      selector:
+        matchLabels:
+          app: radius
