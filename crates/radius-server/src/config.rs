@@ -363,6 +363,9 @@ impl Config {
     /// Returns the first enabled client that matches the source IP.
     /// Returns None if no matching client is found or if the clients list is empty.
     pub fn find_client(&self, source_ip: IpAddr) -> Option<&Client> {
+        // Canonicalize IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to plain IPv4 so a v4
+        // client CIDR matches a source received over a dual-stack (`[::]`) socket.
+        let source_ip = source_ip.to_canonical();
         for client in &self.clients {
             if !client.enabled {
                 continue;
@@ -642,6 +645,30 @@ mod tests {
         // Should not find non-matching IP
         let client = config.find_client("172.16.0.1".parse().unwrap());
         assert!(client.is_none());
+    }
+
+    #[test]
+    fn test_find_client_ipv4_mapped_ipv6() {
+        // Regression: when the server binds dual-stack `[::]`, IPv4 datagrams arrive
+        // with a v4-mapped source (`::ffff:a.b.c.d`). It must still match a v4 client
+        // CIDR — otherwise every IPv4 NAS is rejected as unauthorized.
+        let mut config = Config::default();
+        config.clients = vec![Client {
+            address: "10.0.0.0/8".to_string(),
+            secret: "secret".to_string(),
+            name: Some("v4 net".to_string()),
+            enabled: true,
+            nas_identifier: None,
+        }];
+
+        let mapped: IpAddr = "::ffff:10.0.100.34".parse().unwrap();
+        assert!(mapped.is_ipv6(), "test input must be the v4-mapped form");
+        assert!(
+            config.find_client(mapped).is_some(),
+            "v4-mapped IPv6 source must match the v4 client CIDR"
+        );
+        // And the per-client secret lookup (which routes through find_client) too.
+        assert_eq!(config.get_secret_for_client(mapped), b"secret");
     }
 
     #[test]
