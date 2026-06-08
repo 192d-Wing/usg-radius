@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Overlay for the `uk8w` 5-node arm64 k3s cluster (10.0.111.10-14).
+#
+# This cluster ALREADY runs Cilium BGP (CiliumBGPClusterConfig/k3s-upstream,
+# localASN 64600, peers 10.0.111.1 / 2601:443:c200:572::1) serving dcim/pihole/tacacs
+# anycast VIPs. We therefore REUSE that BGP and add only a radius IP pool +
+# advertisement + workload — we do NOT pull in base/cilium-bgp.yaml (which would
+# create a conflicting CiliumBGPClusterConfig).
+namespace: radius
+
+resources:
+  # Reused unchanged from base:
+  - ../../base/namespace.yaml
+  - ../../base/radius-deployment.yaml
+  - ../../base/radius-service-internal.yaml
+  # Cluster-specific (override base equivalents; base bgp/ippool/secret/lb omitted):
+  - radius-config.secret.yaml
+  - radius-service-lb.yaml
+  - radius-anycast-pool.yaml
+  - radius-advertisement.yaml
+
+images:
+  - name: usg-radius-server
+    newName: ghcr.io/192d-wing/usg-radius-server
+    newTag: "0.8.0"

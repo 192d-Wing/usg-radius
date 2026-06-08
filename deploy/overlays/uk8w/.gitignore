@@ -1,0 +1,2 @@
+# Contains the (throwaway) shared secret/password — keep it out of git.
+radius-config.secret.yaml

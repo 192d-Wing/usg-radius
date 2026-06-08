@@ -1,0 +1,4 @@
+web/node_modules
+web/dist
+bff/target
+**/.DS_Store

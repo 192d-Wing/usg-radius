@@ -1,0 +1,20 @@
+---
+# ClusterIP — front this with oauth2-proxy + an ingress (Traefik/Cilium) for
+# real access. For a quick look in P0: kubectl -n radius port-forward svc/usg-radius-ui 8088:80
+apiVersion: v1
+kind: Service
+metadata:
+  name: usg-radius-ui
+  namespace: radius
+  labels:
+    app.kubernetes.io/name: usg-radius-ui
+    app.kubernetes.io/part-of: usg-radius
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: usg-radius-ui
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

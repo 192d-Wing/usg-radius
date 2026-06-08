@@ -1,0 +1,62 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: usg-radius-ui
+  namespace: radius
+  labels:
+    app.kubernetes.io/name: usg-radius-ui
+    app.kubernetes.io/part-of: usg-radius
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: usg-radius-ui
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: usg-radius-ui
+        app.kubernetes.io/part-of: usg-radius
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ui
+          image: ghcr.io/192d-wing/usg-radius-ui:0.8.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8088
+              name: http
+          env:
+            # The BFF reaches the radius server's internal (health/metrics) service.
+            - name: RADIUS_METRICS_URL
+              value: "http://usg-radius-internal.radius.svc:3812"
+            - name: RADIUS_HEALTH_URL
+              value: "http://usg-radius-internal.radius.svc:2812"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

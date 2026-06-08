@@ -1,0 +1,31 @@
+# Standalone (not part of the server workspace) so it builds independently in the
+# UI Docker context.
+[workspace]
+
+[package]
+name = "radius-ui-bff"
+version = "0.8.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Backend-for-frontend for the usg-radius operator UI: serves the Cloudscape SPA and aggregates the RADIUS server's health/metrics. Identity comes from oauth2-proxy headers."
+
+[[bin]]
+name = "radius-ui-bff"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+# HTTP only (in-cluster http://) — no TLS backend, keeps the musl build free of
+# aws-lc-sys/ring.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+strip = "debuginfo"
+lto = "thin"

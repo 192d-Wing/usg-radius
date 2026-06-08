@@ -1,0 +1,14 @@
+---
+# Radius anycast VIP pool for the uk8w k3s cluster. Mirrors the existing
+# dcim/pihole/tacacs anycast pools (next free address in the 10.10.10.5x scheme).
+apiVersion: cilium.io/v2
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: radius-anycast
+spec:
+  serviceSelector:
+    matchLabels:
+      app: radius
+  blocks:
+    - cidr: "10.10.10.56/32"
+    - cidr: "2601:443:c200:575::56/128"
