@@ -18,10 +18,11 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 /// or IPv6. Only compiled with the `observability` feature (pulls in axum). The
 /// server is stateless; the session manager is backed by in-memory storage.
 #[cfg(feature = "observability")]
-async fn start_observability(listen_port: u16) {
+async fn start_observability(config: &Config) {
     use radius_server::state::{MemoryStateBackend, SharedSessionManager};
     use std::env;
 
+    let listen_port = config.listen_port;
     let health_port = env::var("HEALTH_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
@@ -30,6 +31,10 @@ async fn start_observability(listen_port: u16) {
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(listen_port.saturating_add(2000));
+    let mgmt_port = env::var("MGMT_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(listen_port.saturating_add(3000));
 
     let session_manager = Arc::new(SharedSessionManager::new(Arc::new(
         MemoryStateBackend::new(),
@@ -44,9 +49,26 @@ async fn start_observability(listen_port: u16) {
     spawn_http_server(
         "metrics",
         metrics_port,
-        session_manager,
+        Arc::clone(&session_manager),
         radius_server::start_metrics_server,
     );
+
+    // Read-only management API for the operator UI (needs the loaded Config).
+    let mgmt_cfg = Arc::new(config.clone());
+    let bind = format!("[::]:{mgmt_port}");
+    match bind.parse::<std::net::SocketAddr>() {
+        Ok(addr) => {
+            info!("Starting management server on {bind}");
+            tokio::spawn(async move {
+                if let Err(e) =
+                    radius_server::start_mgmt_server(mgmt_cfg, session_manager, addr).await
+                {
+                    warn!("management server error: {e}");
+                }
+            });
+        }
+        Err(e) => warn!("Invalid management bind address {bind}: {e}"),
+    }
 }
 
 /// Spawn one of the auxiliary HTTP servers (health or metrics) on `[::]:port`.
@@ -78,8 +100,11 @@ fn spawn_http_server<F, Fut>(
 
 /// USG RADIUS Server - RFC 2865 RADIUS Authentication Server
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-#[command(name = "usg_radius")]
+// `version` is omitted here on purpose: the struct defines its own `-V/--version`
+// field below (with custom output), so letting clap auto-generate `--version` too
+// would create a duplicate `version` argument (panics clap's debug asserts).
+#[command(author, about, long_about = None)]
+#[command(name = "usg-radius")]
 struct Cli {
     /// Path to configuration file
     #[arg(value_name = "CONFIG", default_value = "config.json")]
@@ -102,7 +127,7 @@ async fn main() {
     if cli.version {
         println!("USG RADIUS Server v{}", env!("CARGO_PKG_VERSION"));
         println!("RFC 2865 RADIUS Authentication Server");
-        println!("");
+        println!();
         println!("Repository: {}", env!("CARGO_PKG_REPOSITORY"));
         println!("License: {}", env!("CARGO_PKG_LICENSE"));
         process::exit(0);
@@ -142,7 +167,7 @@ async fn main() {
     // If validate-only mode, validate and exit
     if cli.validate {
         println!("✓ Configuration validated successfully!");
-        println!("");
+        println!();
         println!("Configuration summary:");
         println!("  Listen: {}:{}", config.listen_address, config.listen_port);
         println!("  Clients: {}", config.clients.len());
@@ -155,7 +180,7 @@ async fn main() {
         if let Some(ref path) = config.audit_log_path {
             println!("  Audit log: {}", path);
         }
-        println!("");
+        println!();
 
         // Show client list
         if !config.clients.is_empty() {
@@ -285,7 +310,7 @@ async fn main() {
     // externalTrafficPolicy: Local the readiness state gates whether Cilium
     // advertises the anycast VIP from this node.
     #[cfg(feature = "observability")]
-    start_observability(config.listen_port).await;
+    start_observability(&config).await;
 
     info!("");
     info!("Server started successfully!");

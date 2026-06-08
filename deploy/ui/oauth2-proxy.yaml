@@ -1,0 +1,96 @@
+# oauth2-proxy (reverse-proxy mode) fronting usg-radius-ui with Keycloak OIDC.
+# It redirects unauthenticated users to Keycloak and proxies authenticated
+# requests to the UI BFF, injecting X-Auth-Request-* identity headers.
+#
+# Apply this alongside ingress.yaml AFTER providing (operator):
+#   - Secret `radius-ui-oidc` (ns radius) with keys:
+#       oidc-issuer-url : https://icam.oopl.dev.mil/realms/<REALM>
+#       client-id       : <keycloak client id for radius-ui>
+#       cookie-secret   : openssl rand -base64 32 | head -c 32
+#   - Keycloak client `radius-ui` (public + PKCE) with redirect URI
+#       https://radius-ui.oopl.dev.mil/oauth2/callback
+#   - Secret `oopl-ca` (ns radius) with key ca.pem (internal CA that signed Keycloak)
+#   - DNS: radius-ui.oopl.dev.mil -> 10.10.10.54 (Traefik LB)
+#
+# These are NOT in deploy/ui/kustomization.yaml on purpose — apply explicitly once
+# the prerequisites exist:  kubectl apply -f deploy/ui/oauth2-proxy.yaml -f deploy/ui/ingress.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy
+  namespace: radius
+  labels: { app: oauth2-proxy }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: oauth2-proxy }
+  template:
+    metadata:
+      labels: { app: oauth2-proxy }
+    spec:
+      automountServiceAccountToken: false
+      # Resolve the Keycloak ingress host to the Traefik LAN VIP (cluster DNS can't).
+      hostAliases:
+        - ip: "10.10.10.54"
+          hostnames: ["icam.oopl.dev.mil"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 2000
+        runAsGroup: 2000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1
+          args:
+            - "--provider=oidc"
+            - "--http-address=0.0.0.0:4180"
+            - "--reverse-proxy=true"
+            - "--set-xauthrequest=true"
+            - "--pass-access-token=false"
+            - "--email-domain=*"
+            - "--cookie-secure=true"
+            - "--cookie-name=_radius_ui"
+            - "--whitelist-domain=radius-ui.oopl.dev.mil"
+            - "--redirect-url=https://radius-ui.oopl.dev.mil/oauth2/callback"
+            - "--upstream=http://usg-radius-ui.radius.svc.cluster.local"
+            - "--skip-provider-button=true"
+            - "--pass-user-headers=true"
+            - "--code-challenge-method=S256"
+            - "--provider-ca-file=/etc/ssl/oopl/ca.pem"
+          env:
+            - { name: OAUTH2_PROXY_OIDC_ISSUER_URL, valueFrom: { secretKeyRef: { name: radius-ui-oidc, key: oidc-issuer-url } } }
+            - { name: OAUTH2_PROXY_CLIENT_ID, valueFrom: { secretKeyRef: { name: radius-ui-oidc, key: client-id } } }
+            # Public PKCE client — value is an unused placeholder; PKCE authenticates the exchange.
+            - { name: OAUTH2_PROXY_CLIENT_SECRET, value: "unused-public-client-pkce" }
+            - { name: OAUTH2_PROXY_COOKIE_SECRET, valueFrom: { secretKeyRef: { name: radius-ui-oidc, key: cookie-secret } } }
+          ports:
+            - { name: http, containerPort: 4180 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          readinessProbe:
+            httpGet: { path: /ready, port: 4180 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "25m", memory: "64Mi" }
+            limits: { cpu: "250m", memory: "128Mi" }
+          volumeMounts:
+            - { name: oopl-ca, mountPath: /etc/ssl/oopl, readOnly: true }
+      volumes:
+        - name: oopl-ca
+          secret:
+            secretName: oopl-ca
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth2-proxy
+  namespace: radius
+  labels: { app: oauth2-proxy }
+spec:
+  type: ClusterIP
+  selector: { app: oauth2-proxy }
+  ports:
+    - { name: http, port: 80, targetPort: 4180 }

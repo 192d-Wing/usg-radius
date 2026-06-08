@@ -41,6 +41,26 @@ export interface Overview {
   metrics: Metric[];
 }
 
+export interface Client {
+  address: string;
+  name?: string | null;
+  enabled: boolean;
+  nas_identifier?: string | null;
+}
+
+export interface User {
+  username: string;
+  attributes: Record<string, string>;
+}
+
+export interface Session {
+  session_id?: string;
+  username?: string;
+  nas_ip?: string;
+  framed_ip?: string;
+  [k: string]: any;
+}
+
 export const fmtDuration = (s: number) => {
   if (!Number.isFinite(s)) return "—";
   const d = Math.floor(s / 86400);

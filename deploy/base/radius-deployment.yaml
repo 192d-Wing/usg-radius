@@ -66,6 +66,9 @@ spec:
             - containerPort: 3812
               protocol: TCP
               name: metrics
+            - containerPort: 4812
+              protocol: TCP
+              name: mgmt
           env:
             - name: RUST_LOG
               value: "radius_server=info,info"
