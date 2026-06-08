@@ -88,4 +88,7 @@ pub use health::{HealthCheckState, HealthStatus, create_health_server, start_hea
 #[cfg(feature = "observability")]
 pub use metrics::{MetricsState, PrometheusMetrics, create_metrics_server, start_metrics_server};
 #[cfg(feature = "observability")]
-pub use mgmt::{CertIdentity, MgmtSecurity, MgmtState, create_mgmt_server, start_mgmt_server};
+pub use mgmt::{
+    CertIdentity, MgmtSecurity, MgmtState, SharedAccessPolicy, create_mgmt_server,
+    reload_access_policy, start_mgmt_server,
+};

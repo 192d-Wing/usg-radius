@@ -112,6 +112,20 @@ async fn start_observability(
     // `mgmt` config block; see load_access_policy.
     let mgmt_cfg = Arc::new(config.clone());
     let security = load_access_policy(config);
+
+    // Hot-reload the IAM access policy on SIGHUP (Unix) so operators can update it
+    // — e.g. after a ConfigMap change — without restarting the server.
+    #[cfg(unix)]
+    if let (Some(cell), Some(path)) = (
+        security.access_policy.clone(),
+        config
+            .mgmt
+            .as_ref()
+            .and_then(|m| m.access_policy_file.clone()),
+    ) {
+        spawn_access_policy_reloader(cell, path);
+    }
+
     let bind = format!("[::]:{mgmt_port}");
     match bind.parse::<std::net::SocketAddr>() {
         Ok(addr) => {
@@ -160,7 +174,8 @@ fn load_access_policy(config: &Config) -> radius_server::MgmtSecurity {
             process::exit(1);
         }
         info!("Loaded management access policy from {path}");
-        Arc::new(parsed)
+        // Held in a swappable cell so SIGHUP can reload it without a restart.
+        Arc::new(std::sync::RwLock::new(Arc::new(parsed)))
     });
 
     // Audit denials to the same JSON audit log the request path uses.
@@ -173,6 +188,30 @@ fn load_access_policy(config: &Config) -> radius_server::MgmtSecurity {
         trust_forwarded_identity: mgmt.trust_forwarded_identity,
         audit,
     }
+}
+
+/// Spawn a task that reloads the IAM access policy from `path` into `cell` on every
+/// SIGHUP. A failed reload (unreadable/invalid file) keeps the currently-enforced
+/// policy and logs the error — a bad edit can never disable authorization.
+#[cfg(all(feature = "observability", unix))]
+fn spawn_access_policy_reloader(cell: radius_server::SharedAccessPolicy, path: String) {
+    use tokio::signal::unix::{SignalKind, signal};
+    tokio::spawn(async move {
+        let mut hup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("could not install SIGHUP handler for access-policy reload: {e}");
+                return;
+            }
+        };
+        info!("SIGHUP will reload the management access policy from {path}");
+        while hup.recv().await.is_some() {
+            match radius_server::reload_access_policy(&cell, &path) {
+                Ok(()) => info!("reloaded management access policy from {path} (SIGHUP)"),
+                Err(e) => error!("SIGHUP access-policy reload failed (keeping current): {e}"),
+            }
+        }
+    });
 }
 
 /// Spawn one of the auxiliary HTTP servers (health or metrics) on `[::]:port`.

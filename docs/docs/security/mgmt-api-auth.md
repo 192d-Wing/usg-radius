@@ -52,6 +52,20 @@ Add an `mgmt` block to `config.json`:
 A configured-but-unreadable/invalid access policy file is **fatal at startup** (the
 server refuses to run rather than enforce a partially-parsed policy).
 
+### Hot-reload (SIGHUP)
+
+The access policy can be reloaded from disk **without restarting** the server by
+sending it `SIGHUP` (Unix):
+
+```sh
+kill -HUP "$(pidof usg-radius)"     # or: kubectl exec … -- kill -HUP 1
+```
+
+The file is re-read, parsed, and validated **before** swapping. If the new file is
+unreadable or invalid the **currently-enforced policy is kept** and an error is
+logged — a bad edit can never disable authorization or fail open. Typical flow:
+update the mounted ConfigMap, then signal the pod.
+
 ## Access policy schema
 
 An access policy is a list of statements evaluated with IAM semantics:
