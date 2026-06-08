@@ -52,6 +52,7 @@ pub mod eap_auth;
 pub mod health;
 pub mod ldap_auth;
 pub mod metrics;
+pub mod mgmt;
 pub mod postgres_auth;
 pub mod proxy;
 pub mod ratelimit;
@@ -75,3 +76,5 @@ pub use server::{
 pub use health::{HealthCheckState, HealthStatus, create_health_server, start_health_server};
 #[cfg(feature = "observability")]
 pub use metrics::{MetricsState, PrometheusMetrics, create_metrics_server, start_metrics_server};
+#[cfg(feature = "observability")]
+pub use mgmt::{MgmtState, create_mgmt_server, start_mgmt_server};

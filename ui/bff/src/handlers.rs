@@ -72,6 +72,52 @@ pub async fn overview(State(st): State<AppState>) -> Result<Json<Value>, (axum::
     })))
 }
 
+/// Proxy a GET to the RADIUS management API and return its JSON verbatim.
+async fn proxy_api(
+    st: &AppState,
+    path: &str,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    let url = format!("{}{}", st.radius_api_url, path);
+    let resp = st
+        .http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let code = axum::http::StatusCode::from_u16(resp.status().as_u16())
+        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
+    if code.is_success() {
+        Ok(Json(body))
+    } else {
+        Err((code, body.to_string()))
+    }
+}
+
+pub async fn status(
+    State(st): State<AppState>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    proxy_api(&st, "/api/v1/status").await
+}
+pub async fn clients(
+    State(st): State<AppState>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    proxy_api(&st, "/api/v1/clients").await
+}
+pub async fn users(
+    State(st): State<AppState>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    proxy_api(&st, "/api/v1/users").await
+}
+pub async fn sessions(
+    State(st): State<AppState>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    proxy_api(&st, "/api/v1/sessions").await
+}
+
 /// Minimal Prometheus text-format parser: one entry per non-comment sample line
 /// of the form `name{labels} value` (labels optional).
 fn parse_prometheus(body: &str) -> Vec<Metric> {

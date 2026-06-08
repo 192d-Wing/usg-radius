@@ -21,6 +21,9 @@ pub struct AppState {
     /// Base URL of the RADIUS server health port, e.g.
     /// `http://usg-radius-internal.radius.svc:2812`.
     pub radius_health_url: String,
+    /// Base URL of the RADIUS server management API, e.g.
+    /// `http://usg-radius-internal.radius.svc:4812`.
+    pub radius_api_url: String,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -48,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
             "RADIUS_HEALTH_URL",
             "http://usg-radius-internal.radius.svc:2812",
         ),
+        radius_api_url: env_or("RADIUS_API_URL", "http://usg-radius-internal.radius.svc:4812"),
     };
     let listen: SocketAddr = env_or("BFF_LISTEN", "0.0.0.0:8088").parse()?;
     let static_dir = env_or("UI_STATIC_DIR", "/app/web");
@@ -60,6 +64,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/me", get(handlers::me))
         .route("/health", get(handlers::health))
         .route("/overview", get(handlers::overview))
+        .route("/status", get(handlers::status))
+        .route("/clients", get(handlers::clients))
+        .route("/users", get(handlers::users))
+        .route("/sessions", get(handlers::sessions))
         .with_state(state.clone());
 
     let app = Router::new()

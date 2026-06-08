@@ -23,3 +23,7 @@ spec:
       port: 3812
       targetPort: metrics
       protocol: TCP
+    - name: mgmt
+      port: 4812
+      targetPort: mgmt
+      protocol: TCP

@@ -1,0 +1,61 @@
+# Public exposure for usg-radius-ui via Traefik: HTTPS-only, HTTP->HTTPS redirect,
+# HSTS, and Keycloak OIDC through oauth2-proxy (reverse-proxy mode).
+#
+# Prerequisites (operator-provided):
+#   - DNS: radius-ui.oopl.dev.mil -> 10.10.10.54 (Traefik LB)
+#   - TLS Secret `radius-ui-tls` (cert+key for the host) in namespace radius
+#   - oauth2-proxy configured with a Keycloak client (see oauth2-proxy.yaml)
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: radius-https-redirect
+  namespace: radius
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: radius-security-headers
+  namespace: radius
+spec:
+  headers:
+    stsSeconds: 63072000
+    stsIncludeSubdomains: true
+    stsPreload: true
+    forceSTSHeader: true
+    contentTypeNosniff: true
+    browserXssFilter: true
+    referrerPolicy: "strict-origin-when-cross-origin"
+    frameDeny: true
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: usg-radius-ui
+  namespace: radius
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.middlewares: radius-radius-security-headers@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: ["radius-ui.oopl.dev.mil"]
+      secretName: radius-ui-tls
+  rules:
+    - host: radius-ui.oopl.dev.mil
+      http:
+        paths:
+          # All traffic flows through oauth2-proxy (reverse-proxy mode): it
+          # redirects unauthenticated users to Keycloak and proxies the rest to
+          # the usg-radius-ui BFF. /oauth2/* is handled by oauth2-proxy internally.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: oauth2-proxy
+                port: { number: 80 }
