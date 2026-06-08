@@ -55,13 +55,31 @@ async fn start_observability(config: &Config) {
 
     // Read-only management API for the operator UI (needs the loaded Config).
     let mgmt_cfg = Arc::new(config.clone());
+    // Optional authorization policy (used by the policy API + dry-run; not yet
+    // enforced in the request path). Loaded from POLICY_FILE if set.
+    let policy = match env::var("POLICY_FILE") {
+        Ok(path) => match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<radius_server::PolicyConfig>(&s).ok())
+        {
+            Some(p) => {
+                info!("Loaded authorization policy from {path}");
+                Arc::new(p)
+            }
+            None => {
+                warn!("Could not read/parse POLICY_FILE {path}; using empty policy");
+                Arc::new(radius_server::PolicyConfig::default())
+            }
+        },
+        Err(_) => Arc::new(radius_server::PolicyConfig::default()),
+    };
     let bind = format!("[::]:{mgmt_port}");
     match bind.parse::<std::net::SocketAddr>() {
         Ok(addr) => {
             info!("Starting management server on {bind}");
             tokio::spawn(async move {
                 if let Err(e) =
-                    radius_server::start_mgmt_server(mgmt_cfg, session_manager, addr).await
+                    radius_server::start_mgmt_server(mgmt_cfg, session_manager, policy, addr).await
                 {
                     warn!("management server error: {e}");
                 }

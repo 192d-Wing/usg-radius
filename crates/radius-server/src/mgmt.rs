@@ -8,9 +8,17 @@
 #[cfg(feature = "observability")]
 use crate::config::Config;
 #[cfg(feature = "observability")]
+use crate::policy::{Decision, Dictionary, PolicyConfig, RequestContext, dictionary};
+#[cfg(feature = "observability")]
 use crate::state::SharedSessionManager;
 #[cfg(feature = "observability")]
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{
+    Json, Router,
+    extract::State,
+    routing::{get, post},
+};
+#[cfg(feature = "observability")]
+use serde::Deserialize;
 #[cfg(feature = "observability")]
 use serde::Serialize;
 #[cfg(feature = "observability")]
@@ -28,15 +36,21 @@ use tower_http::trace::TraceLayer;
 pub struct MgmtState {
     config: Arc<Config>,
     session_manager: Arc<SharedSessionManager>,
+    policy: Arc<PolicyConfig>,
     started: Instant,
 }
 
 #[cfg(feature = "observability")]
 impl MgmtState {
-    pub fn new(config: Arc<Config>, session_manager: Arc<SharedSessionManager>) -> Self {
+    pub fn new(
+        config: Arc<Config>,
+        session_manager: Arc<SharedSessionManager>,
+        policy: Arc<PolicyConfig>,
+    ) -> Self {
         Self {
             config,
             session_manager,
+            policy,
             started: Instant::now(),
         }
     }
@@ -123,19 +137,49 @@ async fn sessions(State(_st): State<MgmtState>) -> Json<Vec<serde_json::Value>> 
     Json(Vec::new())
 }
 
+/// The currently loaded authorization policy.
+#[cfg(feature = "observability")]
+async fn policy(State(st): State<MgmtState>) -> Json<PolicyConfig> {
+    Json((*st.policy).clone())
+}
+
+/// The attribute + operator dictionary that drives the Condition Studio.
+#[cfg(feature = "observability")]
+async fn dictionary_handler() -> Json<Dictionary> {
+    Json(dictionary())
+}
+
+/// Dry-run body: evaluate a candidate policy against a sample request.
+#[cfg(feature = "observability")]
+#[derive(Deserialize)]
+struct DryRunRequest {
+    policy: PolicyConfig,
+    request: RequestContext,
+}
+
+/// Evaluate a candidate policy against a request without saving it ("what-if").
+#[cfg(feature = "observability")]
+async fn policy_dry_run(Json(body): Json<DryRunRequest>) -> Json<Decision> {
+    Json(body.policy.evaluate(&body.request))
+}
+
 /// Build the management API router.
 #[cfg(feature = "observability")]
 pub fn create_mgmt_server(
     config: Arc<Config>,
     session_manager: Arc<SharedSessionManager>,
+    policy_cfg: Arc<PolicyConfig>,
 ) -> Router {
     Router::new()
         .route("/api/v1/status", get(status))
         .route("/api/v1/clients", get(clients))
         .route("/api/v1/users", get(users))
         .route("/api/v1/sessions", get(sessions))
+        .route("/api/v1/policy", get(policy))
+        .route("/api/v1/dictionary", get(dictionary_handler))
+        .route("/api/v1/policy/dry-run", post(policy_dry_run))
         .layer(TraceLayer::new_for_http())
-        .with_state(MgmtState::new(config, session_manager))
+        .with_state(MgmtState::new(config, session_manager, policy_cfg))
 }
 
 /// Start the management API server on `addr`.
@@ -143,9 +187,10 @@ pub fn create_mgmt_server(
 pub async fn start_mgmt_server(
     config: Arc<Config>,
     session_manager: Arc<SharedSessionManager>,
+    policy_cfg: Arc<PolicyConfig>,
     addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let app = create_mgmt_server(config, session_manager);
+    let app = create_mgmt_server(config, session_manager, policy_cfg);
     tracing::info!("Starting management API on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

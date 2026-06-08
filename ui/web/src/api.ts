@@ -14,6 +14,16 @@ export async function get<T = any>(
   return res.json();
 }
 
+export async function post<T = any>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
 export interface Me {
   user?: string;
   email?: string;

@@ -7,7 +7,10 @@
 
 mod handlers;
 
-use axum::{routing::get, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 use std::net::SocketAddr;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
@@ -68,6 +71,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/clients", get(handlers::clients))
         .route("/users", get(handlers::users))
         .route("/sessions", get(handlers::sessions))
+        .route("/policy", get(handlers::policy_get))
+        .route("/dictionary", get(handlers::dictionary))
+        .route("/policy/dry-run", post(handlers::policy_dry_run))
         .with_state(state.clone());
 
     let app = Router::new()
