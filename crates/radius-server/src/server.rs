@@ -831,6 +831,14 @@ impl RadiusServer {
         config: Arc<ServerConfig>,
         socket: Arc<UdpSocket>,
     ) -> Result<(), ServerError> {
+        // Normalize IPv4-mapped IPv6 sources (`::ffff:a.b.c.d`) to plain IPv4. When
+        // the server binds dual-stack (`[::]`), IPv4 datagrams arrive with a
+        // v4-mapped source address; without this, IPv4 client/secret CIDRs (e.g.
+        // `10.0.0.0/8`) never match and every IPv4 NAS is rejected as unauthorized.
+        // Canonicalizing here keeps the whole pipeline — authorization, secret
+        // selection, rate limiting, dedup, and audit logs — consistent.
+        let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
+
         // Check rate limit FIRST (before any expensive operations)
         if !config.rate_limiter.check_rate_limit(addr.ip()).await {
             let request_id = if data.len() >= 2 { data[1] } else { 0 };

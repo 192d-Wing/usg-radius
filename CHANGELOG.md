@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - IPv4 clients rejected on a dual-stack listener
+
+- When the server binds dual-stack (`listen_address: "::"`), IPv4 datagrams arrive
+  with an IPv4-mapped IPv6 source (`::ffff:a.b.c.d`). Client/secret CIDRs written in
+  IPv4 form (e.g. `10.0.0.0/8`) failed to match it, so **every IPv4 NAS was rejected
+  as an unauthorized client**. The source address is now canonicalized
+  (`to_canonical()`) at the request boundary — fixing authorization, secret
+  selection, rate limiting, dedup, and audit logs — and `Config::find_client`
+  canonicalizes defensively as well. Found during `uk8w` cluster validation (which
+  also confirmed DSR/no-SNAT source-IP preservation is working).
+
 ### Added - Live session index
 
 - **`GET /api/v1/sessions` now returns real active accounting sessions** instead of
