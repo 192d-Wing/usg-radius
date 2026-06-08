@@ -128,6 +128,31 @@ pub async fn dictionary(
     proxy_api(&st, "/api/v1/dictionary").await
 }
 
+/// PUT proxy: forward a new policy to the management API (validate + persist).
+pub async fn policy_put(
+    State(st): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    let url = format!("{}/api/v1/policy", st.radius_api_url);
+    let resp = st
+        .http
+        .put(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let code = axum::http::StatusCode::from_u16(resp.status().as_u16())
+        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+    // The management API returns plain-text validation errors on 4xx; pass through.
+    let text = resp.text().await.unwrap_or_default();
+    if code.is_success() {
+        let out: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        Ok(Json(out))
+    } else {
+        Err((code, text))
+    }
+}
+
 /// POST proxy for the policy dry-run: forwards the candidate policy + request body
 /// to the management API and returns the decision.
 pub async fn policy_dry_run(

@@ -210,6 +210,44 @@ impl PolicyConfig {
         self.authz_profiles.iter().find(|p| p.id == id)
     }
 
+    /// Validate referential integrity: every rule (and the optional default) must
+    /// reference an existing authorization profile, and ids must be unique.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut profile_ids = std::collections::HashSet::new();
+        for p in &self.authz_profiles {
+            if !profile_ids.insert(p.id.as_str()) {
+                return Err(format!("duplicate authorization profile id '{}'", p.id));
+            }
+        }
+        if let Some(def) = &self.default_profile
+            && !profile_ids.contains(def.as_str())
+        {
+            return Err(format!("default_profile '{def}' is not a defined profile"));
+        }
+        let mut set_ids = std::collections::HashSet::new();
+        for set in &self.policy_sets {
+            if !set_ids.insert(set.id.as_str()) {
+                return Err(format!("duplicate policy set id '{}'", set.id));
+            }
+            let mut rule_ids = std::collections::HashSet::new();
+            for rule in &set.rules {
+                if !rule_ids.insert(rule.id.as_str()) {
+                    return Err(format!(
+                        "duplicate rule id '{}' in set '{}'",
+                        rule.id, set.id
+                    ));
+                }
+                if !profile_ids.contains(rule.profile.as_str()) {
+                    return Err(format!(
+                        "rule '{}' in set '{}' references unknown profile '{}'",
+                        rule.id, set.id, rule.profile
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn decision_from(&self, profile_id: &str, set: Option<&str>, rule: Option<&str>) -> Decision {
         match self.profile(profile_id) {
             Some(p) => Decision {

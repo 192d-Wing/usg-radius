@@ -24,6 +24,16 @@ export async function post<T = any>(path: string, body: unknown): Promise<T> {
   return res.json();
 }
 
+export async function put<T = any>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error((await res.text()) || `${res.status} ${res.statusText}`);
+  return res.json();
+}
+
 export interface Me {
   user?: string;
   email?: string;

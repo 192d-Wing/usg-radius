@@ -15,6 +15,7 @@ use crate::state::SharedSessionManager;
 use axum::{
     Json, Router,
     extract::State,
+    http::StatusCode,
     routing::{get, post},
 };
 #[cfg(feature = "observability")]
@@ -24,7 +25,7 @@ use serde::Serialize;
 #[cfg(feature = "observability")]
 use std::collections::HashMap;
 #[cfg(feature = "observability")]
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 #[cfg(feature = "observability")]
 use std::time::Instant;
 #[cfg(feature = "observability")]
@@ -36,7 +37,10 @@ use tower_http::trace::TraceLayer;
 pub struct MgmtState {
     config: Arc<Config>,
     session_manager: Arc<SharedSessionManager>,
-    policy: Arc<PolicyConfig>,
+    /// The live authorization policy (editable via PUT).
+    policy: Arc<RwLock<PolicyConfig>>,
+    /// Where PUT persists the policy (if configured).
+    policy_file: Option<Arc<str>>,
     started: Instant,
 }
 
@@ -45,12 +49,14 @@ impl MgmtState {
     pub fn new(
         config: Arc<Config>,
         session_manager: Arc<SharedSessionManager>,
-        policy: Arc<PolicyConfig>,
+        policy: Arc<RwLock<PolicyConfig>>,
+        policy_file: Option<Arc<str>>,
     ) -> Self {
         Self {
             config,
             session_manager,
             policy,
+            policy_file,
             started: Instant::now(),
         }
     }
@@ -140,7 +146,35 @@ async fn sessions(State(_st): State<MgmtState>) -> Json<Vec<serde_json::Value>> 
 /// The currently loaded authorization policy.
 #[cfg(feature = "observability")]
 async fn policy(State(st): State<MgmtState>) -> Json<PolicyConfig> {
-    Json((*st.policy).clone())
+    let p = st.policy.read().expect("policy lock poisoned").clone();
+    Json(p)
+}
+
+/// Replace the authorization policy: validate referential integrity, persist to
+/// POLICY_FILE (if configured), then swap the in-memory policy.
+#[cfg(feature = "observability")]
+async fn policy_put(
+    State(st): State<MgmtState>,
+    Json(new_policy): Json<PolicyConfig>,
+) -> Result<Json<PolicyConfig>, (StatusCode, String)> {
+    new_policy
+        .validate()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    if let Some(path) = &st.policy_file {
+        let json = serde_json::to_string_pretty(&new_policy)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        std::fs::write(path.as_ref(), json).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to persist policy to {path}: {e}"),
+            )
+        })?;
+    }
+
+    *st.policy.write().expect("policy lock poisoned") = new_policy.clone();
+    tracing::info!("authorization policy updated");
+    Ok(Json(new_policy))
 }
 
 /// The attribute + operator dictionary that drives the Condition Studio.
@@ -168,18 +202,24 @@ async fn policy_dry_run(Json(body): Json<DryRunRequest>) -> Json<Decision> {
 pub fn create_mgmt_server(
     config: Arc<Config>,
     session_manager: Arc<SharedSessionManager>,
-    policy_cfg: Arc<PolicyConfig>,
+    policy_cfg: Arc<RwLock<PolicyConfig>>,
+    policy_file: Option<Arc<str>>,
 ) -> Router {
     Router::new()
         .route("/api/v1/status", get(status))
         .route("/api/v1/clients", get(clients))
         .route("/api/v1/users", get(users))
         .route("/api/v1/sessions", get(sessions))
-        .route("/api/v1/policy", get(policy))
+        .route("/api/v1/policy", get(policy).put(policy_put))
         .route("/api/v1/dictionary", get(dictionary_handler))
         .route("/api/v1/policy/dry-run", post(policy_dry_run))
         .layer(TraceLayer::new_for_http())
-        .with_state(MgmtState::new(config, session_manager, policy_cfg))
+        .with_state(MgmtState::new(
+            config,
+            session_manager,
+            policy_cfg,
+            policy_file,
+        ))
 }
 
 /// Start the management API server on `addr`.
@@ -187,10 +227,11 @@ pub fn create_mgmt_server(
 pub async fn start_mgmt_server(
     config: Arc<Config>,
     session_manager: Arc<SharedSessionManager>,
-    policy_cfg: Arc<PolicyConfig>,
+    policy_cfg: Arc<RwLock<PolicyConfig>>,
+    policy_file: Option<Arc<str>>,
     addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let app = create_mgmt_server(config, session_manager, policy_cfg);
+    let app = create_mgmt_server(config, session_manager, policy_cfg, policy_file);
     tracing::info!("Starting management API on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
