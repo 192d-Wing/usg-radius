@@ -7,6 +7,7 @@ import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
 import Input from "@cloudscape-design/components/input";
 import Select from "@cloudscape-design/components/select";
+import Toggle from "@cloudscape-design/components/toggle";
 import FormField from "@cloudscape-design/components/form-field";
 import AttributeEditor from "@cloudscape-design/components/attribute-editor";
 import ExpandableSection from "@cloudscape-design/components/expandable-section";
@@ -21,9 +22,10 @@ interface Attr { name: string; value: string }
 interface AttrCond { type: "attr"; attribute: string; operator: string; value: string }
 type Condition =
   | { type: "always" }
-  | { type: "all"; conditions: AttrCond[] }
-  | { type: "any"; conditions: AttrCond[] }
-  | { type: string; [k: string]: any };
+  | AttrCond
+  | { type: "all"; conditions: Condition[] }
+  | { type: "any"; conditions: Condition[] }
+  | { type: "not"; condition: Condition };
 interface Profile { id: string; name: string; effect: Effect; attributes: Attr[]; reply_message?: string }
 interface Rule { id: string; name: string; enabled: boolean; condition: Condition; profile: string }
 interface PolicySet { id: string; name: string; enabled: boolean; condition: Condition; rules: Rule[] }
@@ -33,25 +35,124 @@ interface Decision { effect: Effect; policy_set?: string; rule?: string; profile
 const uid = (p: string) => `${p}-${Math.random().toString(36).slice(2, 8)}`;
 const OPERATORS = ["equals", "not_equals", "contains", "starts_with", "ends_with", "matches_regex", "in_cidr"];
 
-// ---- condition <-> flat editor rows ----
-type Match = "always" | "all" | "any";
-function condRows(c?: Condition): { match: Match; rows: AttrCond[]; advanced: boolean } {
-  if (!c || c.type === "always") return { match: "always", rows: [], advanced: false };
-  if (c.type === "all" || c.type === "any") {
-    const children: any[] = (c as any).conditions || [];
-    const rows = children.filter((x) => x.type === "attr");
-    // If any child is NOT a plain attr (a nested group / NOT / ref), this
-    // condition can't be safely flattened — flag it advanced so the editor shows
-    // it read-only instead of silently dropping the nested parts on save.
-    return { match: c.type, rows, advanced: rows.length !== children.length };
+// ---- recursive condition editor (Phase 3b: nested ALL/ANY groups + NOT) ----
+const newAttr = (): AttrCond => ({ type: "attr", attribute: "", operator: "equals", value: "" });
+const newGroup = (): Condition => ({ type: "all", conditions: [newAttr()] });
+
+// A group as the editor sees it: an ALL/ANY operator, an optional NOT wrapper,
+// and child conditions (each of which may itself be a leaf or a nested group).
+interface GroupView { negated: boolean; op: "all" | "any"; children: Condition[] }
+function asGroup(c: Condition): GroupView | null {
+  if (c.type === "not") {
+    const inner = c.condition;
+    if (inner.type === "all" || inner.type === "any")
+      return { negated: true, op: inner.type, children: inner.conditions };
+    return { negated: true, op: "all", children: [inner] }; // not(attr) → negated group of one
   }
-  return { match: "always", rows: [], advanced: true }; // Not/ref at top level: not editable in Phase 3a
+  if (c.type === "all" || c.type === "any") return { negated: false, op: c.type, children: c.conditions };
+  return null;
 }
-function rowsToCond(match: Match, rows: AttrCond[]): Condition {
-  if (match === "always") return { type: "always" };
-  // Keep the chosen all/any even when empty: an empty all/any is rejected by the
-  // server's validate() (clear error), rather than silently becoming match-all.
-  return { type: match, conditions: rows };
+function fromGroup(g: GroupView): Condition {
+  const grp: Condition = { type: g.op, conditions: g.children };
+  return g.negated ? { type: "not", condition: grp } : grp;
+}
+
+// A single leaf condition row: attribute / operator / value.
+function AttrRow({
+  value,
+  onChange,
+  onRemove,
+  attrOptions,
+}: {
+  value: AttrCond;
+  onChange: (c: AttrCond) => void;
+  onRemove: () => void;
+  attrOptions: { label: string; value: string }[];
+}) {
+  return (
+    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+      <div style={{ flex: 2, minWidth: 150 }}>
+        <Select
+          selectedOption={value.attribute ? { value: value.attribute, label: value.attribute } : null}
+          options={attrOptions}
+          filteringType="auto"
+          placeholder="attribute"
+          onChange={(e) => onChange({ ...value, attribute: e.detail.selectedOption.value! })}
+        />
+      </div>
+      <div style={{ flex: 1, minWidth: 130 }}>
+        <Select
+          selectedOption={{ value: value.operator || "equals", label: value.operator || "equals" }}
+          options={OPERATORS.map((o) => ({ value: o, label: o }))}
+          onChange={(e) => onChange({ ...value, operator: e.detail.selectedOption.value! })}
+        />
+      </div>
+      <div style={{ flex: 2, minWidth: 130 }}>
+        <Input value={value.value} placeholder="value" onChange={(e) => onChange({ ...value, value: e.detail.value })} />
+      </div>
+      <Button iconName="remove" variant="icon" ariaLabel="Remove condition" onClick={onRemove} />
+    </div>
+  );
+}
+
+// Recursive editor for an ALL/ANY (optionally NOT-wrapped) group. Children may be
+// leaf rows or nested groups, mirroring the server's recursive Condition tree.
+function GroupEditor({
+  value,
+  onChange,
+  onRemove,
+  attrOptions,
+  depth,
+}: {
+  value: Condition;
+  onChange: (c: Condition) => void;
+  onRemove: () => void;
+  attrOptions: { label: string; value: string }[];
+  depth: number;
+}) {
+  const g = asGroup(value);
+  if (!g) return <Alert type="info">Unsupported condition node; left unchanged.</Alert>;
+  const set = (patch: Partial<GroupView>) => onChange(fromGroup({ ...g, ...patch }));
+  const setChild = (i: number, c: Condition) => set({ children: g.children.map((x, j) => (j === i ? c : x)) });
+  const removeChild = (i: number) => set({ children: g.children.filter((_, j) => j !== i) });
+  return (
+    <div style={{ borderLeft: "2px solid #b6bec9", paddingLeft: 12 }}>
+      <SpaceBetween size="xs">
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <Toggle checked={g.negated} onChange={(e) => set({ negated: e.detail.checked })}>NOT</Toggle>
+          <div style={{ width: 150 }}>
+            <Select
+              selectedOption={{ value: g.op, label: g.op === "all" ? "Match ALL of" : "Match ANY of" }}
+              options={[
+                { value: "all", label: "Match ALL of" },
+                { value: "any", label: "Match ANY of" },
+              ]}
+              onChange={(e) => set({ op: e.detail.selectedOption.value as "all" | "any" })}
+            />
+          </div>
+          <div style={{ flex: 1 }} />
+          <Button iconName="add-plus" onClick={() => set({ children: [...g.children, newAttr()] })}>Condition</Button>
+          <Button iconName="add-plus" onClick={() => set({ children: [...g.children, newGroup()] })}>Group</Button>
+          <Button
+            iconName={depth === 0 ? "close" : "remove"}
+            variant="icon"
+            ariaLabel={depth === 0 ? "Clear all conditions" : "Remove group"}
+            onClick={onRemove}
+          />
+        </div>
+        {g.children.length === 0 && (
+          <Box color="text-status-inactive" fontSize="body-s">Empty group — add a condition (an empty group is rejected on save).</Box>
+        )}
+        {g.children.map((child, i) =>
+          child.type === "attr" ? (
+            <AttrRow key={i} value={child} attrOptions={attrOptions} onChange={(c) => setChild(i, c)} onRemove={() => removeChild(i)} />
+          ) : (
+            <GroupEditor key={i} value={child} depth={depth + 1} attrOptions={attrOptions} onChange={(c) => setChild(i, c)} onRemove={() => removeChild(i)} />
+          )
+        )}
+      </SpaceBetween>
+    </div>
+  );
 }
 
 function ConditionEditor({
@@ -63,65 +164,23 @@ function ConditionEditor({
   onChange: (c: Condition) => void;
   attrOptions: { label: string; value: string }[];
 }) {
-  const { match, rows, advanced } = condRows(value);
-  if (advanced)
-    return <Alert type="info">Advanced condition (nested/NOT) — edit not supported yet; left unchanged.</Alert>;
-  const setMatch = (m: Match) => onChange(rowsToCond(m, rows));
-  const setRows = (r: AttrCond[]) => onChange(rowsToCond(match === "always" ? "all" : match, r));
+  if (value.type === "always")
+    return (
+      <SpaceBetween size="xs">
+        <Box color="text-status-inactive">Always matches (no conditions).</Box>
+        <Button iconName="add-plus" onClick={() => onChange(newGroup())}>Add conditions</Button>
+      </SpaceBetween>
+    );
+  // A bare leaf at the root is editable as a single-child group (all([attr]) ≡ attr).
+  const editable: Condition = value.type === "attr" ? { type: "all", conditions: [value] } : value;
   return (
-    <SpaceBetween size="xs">
-      <FormField label="Match">
-        <Select
-          selectedOption={{ value: match, label: { always: "Always (any request)", all: "Match ALL of", any: "Match ANY of" }[match] }}
-          options={[
-            { value: "always", label: "Always (any request)" },
-            { value: "all", label: "Match ALL of" },
-            { value: "any", label: "Match ANY of" },
-          ]}
-          onChange={(e) => setMatch(e.detail.selectedOption.value as Match)}
-        />
-      </FormField>
-      {match !== "always" && (
-        <AttributeEditor<AttrCond>
-          items={rows}
-          addButtonText="Add condition"
-          removeButtonText="Remove"
-          empty="No conditions"
-          definition={[
-            {
-              label: "Attribute",
-              control: (item, i) => (
-                <Select
-                  selectedOption={item.attribute ? { value: item.attribute, label: item.attribute } : null}
-                  options={attrOptions}
-                  filteringType="auto"
-                  placeholder="attribute"
-                  onChange={(e) => setRows(rows.map((r, j) => (j === i ? { ...r, attribute: e.detail.selectedOption.value! } : r)))}
-                />
-              ),
-            },
-            {
-              label: "Operator",
-              control: (item, i) => (
-                <Select
-                  selectedOption={{ value: item.operator || "equals", label: item.operator || "equals" }}
-                  options={OPERATORS.map((o) => ({ value: o, label: o }))}
-                  onChange={(e) => setRows(rows.map((r, j) => (j === i ? { ...r, operator: e.detail.selectedOption.value! } : r)))}
-                />
-              ),
-            },
-            {
-              label: "Value",
-              control: (item, i) => (
-                <Input value={item.value} onChange={(e) => setRows(rows.map((r, j) => (j === i ? { ...r, value: e.detail.value } : r)))} />
-              ),
-            },
-          ]}
-          onAddButtonClick={() => setRows([...rows, { type: "attr", attribute: "", operator: "equals", value: "" }])}
-          onRemoveButtonClick={({ detail }) => setRows(rows.filter((_, i) => i !== detail.itemIndex))}
-        />
-      )}
-    </SpaceBetween>
+    <GroupEditor
+      value={editable}
+      depth={0}
+      attrOptions={attrOptions}
+      onChange={onChange}
+      onRemove={() => onChange({ type: "always" })}
+    />
   );
 }
 
@@ -195,7 +254,7 @@ export default function PolicyPage() {
       header={
         <Header
           variant="h1"
-          description="ISE-style authorization policy builder. Edit profiles, policy sets and rules, then Save. Saved policy is enforced live on the Access-Accept path. (Flat AND/OR conditions; nested groups land in Phase 3b.)"
+          description="ISE-style authorization policy builder. Edit profiles, policy sets and rules, then Save. Saved policy is enforced live on the Access-Accept path. Conditions support nested ALL/ANY groups and NOT."
           actions={
             <SpaceBetween direction="horizontal" size="xs">
               <Button iconName="refresh" onClick={load}>Reload</Button>
