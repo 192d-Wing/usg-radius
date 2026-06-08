@@ -106,10 +106,12 @@ async fn start_observability(
         radius_server::start_metrics_server,
     );
 
-    // Read-only management API + policy editing for the operator UI. The `policy`
-    // cell is shared with the request path (enforcement), so PUT edits take effect
-    // live without a restart.
+    // Management API + policy editing for the operator UI. The `policy` cell is
+    // shared with the request path (enforcement), so PUT edits take effect live
+    // without a restart. Authorization (mTLS + IAM-style ABAC) is opt-in via the
+    // `mgmt` config block; see load_access_policy.
     let mgmt_cfg = Arc::new(config.clone());
+    let security = load_access_policy(config);
     let bind = format!("[::]:{mgmt_port}");
     match bind.parse::<std::net::SocketAddr>() {
         Ok(addr) => {
@@ -120,6 +122,7 @@ async fn start_observability(
                     session_manager,
                     policy,
                     policy_file,
+                    security,
                     addr,
                 )
                 .await
@@ -129,6 +132,46 @@ async fn start_observability(
             });
         }
         Err(e) => warn!("Invalid management bind address {bind}: {e}"),
+    }
+}
+
+/// Load the IAM-style access policy referenced by `config.mgmt.access_policy_file`
+/// into a [`MgmtSecurity`] bundle. A configured-but-broken policy file is fatal
+/// (consistent with [`load_policy`]) — refusing to start beats silently running an
+/// unenforced or partially-parsed access policy.
+#[cfg(feature = "observability")]
+fn load_access_policy(config: &Config) -> radius_server::MgmtSecurity {
+    use radius_server::{AccessPolicy, MgmtSecurity};
+
+    let Some(mgmt) = &config.mgmt else {
+        return MgmtSecurity::default();
+    };
+    let access_policy = mgmt.access_policy_file.as_ref().map(|path| {
+        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            error!("mgmt.access_policy_file {path} could not be read: {e}");
+            process::exit(1);
+        });
+        let parsed: AccessPolicy = serde_json::from_str(&raw).unwrap_or_else(|e| {
+            error!("mgmt.access_policy_file {path} is not valid JSON: {e}");
+            process::exit(1);
+        });
+        if let Err(e) = parsed.validate() {
+            error!("mgmt.access_policy_file {path} is invalid: {e}");
+            process::exit(1);
+        }
+        info!("Loaded management access policy from {path}");
+        Arc::new(parsed)
+    });
+
+    // Audit denials to the same JSON audit log the request path uses.
+    let audit = radius_server::AuditLogger::new(config.audit_log_path.clone())
+        .map(Arc::new)
+        .ok();
+
+    MgmtSecurity {
+        access_policy,
+        trust_forwarded_identity: mgmt.trust_forwarded_identity,
+        audit,
     }
 }
 

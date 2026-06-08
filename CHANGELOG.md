@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Management API authentication (mTLS + IAM-style ABAC)
+
+- **Secured the management API.** The `/api/v1/*` endpoints — including
+  `PUT /api/v1/policy`, which rewrites the live authorization policy — can now be
+  protected with **mutual TLS** and an **AWS-IAM-style, attribute-based access
+  policy** (granular `Action`/`Resource` statements with `Effect` Allow/Deny,
+  explicit-deny-wins, default-deny). New pure engine in
+  `crates/radius-server/src/access.rs`.
+- **Opt-in, no breakage.** With no `mgmt` config block the API stays open (today's
+  behavior) and logs a prominent startup warning. Configure `mgmt.tls` to require
+  client certs and `mgmt.access_policy_file` to enforce authorization. See
+  [`docs/docs/security/mgmt-api-auth.md`](docs/docs/security/mgmt-api-auth.md) and
+  [`examples/configs/access-policy.example.json`](examples/configs/access-policy.example.json).
+- **Merged ABAC principal.** Conditions can match the mTLS client-cert identity
+  (`tls:ClientCN`/`ClientOU`/`ClientSAN`/`Fingerprint`, parsed via `x509-parser`)
+  and the oauth2-proxy/Keycloak identity (`identity:User`/`Email`/`Group`)
+  forwarded by the BFF — plus `request:Action`/`Resource`/`Method`/`SourceIp`.
+  Forwarded identity headers are only trusted over a verified mTLS channel.
+- **Audited denials.** Authorization denials are logged at `WARN` and written to the
+  JSON audit log as `UnauthorizedClient` events with the principal and reason.
+- **BFF.** Forwards `X-Auth-Request-*` identity to the mgmt API; an optional `mtls`
+  cargo feature lets it present a client certificate
+  (`RADIUS_API_CLIENT_CERT`/`_KEY`/`_CA`). The default build stays TLS-free.
+
 ### Changed - Kubernetes-only deployment (k3s/k8s + Cilium)
 
 - **Single deployment path**: the project now targets **Kubernetes (k3s or k8s) with

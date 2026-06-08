@@ -32,6 +32,10 @@ argon2.workspace = true
 pbkdf2.workspace = true
 sha2.workspace = true
 rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+x509-parser = { workspace = true, optional = true }
 
 # Async traits (always needed for StateBackend)
 async-trait.workspace = true
@@ -47,5 +51,12 @@ tempfile.workspace = true
 
 [features]
 default = ["observability", "tls"]
-tls = ["radius-proto/tls", "dep:rustls"]
+tls = [
+    "radius-proto/tls",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:x509-parser",
+]
 observability = ["dep:axum", "dep:tower", "dep:tower-http"]

@@ -72,18 +72,34 @@ pub async fn overview(State(st): State<AppState>) -> Result<Json<Value>, (axum::
     })))
 }
 
+/// The oauth2-proxy identity headers the mgmt API's ABAC engine evaluates against.
+/// Forwarded verbatim so the management policy can condition on the human principal
+/// (user/email/groups), in addition to the BFF's own mTLS client-cert identity.
+const IDENTITY_HEADERS: [&str; 3] = [
+    "x-auth-request-user",
+    "x-auth-request-email",
+    "x-auth-request-groups",
+];
+
 /// Proxy a request to the RADIUS management API. Reads the response body as text
 /// and only parses JSON on success, so a non-2xx upstream error (which may be a
 /// plain-text validation message, not JSON) is passed through with its real status
-/// and body instead of being masked as a generic 502.
+/// and body instead of being masked as a generic 502. The caller's identity headers
+/// are forwarded so the mgmt API can authorize the human principal.
 async fn proxy(
     st: &AppState,
+    in_headers: &axum::http::HeaderMap,
     method: reqwest::Method,
     path: &str,
     body: Option<&Value>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
     let url = format!("{}{}", st.radius_api_url, path);
     let mut req = st.http.request(method, &url);
+    for name in IDENTITY_HEADERS {
+        if let Some(v) = in_headers.get(name) {
+            req = req.header(name, v);
+        }
+    }
     if let Some(b) = body {
         req = req.json(b);
     }
@@ -111,31 +127,31 @@ async fn proxy(
 
 type ProxyResult = Result<Json<Value>, (axum::http::StatusCode, String)>;
 
-pub async fn status(State(st): State<AppState>) -> ProxyResult {
-    proxy(&st, reqwest::Method::GET, "/api/v1/status", None).await
+pub async fn status(State(st): State<AppState>, h: HeaderMap) -> ProxyResult {
+    proxy(&st, &h, reqwest::Method::GET, "/api/v1/status", None).await
 }
-pub async fn clients(State(st): State<AppState>) -> ProxyResult {
-    proxy(&st, reqwest::Method::GET, "/api/v1/clients", None).await
+pub async fn clients(State(st): State<AppState>, h: HeaderMap) -> ProxyResult {
+    proxy(&st, &h, reqwest::Method::GET, "/api/v1/clients", None).await
 }
-pub async fn users(State(st): State<AppState>) -> ProxyResult {
-    proxy(&st, reqwest::Method::GET, "/api/v1/users", None).await
+pub async fn users(State(st): State<AppState>, h: HeaderMap) -> ProxyResult {
+    proxy(&st, &h, reqwest::Method::GET, "/api/v1/users", None).await
 }
-pub async fn sessions(State(st): State<AppState>) -> ProxyResult {
-    proxy(&st, reqwest::Method::GET, "/api/v1/sessions", None).await
+pub async fn sessions(State(st): State<AppState>, h: HeaderMap) -> ProxyResult {
+    proxy(&st, &h, reqwest::Method::GET, "/api/v1/sessions", None).await
 }
-pub async fn policy_get(State(st): State<AppState>) -> ProxyResult {
-    proxy(&st, reqwest::Method::GET, "/api/v1/policy", None).await
+pub async fn policy_get(State(st): State<AppState>, h: HeaderMap) -> ProxyResult {
+    proxy(&st, &h, reqwest::Method::GET, "/api/v1/policy", None).await
 }
-pub async fn dictionary(State(st): State<AppState>) -> ProxyResult {
-    proxy(&st, reqwest::Method::GET, "/api/v1/dictionary", None).await
+pub async fn dictionary(State(st): State<AppState>, h: HeaderMap) -> ProxyResult {
+    proxy(&st, &h, reqwest::Method::GET, "/api/v1/dictionary", None).await
 }
 /// PUT a new policy to the management API (validate + persist); 4xx body passes through.
-pub async fn policy_put(State(st): State<AppState>, Json(body): Json<Value>) -> ProxyResult {
-    proxy(&st, reqwest::Method::PUT, "/api/v1/policy", Some(&body)).await
+pub async fn policy_put(State(st): State<AppState>, h: HeaderMap, Json(body): Json<Value>) -> ProxyResult {
+    proxy(&st, &h, reqwest::Method::PUT, "/api/v1/policy", Some(&body)).await
 }
 /// POST a candidate policy + request to the dry-run endpoint and return the decision.
-pub async fn policy_dry_run(State(st): State<AppState>, Json(body): Json<Value>) -> ProxyResult {
-    proxy(&st, reqwest::Method::POST, "/api/v1/policy/dry-run", Some(&body)).await
+pub async fn policy_dry_run(State(st): State<AppState>, h: HeaderMap, Json(body): Json<Value>) -> ProxyResult {
+    proxy(&st, &h, reqwest::Method::POST, "/api/v1/policy/dry-run", Some(&body)).await
 }
 
 /// Minimal Prometheus text-format parser: one entry per non-comment sample line

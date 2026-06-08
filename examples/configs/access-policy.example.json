@@ -1,0 +1,71 @@
+{
+  "version": "2025-06-08",
+  "_comment": "IAM-style ABAC access policy for the RADIUS management API. Statements are evaluated with: explicit Deny wins, else any matching Allow grants, else default Deny. A statement applies when an action glob AND a resource glob match AND every condition matches. Condition keys: tls:ClientCN, tls:ClientOU, tls:ClientSAN, tls:Fingerprint, identity:User, identity:Email, identity:Group, request:Action, request:Resource, request:Method, request:SourceIp. Reference this file from config.json as mgmt.access_policy_file.",
+  "statements": [
+    {
+      "sid": "AllowOperatorsReadAndSimulate",
+      "effect": "Allow",
+      "action": [
+        "radius:GetStatus",
+        "radius:ListClients",
+        "radius:ListUsers",
+        "radius:ListSessions",
+        "radius:GetPolicy",
+        "radius:GetDictionary",
+        "radius:SimulatePolicy"
+      ],
+      "resource": ["arn:usgradius:mgmt:::*"],
+      "condition": [
+        {
+          "operator": "StringEquals",
+          "key": "identity:Group",
+          "values": ["operators", "policy-admins"]
+        }
+      ]
+    },
+    {
+      "sid": "AllowPolicyAdminsToEditPolicyFromInternalNetwork",
+      "effect": "Allow",
+      "action": ["radius:PutPolicy"],
+      "resource": ["arn:usgradius:mgmt:::policy"],
+      "condition": [
+        {
+          "operator": "StringEquals",
+          "key": "identity:Group",
+          "values": ["policy-admins"]
+        },
+        {
+          "operator": "IpAddress",
+          "key": "request:SourceIp",
+          "values": ["10.0.0.0/8", "fd00::/8"]
+        }
+      ]
+    },
+    {
+      "sid": "AllowTrustedBffServiceIdentity",
+      "effect": "Allow",
+      "action": ["radius:Get*", "radius:List*", "radius:SimulatePolicy"],
+      "resource": ["arn:usgradius:mgmt:::*"],
+      "condition": [
+        {
+          "operator": "StringLike",
+          "key": "tls:ClientCN",
+          "values": ["usg-radius-bff.*"]
+        }
+      ]
+    },
+    {
+      "sid": "DenyPolicyEditsOutsideInternalNetwork",
+      "effect": "Deny",
+      "action": ["radius:PutPolicy"],
+      "resource": ["arn:usgradius:mgmt:::policy"],
+      "condition": [
+        {
+          "operator": "NotIpAddress",
+          "key": "request:SourceIp",
+          "values": ["10.0.0.0/8", "fd00::/8"]
+        }
+      ]
+    }
+  ]
+}
