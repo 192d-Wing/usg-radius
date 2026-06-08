@@ -63,6 +63,16 @@ url = "2.5"
 axum = "0.7"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
+# Low-level HTTP serving for the mgmt API's mTLS listener (needed to expose the
+# peer client certificate to handlers, which axum::serve does not).
+tokio-rustls = "0.26"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = [
+    "server",
+    "server-auto",
+    "tokio",
+    "service",
+] }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "cargo"] }

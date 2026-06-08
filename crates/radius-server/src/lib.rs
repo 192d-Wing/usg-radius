@@ -43,6 +43,7 @@
 //! }
 //! ```
 
+pub mod access;
 pub mod accounting;
 pub mod audit;
 pub mod buffer_pool;
@@ -61,6 +62,10 @@ pub mod ratelimit;
 pub mod server;
 pub mod state;
 
+pub use access::{
+    AccessContext, AccessDecision, AccessPolicy, ConditionEntry, ConditionOp,
+    Effect as AccessEffect, Statement as AccessStatement,
+};
 pub use accounting::{AccountingHandler, AccountingResult, Session, SimpleAccountingHandler};
 pub use audit::{AuditEntry, AuditEventType, AuditLogger};
 pub use cache::{RequestCache, RequestFingerprint};
@@ -83,4 +88,4 @@ pub use health::{HealthCheckState, HealthStatus, create_health_server, start_hea
 #[cfg(feature = "observability")]
 pub use metrics::{MetricsState, PrometheusMetrics, create_metrics_server, start_metrics_server};
 #[cfg(feature = "observability")]
-pub use mgmt::{MgmtState, create_mgmt_server, start_mgmt_server};
+pub use mgmt::{CertIdentity, MgmtSecurity, MgmtState, create_mgmt_server, start_mgmt_server};

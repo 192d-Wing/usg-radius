@@ -33,6 +33,45 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// Build the HTTP client used to call the RADIUS management API. With the `mtls`
+/// feature (and `RADIUS_API_CLIENT_CERT`/`_KEY` set) the client presents a client
+/// certificate so the mgmt API can require mTLS; otherwise it is plain HTTP — the
+/// default, keeping the musl build free of a TLS backend (terminate mTLS at the
+/// service mesh instead).
+fn build_http_client() -> anyhow::Result<reqwest::Client> {
+    let builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
+    Ok(configure_mtls(builder)?.build()?)
+}
+
+#[cfg(feature = "mtls")]
+fn configure_mtls(builder: reqwest::ClientBuilder) -> anyhow::Result<reqwest::ClientBuilder> {
+    let (Some(cert), Some(key)) = (
+        std::env::var("RADIUS_API_CLIENT_CERT").ok(),
+        std::env::var("RADIUS_API_CLIENT_KEY").ok(),
+    ) else {
+        tracing::warn!(
+            "mtls feature built but RADIUS_API_CLIENT_CERT/_KEY are not set; calling the mgmt \
+             API without a client certificate"
+        );
+        return Ok(builder);
+    };
+    // reqwest::Identity::from_pem wants the cert and key concatenated in one PEM.
+    let mut pem = std::fs::read(&cert)?;
+    pem.push(b'\n');
+    pem.extend_from_slice(&std::fs::read(&key)?);
+    let mut builder = builder.identity(reqwest::Identity::from_pem(&pem)?);
+    if let Ok(ca) = std::env::var("RADIUS_API_CA") {
+        let ca_pem = std::fs::read(&ca)?;
+        builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&ca_pem)?);
+    }
+    Ok(builder)
+}
+
+#[cfg(not(feature = "mtls"))]
+fn configure_mtls(builder: reqwest::ClientBuilder) -> anyhow::Result<reqwest::ClientBuilder> {
+    Ok(builder)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -43,9 +82,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let state = AppState {
-        http: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?,
+        http: build_http_client()?,
         radius_metrics_url: env_or(
             "RADIUS_METRICS_URL",
             "http://usg-radius-internal.radius.svc:3812",

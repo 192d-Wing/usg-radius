@@ -92,6 +92,7 @@ Home = "index.md"
 [[project.nav]]
 "Security" = [
     { "Overview" = "security/overview.md" },
+    { "Management API Auth (mTLS + IAM ABAC)" = "security/mgmt-api-auth.md" },
 ]
 
 [[project.nav]]

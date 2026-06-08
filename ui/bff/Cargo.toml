@@ -17,14 +17,19 @@ path = "src/main.rs"
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 tower-http = { version = "0.6", features = ["fs", "trace"] }
-# HTTP only (in-cluster http://) — no TLS backend, keeps the musl build free of
-# aws-lc-sys/ring.
+# HTTP only by default (in-cluster http://) — no TLS backend, keeps the musl build
+# free of aws-lc-sys/ring. The optional `mtls` feature adds a rustls TLS backend so
+# the BFF can present a client certificate to the mgmt API.
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# Present a client certificate to the mgmt API (RADIUS_API_CLIENT_CERT/_KEY/_CA).
+mtls = ["reqwest/rustls-tls"]
 
 [profile.release]
 strip = "debuginfo"

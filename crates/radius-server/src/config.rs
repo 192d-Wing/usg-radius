@@ -212,6 +212,41 @@ pub struct Config {
     /// EapAuthHandler instead of the plain SimpleAuthHandler.
     #[serde(default)]
     pub eap: Option<EapConfig>,
+
+    /// Management API security (mTLS + IAM-style ABAC access policy). When unset,
+    /// the management API stays open (today's behavior) and logs a warning.
+    #[serde(default)]
+    pub mgmt: Option<MgmtConfig>,
+}
+
+/// Management API security configuration. Enforcement is *opt-in*: when an
+/// `access_policy_file` is configured the IAM-style policy is applied (default
+/// deny); when `tls` is configured the listener serves HTTPS and, if
+/// `client_ca_path` is present, requires + verifies client certificates (mTLS).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MgmtConfig {
+    /// TLS for the management listener. When omitted the listener is plain HTTP.
+    #[serde(default)]
+    pub tls: Option<MgmtTlsConfig>,
+    /// Path to the IAM-style access policy JSON. When set, authorization is enforced.
+    #[serde(default)]
+    pub access_policy_file: Option<String>,
+    /// Trust `X-Auth-Request-*` identity headers (forwarded by oauth2-proxy via the
+    /// BFF) when building the ABAC principal. Headers are only honored when the peer
+    /// was authenticated by mTLS, OR when this is explicitly true without mTLS.
+    #[serde(default = "default_true")]
+    pub trust_forwarded_identity: bool,
+}
+
+/// TLS certificate paths for the management API listener.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MgmtTlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
+    /// CA bundle used to verify client certificates. Present ⇒ mTLS (client cert
+    /// required); absent ⇒ server-only TLS.
+    #[serde(default)]
+    pub client_ca_path: Option<String>,
 }
 
 /// EAP configuration block.
@@ -285,6 +320,7 @@ impl Default for Config {
             postgres: None,
             proxy: None,
             eap: None,
+            mgmt: None,
         }
     }
 }
@@ -384,6 +420,32 @@ impl Config {
             }
         }
 
+        // Validate management API security config.
+        if let Some(mgmt) = &self.mgmt {
+            if let Some(tls) = &mgmt.tls
+                && (tls.cert_path.is_empty() || tls.key_path.is_empty())
+            {
+                return Err(ConfigError::Invalid(
+                    "mgmt.tls requires both cert_path and key_path".to_string(),
+                ));
+            }
+            // Enforcing authorization while accepting unauthenticated, spoofable
+            // identity headers is a foot-gun — warn loudly but don't hard-fail
+            // (the operator may terminate mTLS at a trusted mesh).
+            let mtls = mgmt
+                .tls
+                .as_ref()
+                .map(|t| t.client_ca_path.is_some())
+                .unwrap_or(false);
+            if mgmt.access_policy_file.is_some() && !mtls && mgmt.trust_forwarded_identity {
+                tracing::warn!(
+                    "mgmt.access_policy_file is set without mTLS (client_ca_path) but \
+                     trust_forwarded_identity=true: identity headers are spoofable without \
+                     a verified client certificate"
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -456,6 +518,7 @@ impl Config {
             postgres: None,
             proxy: None,
             eap: None,
+            mgmt: None,
         }
     }
 }
