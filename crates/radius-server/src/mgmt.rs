@@ -45,6 +45,12 @@ use std::time::Instant;
 #[cfg(feature = "observability")]
 use tower_http::trace::TraceLayer;
 
+/// A live-swappable handle to the IAM access policy, so it can be reloaded from
+/// disk (e.g. on SIGHUP) without restarting the server. The request path takes a
+/// brief read lock and clones the inner `Arc` out before evaluating.
+#[cfg(feature = "observability")]
+pub type SharedAccessPolicy = Arc<RwLock<Arc<AccessPolicy>>>;
+
 /// Optional security configuration for the management API. When `access_policy`
 /// is `Some`, every request is authorized against it (IAM-style ABAC, default
 /// deny). When `None`, the API is open (today's behavior) — the caller logs a
@@ -53,12 +59,31 @@ use tower_http::trace::TraceLayer;
 #[derive(Clone, Default)]
 pub struct MgmtSecurity {
     /// The loaded IAM-style access policy. `Some` ⇒ authorization is enforced.
-    pub access_policy: Option<Arc<AccessPolicy>>,
+    /// Held behind a lock so it can be hot-reloaded from disk.
+    pub access_policy: Option<SharedAccessPolicy>,
     /// Trust forwarded `X-Auth-Request-*` identity headers when building the
     /// principal even if no client certificate authenticated the peer.
     pub trust_forwarded_identity: bool,
     /// Where authorization denials are recorded (if configured).
     pub audit: Option<Arc<AuditLogger>>,
+}
+
+/// Reload the IAM access policy from `path` into `cell`, validating it **before**
+/// swapping. On any read/parse/validation error the currently-loaded policy is
+/// kept and an error returned — a bad edit can never disable authorization or
+/// fail open. Safe to call from a signal handler task (e.g. SIGHUP).
+#[cfg(feature = "observability")]
+pub fn reload_access_policy(cell: &SharedAccessPolicy, path: &str) -> Result<(), String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+    let parsed: AccessPolicy =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {path}: {e}"))?;
+    parsed
+        .validate()
+        .map_err(|e| format!("validate {path}: {e}"))?;
+    *cell
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(parsed);
+    Ok(())
 }
 
 /// Identity parsed from a verified mTLS client certificate.
@@ -350,8 +375,14 @@ fn build_access_context(
 /// denial while auditing it.
 #[cfg(feature = "observability")]
 async fn authorize(State(st): State<MgmtState>, req: Request, next: Next) -> Response {
+    // Clone the current policy Arc out of the swappable cell, then drop the lock —
+    // so a concurrent SIGHUP reload never blocks (or is blocked by) evaluation.
     let policy = match &st.security.access_policy {
-        Some(p) => p,
+        Some(cell) => Arc::clone(
+            &cell
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ),
         // Defensive: middleware shouldn't be mounted without a policy.
         None => return next.run(req).await,
     };
@@ -778,6 +809,56 @@ mod tests {
                 &ctx_trusted
             )
             .allowed
+        );
+    }
+
+    #[test]
+    fn reload_swaps_on_valid_and_keeps_old_on_invalid() {
+        use std::io::Write;
+
+        // Start with a policy that denies everything (empty = default deny).
+        let cell: SharedAccessPolicy = Arc::new(RwLock::new(Arc::new(AccessPolicy::default())));
+        let ctx = AccessContext::new();
+        assert!(
+            !cell
+                .read()
+                .unwrap()
+                .evaluate("radius:GetStatus", "x", &ctx)
+                .allowed
+        );
+
+        // Reload a valid policy that allows GetStatus → the cell swaps.
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"{{"statements":[{{"sid":"a","effect":"Allow","action":["radius:GetStatus"],"resource":["*"]}}]}}"#
+        )
+        .unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+        reload_access_policy(&cell, &path).expect("valid reload");
+        assert!(
+            cell.read()
+                .unwrap()
+                .evaluate("radius:GetStatus", "x", &ctx)
+                .allowed
+        );
+
+        // A subsequent invalid file (statement with no actions) is rejected and the
+        // previously-enforced policy is kept — reload never fails open.
+        let mut bad = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            bad,
+            r#"{{"statements":[{{"effect":"Allow","action":[],"resource":["*"]}}]}}"#
+        )
+        .unwrap();
+        let bad_path = bad.path().to_str().unwrap().to_string();
+        assert!(reload_access_policy(&cell, &bad_path).is_err());
+        assert!(
+            cell.read()
+                .unwrap()
+                .evaluate("radius:GetStatus", "x", &ctx)
+                .allowed,
+            "invalid reload must keep the previous policy"
         );
     }
 }

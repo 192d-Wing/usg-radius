@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Forwarded identity headers are only trusted over a verified mTLS channel.
 - **Audited denials.** Authorization denials are logged at `WARN` and written to the
   JSON audit log as `UnauthorizedClient` events with the principal and reason.
+- **Hot-reload (SIGHUP).** The IAM access policy can be reloaded from disk without a
+  restart by sending `SIGHUP`. The new file is validated before swapping; an
+  unreadable/invalid file keeps the current policy (never fails open).
 - **BFF.** Forwards `X-Auth-Request-*` identity to the mgmt API; an optional `mtls`
   cargo feature lets it present a client certificate
   (`RADIUS_API_CLIENT_CERT`/`_KEY`/`_CA`). The default build stays TLS-free.
