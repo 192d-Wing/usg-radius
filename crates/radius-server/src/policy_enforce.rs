@@ -30,24 +30,83 @@ fn nas_port_type_name(n: u32) -> String {
     }
 }
 
+/// Map Service-Type integer codes (RFC 2865) to names so conditions can be
+/// authored against the names the dictionary advertises.
+fn service_type_name(n: u32) -> String {
+    match n {
+        1 => "Login".into(),
+        2 => "Framed".into(),
+        3 => "Callback-Login".into(),
+        4 => "Callback-Framed".into(),
+        5 => "Outbound".into(),
+        6 => "Administrative".into(),
+        7 => "NAS-Prompt".into(),
+        8 => "Authenticate-Only".into(),
+        9 => "Callback-NAS-Prompt".into(),
+        10 => "Call-Check".into(),
+        11 => "Callback-Administrative".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Map Framed-Protocol integer codes (RFC 2865) to names.
+fn framed_protocol_name(n: u32) -> String {
+    match n {
+        1 => "PPP".into(),
+        2 => "SLIP".into(),
+        3 => "ARAP".into(),
+        4 => "Gandalf-SLML".into(),
+        5 => "Xylogics-IPX-SLIP".into(),
+        6 => "X.75-Synchronous".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Map EAP method type numbers (IANA) to names.
+fn eap_type_name(t: u8) -> String {
+    match t {
+        1 => "Identity".into(),
+        2 => "Notification".into(),
+        4 => "MD5-Challenge".into(),
+        6 => "GTC".into(),
+        13 => "EAP-TLS".into(),
+        21 => "EAP-TTLS".into(),
+        25 => "PEAP".into(),
+        43 => "EAP-FAST".into(),
+        55 => "EAP-TEAP".into(),
+        other => format!("EAP-Type-{other}"),
+    }
+}
+
+/// Extract the EAP method type from the first EAP-Message (an EAP
+/// Request/Response packet: code, id, length(2), type, ...).
+fn eap_type(request: &Packet) -> Option<String> {
+    let a = request.find_attribute(AttributeType::EapMessage as u8)?;
+    // Only Request(1)/Response(2) packets carry a method type byte at offset 4.
+    if a.value.len() >= 5 && (a.value[0] == 1 || a.value[0] == 2) {
+        Some(eap_type_name(a.value[4]))
+    } else {
+        None
+    }
+}
+
 /// Build the policy [`RequestContext`] from an Access-Request packet. Attribute
 /// names match the engine's dictionary so policy conditions can reference them.
 pub fn request_context(request: &Packet, username: &str) -> RequestContext {
     let mut attrs: HashMap<String, String> = HashMap::new();
     attrs.insert("User-Name".into(), username.to_string());
 
-    // String-valued attributes.
+    // String-valued attributes. Use lossy UTF-8 (not as_string, which fails on
+    // non-UTF-8 and would DROP the attribute — a missing attribute silently flips
+    // `not_equals` conditions, a security-relevant change).
     for (name, ty) in [
         ("NAS-Identifier", AttributeType::NasIdentifier),
         ("Called-Station-Id", AttributeType::CalledStationId),
         ("Calling-Station-Id", AttributeType::CallingStationId),
         ("Filter-Id", AttributeType::FilterId),
     ] {
-        if let Some(v) = request
-            .find_attribute(ty as u8)
-            .and_then(|a| a.as_string().ok())
-        {
-            attrs.insert(name.into(), v);
+        if let Some(a) = request.find_attribute(ty as u8) {
+            attrs.insert(name.into(), String::from_utf8_lossy(&a.value).into_owned());
         }
     }
 
@@ -64,47 +123,80 @@ pub fn request_context(request: &Packet, username: &str) -> RequestContext {
         );
     }
 
-    // Integer-coded attributes (mapped to names where well-known).
+    // Integer-coded attributes, mapped to the names the dictionary advertises.
     if let Some(n) = read_u32(request, AttributeType::NasPortType as u8) {
         attrs.insert("NAS-Port-Type".into(), nas_port_type_name(n));
     }
     if let Some(n) = read_u32(request, AttributeType::ServiceType as u8) {
-        attrs.insert("Service-Type".into(), n.to_string());
+        attrs.insert("Service-Type".into(), service_type_name(n));
+    }
+    if let Some(n) = read_u32(request, AttributeType::FramedProtocol as u8) {
+        attrs.insert("Framed-Protocol".into(), framed_protocol_name(n));
+    }
+    if let Some(t) = eap_type(request) {
+        attrs.insert("EAP-Type".into(), t);
     }
 
     RequestContext::new(attrs)
 }
 
-enum Kind {
-    Str,
-    Int,
-}
+/// Tag octet for tunnel attributes. We only ever return a single tunnel group, so
+/// a fixed tag of 1 groups Tunnel-Type / Tunnel-Medium-Type / Tunnel-Private-Group-ID
+/// together (RFC 2868 §3.1); a tag of 0 would mean "untagged".
+const TUNNEL_TAG: u8 = 1;
 
 /// Map an authorization profile's returned attribute (name + value) to a RADIUS
 /// [`Attribute`]. Returns `None` for names this server doesn't know how to encode
-/// (the caller logs and skips them).
+/// (the caller logs and skips them). Keep in sync with
+/// [`crate::policy::KNOWN_REPLY_ATTRIBUTES`].
 pub fn reply_attribute(ra: &ReplyAttribute) -> Option<Attribute> {
-    // (RADIUS attribute number, encoding). Covers the common authorization
-    // results; tunnel attrs use their RFC 2868 numbers (not in AttributeType).
-    let (ty, kind): (u8, Kind) = match ra.name.as_str() {
-        "Filter-Id" => (AttributeType::FilterId as u8, Kind::Str),
-        "Reply-Message" => (AttributeType::ReplyMessage as u8, Kind::Str),
-        "Class" => (AttributeType::Class as u8, Kind::Str),
-        "Session-Timeout" => (AttributeType::SessionTimeout as u8, Kind::Int),
-        "Idle-Timeout" => (AttributeType::IdleTimeout as u8, Kind::Int),
-        "Tunnel-Type" => (64, Kind::Int),
-        "Tunnel-Medium-Type" => (65, Kind::Int),
-        "Tunnel-Private-Group-ID" => (81, Kind::Str),
-        _ => return None,
-    };
-    match kind {
-        Kind::Str => Attribute::string(ty, ra.value.clone()).ok(),
-        Kind::Int => ra
+    match ra.name.as_str() {
+        "Filter-Id" => Attribute::string(AttributeType::FilterId as u8, ra.value.clone()).ok(),
+        "Reply-Message" => {
+            Attribute::string(AttributeType::ReplyMessage as u8, ra.value.clone()).ok()
+        }
+        "Class" => Attribute::string(AttributeType::Class as u8, ra.value.clone()).ok(),
+        "Session-Timeout" => ra
             .value
             .parse::<u32>()
             .ok()
-            .and_then(|n| Attribute::integer(ty, n).ok()),
+            .and_then(|n| Attribute::integer(AttributeType::SessionTimeout as u8, n).ok()),
+        "Idle-Timeout" => ra
+            .value
+            .parse::<u32>()
+            .ok()
+            .and_then(|n| Attribute::integer(AttributeType::IdleTimeout as u8, n).ok()),
+        // RFC 2868 §3.1: tagged integer — high octet is the tag, low 3 octets the
+        // value. Encoding these as a plain 4-byte integer (the old behavior) put the
+        // value's top byte where the tag belongs, corrupting the VLAN assignment.
+        "Tunnel-Type" => ra
+            .value
+            .parse::<u32>()
+            .ok()
+            .and_then(|n| tagged_integer(64, n)),
+        "Tunnel-Medium-Type" => ra
+            .value
+            .parse::<u32>()
+            .ok()
+            .and_then(|n| tagged_integer(65, n)),
+        // RFC 2868 §3.5: tagged string — a leading tag octet then the value bytes.
+        "Tunnel-Private-Group-ID" => {
+            let mut v = Vec::with_capacity(1 + ra.value.len());
+            v.push(TUNNEL_TAG);
+            v.extend_from_slice(ra.value.as_bytes());
+            Attribute::new(81, v).ok()
+        }
+        _ => None,
     }
+}
+
+/// Encode an RFC 2868 tagged integer: `[tag, value_hi, value_mid, value_lo]`.
+fn tagged_integer(ty: u8, n: u32) -> Option<Attribute> {
+    Attribute::new(
+        ty,
+        vec![TUNNEL_TAG, (n >> 16) as u8, (n >> 8) as u8, n as u8],
+    )
+    .ok()
 }
 
 #[cfg(test)]
@@ -141,14 +233,50 @@ mod tests {
     }
 
     #[test]
+    fn context_maps_integer_codes_and_eap_type() {
+        // EAP-Response/EAP-TLS: code=2, id=1, len=6, type=13.
+        let eap = Attribute::new(AttributeType::EapMessage as u8, vec![2, 1, 0, 6, 13, 0]).unwrap();
+        let p = req(vec![
+            Attribute::integer(AttributeType::ServiceType as u8, 2).unwrap(),
+            Attribute::integer(AttributeType::FramedProtocol as u8, 1).unwrap(),
+            eap,
+        ]);
+        let ctx = request_context(&p, "bob");
+        assert_eq!(ctx.attributes.get("Service-Type").unwrap(), "Framed");
+        assert_eq!(ctx.attributes.get("Framed-Protocol").unwrap(), "PPP");
+        assert_eq!(ctx.attributes.get("EAP-Type").unwrap(), "EAP-TLS");
+    }
+
+    #[test]
+    fn context_keeps_non_utf8_string_attribute() {
+        // A non-UTF-8 Calling-Station-Id must still be present (lossy), not dropped —
+        // otherwise a `not_equals` condition would silently flip to matching.
+        let p = req(vec![
+            Attribute::new(AttributeType::CallingStationId as u8, vec![0xff, 0xfe]).unwrap(),
+        ]);
+        let ctx = request_context(&p, "alice");
+        assert!(ctx.attributes.contains_key("Calling-Station-Id"));
+    }
+
+    #[test]
     fn reply_attribute_maps_known_names() {
+        // RFC 2868 tagged string: leading tag octet (1) then the value bytes.
         let vlan = reply_attribute(&ReplyAttribute {
             name: "Tunnel-Private-Group-ID".into(),
             value: "42".into(),
         })
         .unwrap();
         assert_eq!(vlan.attr_type, 81);
-        assert_eq!(vlan.as_string().unwrap(), "42");
+        assert_eq!(vlan.value, vec![TUNNEL_TAG, b'4', b'2']);
+
+        // RFC 2868 tagged integer: [tag, hi, mid, lo]; VLAN tunnel type = 13.
+        let tt = reply_attribute(&ReplyAttribute {
+            name: "Tunnel-Type".into(),
+            value: "13".into(),
+        })
+        .unwrap();
+        assert_eq!(tt.attr_type, 64);
+        assert_eq!(tt.value, vec![TUNNEL_TAG, 0, 0, 13]);
 
         let to = reply_attribute(&ReplyAttribute {
             name: "Session-Timeout".into(),

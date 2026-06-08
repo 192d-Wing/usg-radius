@@ -29,27 +29,38 @@ fn load_policy() -> (
         .ok()
         .map(|p| Arc::from(p.as_str()));
     let loaded = match &policy_file {
-        Some(path) if std::path::Path::new(path.as_ref()).exists() => {
-            match std::fs::read_to_string(path.as_ref())
-                .map_err(|e| e.to_string())
-                .and_then(|s| {
-                    serde_json::from_str::<radius_server::PolicyConfig>(&s)
-                        .map_err(|e| e.to_string())
-                }) {
-                Ok(p) => {
-                    info!("Loaded authorization policy from {path}");
-                    p
-                }
+        // No exists()-precheck (avoids a TOCTOU): a genuinely-absent file is a
+        // fresh start; any other read error, or a parse/validation failure on a
+        // file that DOES exist, is fatal — silently enforcing an empty or invalid
+        // policy would be a fail-open / lockout hazard.
+        Some(path) => match std::fs::read_to_string(path.as_ref()) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!("POLICY_FILE {path} does not exist yet; starting with an empty policy");
+                radius_server::PolicyConfig::default()
+            }
+            Err(e) => {
+                error!("POLICY_FILE {path} could not be read: {e}");
+                process::exit(1);
+            }
+            Ok(s) => match serde_json::from_str::<radius_server::PolicyConfig>(&s) {
+                // Validate on load with the SAME rules the PUT API enforces, so a
+                // structurally-invalid file can't be loaded and then enforced.
+                Ok(p) => match p.validate() {
+                    Ok(()) => {
+                        info!("Loaded authorization policy from {path}");
+                        p
+                    }
+                    Err(e) => {
+                        error!("POLICY_FILE {path} is invalid: {e}");
+                        process::exit(1);
+                    }
+                },
                 Err(e) => {
-                    error!("POLICY_FILE {path} exists but could not be loaded: {e}");
+                    error!("POLICY_FILE {path} is not valid JSON: {e}");
                     process::exit(1);
                 }
-            }
-        }
-        Some(path) => {
-            info!("POLICY_FILE {path} does not exist yet; starting with an empty policy");
-            radius_server::PolicyConfig::default()
-        }
+            },
+        },
         None => radius_server::PolicyConfig::default(),
     };
     (Arc::new(std::sync::RwLock::new(loaded)), policy_file)

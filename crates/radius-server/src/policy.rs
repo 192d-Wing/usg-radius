@@ -253,6 +253,18 @@ impl PolicyConfig {
             if !profile_ids.insert(p.id.as_str()) {
                 return Err(format!("duplicate authorization profile id '{}'", p.id));
             }
+            // Reject returned attributes the server can't encode, so they fail
+            // loudly at save time instead of being silently dropped on the wire.
+            for a in &p.attributes {
+                if !KNOWN_REPLY_ATTRIBUTES.contains(&a.name.as_str()) {
+                    return Err(format!(
+                        "profile '{}' returns unsupported attribute '{}' (supported: {})",
+                        p.id,
+                        a.name,
+                        KNOWN_REPLY_ATTRIBUTES.join(", ")
+                    ));
+                }
+            }
         }
         if let Some(def) = &self.default_profile
             && !profile_ids.contains(def.as_str())
@@ -355,15 +367,32 @@ pub struct DictionaryAttribute {
     pub description: &'static str,
 }
 
-/// The attributes + operators the UI offers when authoring conditions.
+/// Authorization-profile attributes the server knows how to put on the wire.
+/// Kept in sync with `policy_enforce::reply_attribute`; `validate()` rejects any
+/// profile attribute outside this set so unknown names can't be silently dropped.
+pub const KNOWN_REPLY_ATTRIBUTES: &[&str] = &[
+    "Filter-Id",
+    "Reply-Message",
+    "Class",
+    "Session-Timeout",
+    "Idle-Timeout",
+    "Tunnel-Type",
+    "Tunnel-Medium-Type",
+    "Tunnel-Private-Group-ID",
+];
+
+/// What the UI offers when authoring policy: condition attributes + operators, and
+/// the reply attributes a profile may return.
 #[derive(Debug, Clone, Serialize)]
 pub struct Dictionary {
     pub attributes: Vec<DictionaryAttribute>,
     pub operators: Vec<&'static str>,
+    pub reply_attributes: Vec<&'static str>,
 }
 
-/// Build the condition dictionary (static for now; could be enriched from the
-/// loaded RADIUS attribute dictionary later).
+/// Build the policy dictionary. Condition attributes are limited to those the
+/// enforcement path actually populates from the request (so the UI can't offer a
+/// condition that would silently never match).
 pub fn dictionary() -> Dictionary {
     let attr = |name, label, description| DictionaryAttribute {
         name,
@@ -374,16 +403,11 @@ pub fn dictionary() -> Dictionary {
         attributes: vec![
             attr("User-Name", "User name", "RADIUS User-Name"),
             attr(
-                "identity-group",
-                "Identity group",
-                "Group from LDAP/AD/local",
-            ),
-            attr(
                 "NAS-IP-Address",
                 "NAS IP",
                 "Network Access Server source IP",
             ),
-            attr("device-group", "Device group", "NAS device group (by CIDR)"),
+            attr("NAS-Identifier", "NAS identifier", "RADIUS NAS-Identifier"),
             attr(
                 "NAS-Port-Type",
                 "NAS port type",
@@ -398,12 +422,7 @@ pub fn dictionary() -> Dictionary {
             attr("Service-Type", "Service-Type", "e.g. Framed, Login"),
             attr("Framed-Protocol", "Framed-Protocol", "e.g. PPP"),
             attr("EAP-Type", "EAP type", "e.g. EAP-TLS, PEAP, EAP-TEAP"),
-            attr(
-                "time-of-day",
-                "Time of day",
-                "HH:MM (UTC) for schedule conditions",
-            ),
-            attr("day-of-week", "Day of week", "mon..sun"),
+            attr("Filter-Id", "Filter-Id", "RADIUS Filter-Id"),
         ],
         operators: vec![
             "equals",
@@ -414,6 +433,7 @@ pub fn dictionary() -> Dictionary {
             "matches_regex",
             "in_cidr",
         ],
+        reply_attributes: KNOWN_REPLY_ATTRIBUTES.to_vec(),
     }
 }
 
@@ -636,6 +656,26 @@ mod tests {
             }],
         };
         assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_reply_attribute() {
+        let policy = PolicyConfig {
+            authz_profiles: vec![AuthzProfile {
+                id: "p".into(),
+                name: "p".into(),
+                effect: Effect::Accept,
+                attributes: vec![ReplyAttribute {
+                    name: "Made-Up-Attr".into(),
+                    value: "x".into(),
+                }],
+                reply_message: None,
+            }],
+            default_profile: None,
+            policy_sets: vec![],
+        };
+        let err = policy.validate().unwrap_err();
+        assert!(err.contains("Made-Up-Attr"), "unexpected error: {err}");
     }
 
     #[test]

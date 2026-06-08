@@ -128,6 +128,7 @@ function ConditionEditor({
 export default function PolicyPage() {
   const [policy, setPolicy] = useState<Policy>({ policy_sets: [], authz_profiles: [] });
   const [attrOptions, setAttrOptions] = useState<{ label: string; value: string }[]>([]);
+  const [replyAttrOptions, setReplyAttrOptions] = useState<{ label: string; value: string }[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -139,7 +140,12 @@ export default function PolicyPage() {
         setPolicy({ policy_sets: p.policy_sets ?? [], authz_profiles: p.authz_profiles ?? [], default_profile: p.default_profile });
       })
       .catch((e) => setErr(String(e)));
-    get<{ attributes: { name: string }[] }>("/api/dictionary").then((d) => setAttrOptions(d.attributes.map((a) => ({ label: a.name, value: a.name })))).catch(() => {});
+    get<{ attributes: { name: string }[]; reply_attributes: string[] }>("/api/dictionary")
+      .then((d) => {
+        setAttrOptions(d.attributes.map((a) => ({ label: a.name, value: a.name })));
+        setReplyAttrOptions((d.reply_attributes ?? []).map((n) => ({ label: n, value: n })));
+      })
+      .catch(() => {});
   };
   useEffect(load, []);
 
@@ -189,7 +195,7 @@ export default function PolicyPage() {
       header={
         <Header
           variant="h1"
-          description="ISE-style authorization policy builder. Edit profiles, policy sets and rules, then Save. (Flat AND/OR conditions; nested groups land in Phase 3b. Not yet enforced in the live request path.)"
+          description="ISE-style authorization policy builder. Edit profiles, policy sets and rules, then Save. Saved policy is enforced live on the Access-Accept path. (Flat AND/OR conditions; nested groups land in Phase 3b.)"
           actions={
             <SpaceBetween direction="horizontal" size="xs">
               <Button iconName="refresh" onClick={load}>Reload</Button>
@@ -225,7 +231,7 @@ export default function PolicyPage() {
                       removeButtonText="Remove"
                       empty="None"
                       definition={[
-                        { label: "Attribute", control: (it, i) => <Input value={it.name} placeholder="e.g. Filter-Id" onChange={(e) => updateProfile(p.id, { attributes: p.attributes.map((a, j) => (j === i ? { ...a, name: e.detail.value } : a)) })} /> },
+                        { label: "Attribute", control: (it, i) => <Select selectedOption={it.name ? { label: it.name, value: it.name } : null} options={replyAttrOptions} placeholder="select an attribute" onChange={(e) => updateProfile(p.id, { attributes: p.attributes.map((a, j) => (j === i ? { ...a, name: e.detail.selectedOption.value! } : a)) })} /> },
                         { label: "Value", control: (it, i) => <Input value={it.value} onChange={(e) => updateProfile(p.id, { attributes: p.attributes.map((a, j) => (j === i ? { ...a, value: e.detail.value } : a)) })} /> },
                       ]}
                       onAddButtonClick={() => updateProfile(p.id, { attributes: [...p.attributes, { name: "", value: "" }] })}
