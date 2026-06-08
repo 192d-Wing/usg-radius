@@ -13,6 +13,8 @@
 #[cfg(feature = "observability")]
 use crate::access::{AccessContext, AccessPolicy};
 #[cfg(feature = "observability")]
+use crate::accounting::AccountingHandler;
+#[cfg(feature = "observability")]
 use crate::audit::{AuditEntry, AuditEventType, AuditLogger};
 #[cfg(feature = "observability")]
 use crate::config::Config;
@@ -118,6 +120,9 @@ pub struct MgmtState {
     policy_file: Option<Arc<str>>,
     /// IAM-style authorization + audit (None ⇒ open API).
     security: MgmtSecurity,
+    /// Live accounting sessions, shared with the request path. `None` ⇒ the
+    /// `sessions` endpoint returns an empty list.
+    accounting: Option<Arc<dyn AccountingHandler>>,
     started: Instant,
 }
 
@@ -129,6 +134,7 @@ impl MgmtState {
         policy: Arc<RwLock<PolicyConfig>>,
         policy_file: Option<Arc<str>>,
         security: MgmtSecurity,
+        accounting: Option<Arc<dyn AccountingHandler>>,
     ) -> Self {
         Self {
             config,
@@ -136,6 +142,7 @@ impl MgmtState {
             policy,
             policy_file,
             security,
+            accounting,
             started: Instant::now(),
         }
     }
@@ -215,11 +222,53 @@ async fn users(State(st): State<MgmtState>) -> Json<Vec<UserDto>> {
     )
 }
 
-/// Active sessions. The request path does not yet maintain a queryable live-session
-/// index, so this returns an empty list for now (populated in a later phase).
+/// One active accounting session for the operator UI.
 #[cfg(feature = "observability")]
-async fn sessions(State(_st): State<MgmtState>) -> Json<Vec<serde_json::Value>> {
-    Json(Vec::new())
+#[derive(Serialize)]
+struct SessionDto {
+    session_id: String,
+    username: String,
+    nas_ip: String,
+    framed_ip: Option<String>,
+    start_time: u64,
+    last_update: u64,
+    session_time: u32,
+    input_octets: u64,
+    output_octets: u64,
+    input_packets: u64,
+    output_packets: u64,
+}
+
+#[cfg(feature = "observability")]
+impl From<&crate::accounting::Session> for SessionDto {
+    fn from(s: &crate::accounting::Session) -> Self {
+        SessionDto {
+            session_id: s.session_id.clone(),
+            username: s.username.clone(),
+            nas_ip: s.nas_ip.to_string(),
+            framed_ip: s.framed_ip.map(|ip| ip.to_string()),
+            start_time: s.start_time,
+            last_update: s.last_update,
+            session_time: s.session_time,
+            input_octets: s.input_octets,
+            output_octets: s.output_octets,
+            input_packets: s.input_packets,
+            output_packets: s.output_packets,
+        }
+    }
+}
+
+/// Active accounting sessions, read from the shared accounting handler. Returns an
+/// empty list when accounting is not wired in. Sorted by most-recently-updated so
+/// the UI shows the freshest sessions first.
+#[cfg(feature = "observability")]
+async fn sessions(State(st): State<MgmtState>) -> Json<Vec<SessionDto>> {
+    let Some(handler) = &st.accounting else {
+        return Json(Vec::new());
+    };
+    let mut active = handler.get_active_sessions().await;
+    active.sort_by_key(|s| std::cmp::Reverse(s.last_update));
+    Json(active.iter().map(SessionDto::from).collect())
 }
 
 /// The currently loaded authorization policy.
@@ -439,9 +488,17 @@ pub fn create_mgmt_server(
     policy_cfg: Arc<RwLock<PolicyConfig>>,
     policy_file: Option<Arc<str>>,
     security: MgmtSecurity,
+    accounting: Option<Arc<dyn AccountingHandler>>,
 ) -> Router {
     let enforce = security.access_policy.is_some();
-    let state = MgmtState::new(config, session_manager, policy_cfg, policy_file, security);
+    let state = MgmtState::new(
+        config,
+        session_manager,
+        policy_cfg,
+        policy_file,
+        security,
+        accounting,
+    );
     let mut app = Router::new()
         .route("/api/v1/status", get(status))
         .route("/api/v1/clients", get(clients))
@@ -472,6 +529,7 @@ pub async fn start_mgmt_server(
     policy_cfg: Arc<RwLock<PolicyConfig>>,
     policy_file: Option<Arc<str>>,
     security: MgmtSecurity,
+    accounting: Option<Arc<dyn AccountingHandler>>,
     addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if security.access_policy.is_none() {
@@ -487,7 +545,14 @@ pub async fn start_mgmt_server(
     #[cfg(not(feature = "tls"))]
     let tls: Option<crate::config::MgmtTlsConfig> = None;
 
-    let app = create_mgmt_server(config, session_manager, policy_cfg, policy_file, security);
+    let app = create_mgmt_server(
+        config,
+        session_manager,
+        policy_cfg,
+        policy_file,
+        security,
+        accounting,
+    );
 
     match tls {
         #[cfg(feature = "tls")]
@@ -860,5 +925,53 @@ mod tests {
                 .allowed,
             "invalid reload must keep the previous policy"
         );
+    }
+
+    fn mgmt_state_with_accounting(
+        accounting: Option<Arc<dyn crate::accounting::AccountingHandler>>,
+    ) -> MgmtState {
+        use crate::state::{MemoryStateBackend, SharedSessionManager};
+        MgmtState::new(
+            Arc::new(Config::example()),
+            Arc::new(SharedSessionManager::new(Arc::new(
+                MemoryStateBackend::new(),
+            ))),
+            Arc::new(RwLock::new(PolicyConfig::default())),
+            None,
+            MgmtSecurity::default(),
+            accounting,
+        )
+    }
+
+    #[tokio::test]
+    async fn sessions_endpoint_lists_active_and_hides_stopped() {
+        use crate::accounting::{AccountingHandler, SimpleAccountingHandler};
+        use radius_proto::{Code, Packet};
+
+        let acct = Arc::new(SimpleAccountingHandler::new());
+        let pkt = Packet::new(Code::AccountingRequest, 1, [0u8; 16]);
+        let nas = "10.0.0.1".parse().unwrap();
+        acct.handle_start("sess-1", "alice", nas, &pkt)
+            .await
+            .unwrap();
+        acct.handle_start("sess-2", "bob", nas, &pkt).await.unwrap();
+        // Stop one — it must no longer appear in the live list.
+        acct.handle_stop("sess-1", "alice", nas, &pkt)
+            .await
+            .unwrap();
+
+        let state = mgmt_state_with_accounting(Some(acct));
+        let Json(list) = sessions(State(state)).await;
+        assert_eq!(list.len(), 1, "only the un-stopped session is active");
+        assert_eq!(list[0].session_id, "sess-2");
+        assert_eq!(list[0].username, "bob");
+        assert_eq!(list[0].nas_ip, "10.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn sessions_endpoint_empty_without_accounting() {
+        let state = mgmt_state_with_accounting(None);
+        let Json(list) = sessions(State(state)).await;
+        assert!(list.is_empty());
     }
 }
