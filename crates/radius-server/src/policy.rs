@@ -70,7 +70,12 @@ impl Operator {
             Operator::Contains => a.contains(&e),
             Operator::StartsWith => a.starts_with(&e),
             Operator::EndsWith => a.ends_with(&e),
-            Operator::MatchesRegex => regex::Regex::new(expected)
+            // Case-insensitive to match the contract of the other operators. An
+            // invalid pattern never matches (validate() rejects bad patterns at
+            // save time, so this branch is only hit for already-validated regexes).
+            Operator::MatchesRegex => regex::RegexBuilder::new(expected)
+                .case_insensitive(true)
+                .build()
                 .map(|re| re.is_match(actual))
                 .unwrap_or(false),
             Operator::InCidr => match (
@@ -107,6 +112,36 @@ pub enum Condition {
 impl Condition {
     pub fn always() -> Condition {
         Condition::Always
+    }
+
+    /// Validate a condition tree: composite (`all`/`any`) conditions must be
+    /// non-empty (an empty `all` is vacuously true — a silent fail-open — and an
+    /// empty `any` vacuously false), and every `matches_regex` pattern must compile.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Condition::All { conditions } | Condition::Any { conditions } => {
+                if conditions.is_empty() {
+                    return Err(
+                        "an 'all'/'any' condition must have at least one sub-condition \
+                         (use 'always' to match every request)"
+                            .to_string(),
+                    );
+                }
+                for c in conditions {
+                    c.validate()?;
+                }
+                Ok(())
+            }
+            Condition::Not { condition } => condition.validate(),
+            Condition::Attr {
+                operator: Operator::MatchesRegex,
+                value,
+                attribute,
+            } => regex::Regex::new(value)
+                .map(|_| ())
+                .map_err(|e| format!("invalid regex for attribute '{attribute}': {e}")),
+            Condition::Attr { .. } | Condition::Always => Ok(()),
+        }
     }
 
     /// Does this condition match the request context?
@@ -229,6 +264,9 @@ impl PolicyConfig {
             if !set_ids.insert(set.id.as_str()) {
                 return Err(format!("duplicate policy set id '{}'", set.id));
             }
+            set.condition
+                .validate()
+                .map_err(|e| format!("policy set '{}': {e}", set.id))?;
             let mut rule_ids = std::collections::HashSet::new();
             for rule in &set.rules {
                 if !rule_ids.insert(rule.id.as_str()) {
@@ -237,6 +275,9 @@ impl PolicyConfig {
                         rule.id, set.id
                     ));
                 }
+                rule.condition
+                    .validate()
+                    .map_err(|e| format!("rule '{}' in set '{}': {e}", rule.id, set.id))?;
                 if !profile_ids.contains(rule.profile.as_str()) {
                     return Err(format!(
                         "rule '{}' in set '{}' references unknown profile '{}'",
@@ -515,6 +556,86 @@ mod tests {
         // No set matches -> default profile (reject).
         let d3 = policy.evaluate(&ctx(&[("NAS-Port-Type", "Ethernet")]));
         assert_eq!(d3.effect, Effect::Reject);
+    }
+
+    #[test]
+    fn regex_operator_is_case_insensitive() {
+        let c = Condition::Attr {
+            attribute: "User-Name".into(),
+            operator: Operator::MatchesRegex,
+            value: "^STAFF[0-9]+$".into(),
+        };
+        assert!(c.matches(&ctx(&[("User-Name", "staff01")])));
+    }
+
+    #[test]
+    fn validate_rejects_empty_composite_condition() {
+        let policy = PolicyConfig {
+            authz_profiles: vec![accept("p")],
+            default_profile: None,
+            policy_sets: vec![PolicySet {
+                id: "s".into(),
+                name: "s".into(),
+                enabled: true,
+                condition: Condition::All { conditions: vec![] },
+                rules: vec![],
+            }],
+        };
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_regex() {
+        let policy = PolicyConfig {
+            authz_profiles: vec![accept("p")],
+            default_profile: None,
+            policy_sets: vec![PolicySet {
+                id: "s".into(),
+                name: "s".into(),
+                enabled: true,
+                condition: Condition::Always,
+                rules: vec![Rule {
+                    id: "r".into(),
+                    name: "r".into(),
+                    enabled: true,
+                    condition: Condition::Attr {
+                        attribute: "User-Name".into(),
+                        operator: Operator::MatchesRegex,
+                        value: "(staff".into(),
+                    },
+                    profile: "p".into(),
+                }],
+            }],
+        };
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_policy() {
+        let policy = PolicyConfig {
+            authz_profiles: vec![accept("p")],
+            default_profile: Some("p".into()),
+            policy_sets: vec![PolicySet {
+                id: "s".into(),
+                name: "s".into(),
+                enabled: true,
+                condition: Condition::Always,
+                rules: vec![Rule {
+                    id: "r".into(),
+                    name: "r".into(),
+                    enabled: true,
+                    condition: Condition::All {
+                        conditions: vec![Condition::Attr {
+                            attribute: "identity-group".into(),
+                            operator: Operator::Equals,
+                            value: "staff".into(),
+                        }],
+                    },
+                    profile: "p".into(),
+                }],
+            }],
+        };
+        assert!(policy.validate().is_ok());
     }
 
     #[test]

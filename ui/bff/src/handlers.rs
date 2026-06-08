@@ -72,112 +72,70 @@ pub async fn overview(State(st): State<AppState>) -> Result<Json<Value>, (axum::
     })))
 }
 
-/// Proxy a GET to the RADIUS management API and return its JSON verbatim.
-async fn proxy_api(
+/// Proxy a request to the RADIUS management API. Reads the response body as text
+/// and only parses JSON on success, so a non-2xx upstream error (which may be a
+/// plain-text validation message, not JSON) is passed through with its real status
+/// and body instead of being masked as a generic 502.
+async fn proxy(
     st: &AppState,
+    method: reqwest::Method,
     path: &str,
+    body: Option<&Value>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
     let url = format!("{}{}", st.radius_api_url, path);
-    let resp = st
-        .http
-        .get(&url)
+    let mut req = st.http.request(method, &url);
+    if let Some(b) = body {
+        req = req.json(b);
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
     let code = axum::http::StatusCode::from_u16(resp.status().as_u16())
         .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-    let body: Value = resp
-        .json()
+    let text = resp
+        .text()
         .await
         .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
-    if code.is_success() {
-        Ok(Json(body))
-    } else {
-        Err((code, body.to_string()))
+    if !code.is_success() {
+        // Pass the upstream status + body (often a plain-text error) through.
+        return Err((code, text));
     }
+    let out = if text.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&text).map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?
+    };
+    Ok(Json(out))
 }
 
-pub async fn status(
-    State(st): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
-    proxy_api(&st, "/api/v1/status").await
-}
-pub async fn clients(
-    State(st): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
-    proxy_api(&st, "/api/v1/clients").await
-}
-pub async fn users(
-    State(st): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
-    proxy_api(&st, "/api/v1/users").await
-}
-pub async fn sessions(
-    State(st): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
-    proxy_api(&st, "/api/v1/sessions").await
-}
-pub async fn policy_get(
-    State(st): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
-    proxy_api(&st, "/api/v1/policy").await
-}
-pub async fn dictionary(
-    State(st): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
-    proxy_api(&st, "/api/v1/dictionary").await
-}
+type ProxyResult = Result<Json<Value>, (axum::http::StatusCode, String)>;
 
-/// PUT proxy: forward a new policy to the management API (validate + persist).
-pub async fn policy_put(
-    State(st): State<AppState>,
-    Json(body): Json<Value>,
-) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
-    let url = format!("{}/api/v1/policy", st.radius_api_url);
-    let resp = st
-        .http
-        .put(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
-    let code = axum::http::StatusCode::from_u16(resp.status().as_u16())
-        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-    // The management API returns plain-text validation errors on 4xx; pass through.
-    let text = resp.text().await.unwrap_or_default();
-    if code.is_success() {
-        let out: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        Ok(Json(out))
-    } else {
-        Err((code, text))
-    }
+pub async fn status(State(st): State<AppState>) -> ProxyResult {
+    proxy(&st, reqwest::Method::GET, "/api/v1/status", None).await
 }
-
-/// POST proxy for the policy dry-run: forwards the candidate policy + request body
-/// to the management API and returns the decision.
-pub async fn policy_dry_run(
-    State(st): State<AppState>,
-    Json(body): Json<Value>,
-) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
-    let url = format!("{}/api/v1/policy/dry-run", st.radius_api_url);
-    let resp = st
-        .http
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
-    let code = axum::http::StatusCode::from_u16(resp.status().as_u16())
-        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-    let out: Value = resp
-        .json()
-        .await
-        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
-    if code.is_success() {
-        Ok(Json(out))
-    } else {
-        Err((code, out.to_string()))
-    }
+pub async fn clients(State(st): State<AppState>) -> ProxyResult {
+    proxy(&st, reqwest::Method::GET, "/api/v1/clients", None).await
+}
+pub async fn users(State(st): State<AppState>) -> ProxyResult {
+    proxy(&st, reqwest::Method::GET, "/api/v1/users", None).await
+}
+pub async fn sessions(State(st): State<AppState>) -> ProxyResult {
+    proxy(&st, reqwest::Method::GET, "/api/v1/sessions", None).await
+}
+pub async fn policy_get(State(st): State<AppState>) -> ProxyResult {
+    proxy(&st, reqwest::Method::GET, "/api/v1/policy", None).await
+}
+pub async fn dictionary(State(st): State<AppState>) -> ProxyResult {
+    proxy(&st, reqwest::Method::GET, "/api/v1/dictionary", None).await
+}
+/// PUT a new policy to the management API (validate + persist); 4xx body passes through.
+pub async fn policy_put(State(st): State<AppState>, Json(body): Json<Value>) -> ProxyResult {
+    proxy(&st, reqwest::Method::PUT, "/api/v1/policy", Some(&body)).await
+}
+/// POST a candidate policy + request to the dry-run endpoint and return the decision.
+pub async fn policy_dry_run(State(st): State<AppState>, Json(body): Json<Value>) -> ProxyResult {
+    proxy(&st, reqwest::Method::POST, "/api/v1/policy/dry-run", Some(&body)).await
 }
 
 /// Minimal Prometheus text-format parser: one entry per non-comment sample line

@@ -164,7 +164,15 @@ async fn policy_put(
     if let Some(path) = &st.policy_file {
         let json = serde_json::to_string_pretty(&new_policy)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        std::fs::write(path.as_ref(), json).map_err(|e| {
+        // Atomic write: write a temp file then rename over the target, so a crash
+        // mid-write can't leave a truncated/corrupt POLICY_FILE. Async I/O to avoid
+        // blocking the runtime worker.
+        let tmp = format!("{path}.tmp");
+        let persist = async {
+            tokio::fs::write(&tmp, &json).await?;
+            tokio::fs::rename(&tmp, path.as_ref()).await
+        };
+        persist.await.map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to persist policy to {path}: {e}"),

@@ -37,12 +37,20 @@ const OPERATORS = ["equals", "not_equals", "contains", "starts_with", "ends_with
 type Match = "always" | "all" | "any";
 function condRows(c?: Condition): { match: Match; rows: AttrCond[]; advanced: boolean } {
   if (!c || c.type === "always") return { match: "always", rows: [], advanced: false };
-  if (c.type === "all" || c.type === "any")
-    return { match: c.type, rows: (c.conditions || []).filter((x: any) => x.type === "attr"), advanced: false };
-  return { match: "always", rows: [], advanced: true }; // Not/nested/ref: not editable in Phase 3a
+  if (c.type === "all" || c.type === "any") {
+    const children: any[] = (c as any).conditions || [];
+    const rows = children.filter((x) => x.type === "attr");
+    // If any child is NOT a plain attr (a nested group / NOT / ref), this
+    // condition can't be safely flattened — flag it advanced so the editor shows
+    // it read-only instead of silently dropping the nested parts on save.
+    return { match: c.type, rows, advanced: rows.length !== children.length };
+  }
+  return { match: "always", rows: [], advanced: true }; // Not/ref at top level: not editable in Phase 3a
 }
 function rowsToCond(match: Match, rows: AttrCond[]): Condition {
-  if (match === "always" || rows.length === 0) return { type: "always" };
+  if (match === "always") return { type: "always" };
+  // Keep the chosen all/any even when empty: an empty all/any is rejected by the
+  // server's validate() (clear error), rather than silently becoming match-all.
   return { type: match, conditions: rows };
 }
 
@@ -125,7 +133,12 @@ export default function PolicyPage() {
   const [saving, setSaving] = useState(false);
 
   const load = () => {
-    get<Policy>("/api/policy").then((p) => setPolicy({ policy_sets: p.policy_sets ?? [], authz_profiles: p.authz_profiles ?? [], default_profile: p.default_profile })).catch((e) => setErr(String(e)));
+    get<Policy>("/api/policy")
+      .then((p) => {
+        setErr(null);
+        setPolicy({ policy_sets: p.policy_sets ?? [], authz_profiles: p.authz_profiles ?? [], default_profile: p.default_profile });
+      })
+      .catch((e) => setErr(String(e)));
     get<{ attributes: { name: string }[] }>("/api/dictionary").then((d) => setAttrOptions(d.attributes.map((a) => ({ label: a.name, value: a.name })))).catch(() => {});
   };
   useEffect(load, []);
@@ -148,7 +161,13 @@ export default function PolicyPage() {
   const addProfile = () =>
     setPolicy({ ...policy, authz_profiles: [...policy.authz_profiles, { id: uid("p"), name: "New profile", effect: "accept", attributes: [] }] });
   const removeProfile = (id: string) =>
-    setPolicy({ ...policy, authz_profiles: policy.authz_profiles.filter((p) => p.id !== id) });
+    setPolicy({
+      ...policy,
+      authz_profiles: policy.authz_profiles.filter((p) => p.id !== id),
+      // Drop a dangling default reference so Save doesn't fail with an
+      // invisible "default_profile not defined" error.
+      default_profile: policy.default_profile === id ? undefined : policy.default_profile,
+    });
 
   // ---- set / rule editing ----
   const updateSet = (id: string, patch: Partial<PolicySet>) =>
@@ -223,6 +242,20 @@ export default function PolicyPage() {
         {/* Policy sets */}
         <Container header={<Header variant="h2" counter={`(${policy.policy_sets.length})`} actions={<Button onClick={addSet} iconName="add-plus">Add policy set</Button>}>Policy sets (evaluated in order)</Header>}>
           <SpaceBetween size="s">
+            <FormField label="Default result" description="Applied when the selected set matches no rule, or no set matches. Defaults to reject.">
+              <Select
+                selectedOption={
+                  policy.default_profile
+                    ? profileOptions.find((o) => o.value === policy.default_profile) ?? { value: policy.default_profile, label: `${policy.default_profile} (missing)` }
+                    : { value: "", label: "Reject (implicit)" }
+                }
+                options={[{ value: "", label: "Reject (implicit)" }, ...profileOptions]}
+                onChange={(e) => {
+                  const v = e.detail.selectedOption.value;
+                  setPolicy({ ...policy, default_profile: v || undefined });
+                }}
+              />
+            </FormField>
             {policy.policy_sets.length === 0 && <Box color="text-status-inactive">No policy sets yet.</Box>}
             {policy.policy_sets.map((s, idx) => (
               <ExpandableSection key={s.id} defaultExpanded headerText={`${idx + 1}. ${s.name}`} variant="container">
@@ -301,15 +334,26 @@ function SimulatePanel({ policy }: { policy: Policy }) {
     { name: "identity-group", value: "staff" },
   ]);
   const [decision, setDecision] = useState<Decision | null>(null);
+  const [simErr, setSimErr] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const run = () => {
     setRunning(true);
+    setSimErr(null);
     const request = { attributes: Object.fromEntries(attrs.filter((a) => a.name).map((a) => [a.name, a.value])) };
-    post<Decision>("/api/policy/dry-run", { policy, request }).then(setDecision).finally(() => setRunning(false));
+    post<Decision>("/api/policy/dry-run", { policy, request })
+      .then((d) => {
+        setDecision(d);
+      })
+      .catch((e) => {
+        setDecision(null);
+        setSimErr(String(e).replace(/^Error:\s*/, ""));
+      })
+      .finally(() => setRunning(false));
   };
   return (
     <Container header={<Header variant="h2" description="Evaluate the current (unsaved) policy against a sample request.">Simulate</Header>}>
       <SpaceBetween size="m">
+        {simErr && <Alert type="error" header="Simulation failed">{simErr}</Alert>}
         <AttributeEditor<Attr>
           items={attrs}
           addButtonText="Add attribute"

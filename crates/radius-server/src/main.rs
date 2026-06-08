@@ -62,19 +62,30 @@ async fn start_observability(config: &Config) {
         .ok()
         .map(|p| std::sync::Arc::from(p.as_str()));
     let loaded = match &policy_file {
-        Some(path) => match std::fs::read_to_string(path.as_ref())
-            .ok()
-            .and_then(|s| serde_json::from_str::<radius_server::PolicyConfig>(&s).ok())
-        {
-            Some(p) => {
-                info!("Loaded authorization policy from {path}");
-                p
+        // A missing file is fine (first run); but a file that EXISTS and fails to
+        // read/parse is fatal — silently starting with an empty policy would
+        // discard the operator's authorization config (fail-open once enforced).
+        Some(path) if std::path::Path::new(path.as_ref()).exists() => {
+            match std::fs::read_to_string(path.as_ref())
+                .map_err(|e| e.to_string())
+                .and_then(|s| {
+                    serde_json::from_str::<radius_server::PolicyConfig>(&s)
+                        .map_err(|e| e.to_string())
+                }) {
+                Ok(p) => {
+                    info!("Loaded authorization policy from {path}");
+                    p
+                }
+                Err(e) => {
+                    error!("POLICY_FILE {path} exists but could not be loaded: {e}");
+                    process::exit(1);
+                }
             }
-            None => {
-                warn!("Could not read/parse POLICY_FILE {path}; starting with empty policy");
-                radius_server::PolicyConfig::default()
-            }
-        },
+        }
+        Some(path) => {
+            info!("POLICY_FILE {path} does not exist yet; starting with an empty policy");
+            radius_server::PolicyConfig::default()
+        }
         None => radius_server::PolicyConfig::default(),
     };
     let policy = Arc::new(std::sync::RwLock::new(loaded));
