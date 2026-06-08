@@ -117,6 +117,43 @@ pub async fn sessions(
 ) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
     proxy_api(&st, "/api/v1/sessions").await
 }
+pub async fn policy_get(
+    State(st): State<AppState>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    proxy_api(&st, "/api/v1/policy").await
+}
+pub async fn dictionary(
+    State(st): State<AppState>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    proxy_api(&st, "/api/v1/dictionary").await
+}
+
+/// POST proxy for the policy dry-run: forwards the candidate policy + request body
+/// to the management API and returns the decision.
+pub async fn policy_dry_run(
+    State(st): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    let url = format!("{}/api/v1/policy/dry-run", st.radius_api_url);
+    let resp = st
+        .http
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let code = axum::http::StatusCode::from_u16(resp.status().as_u16())
+        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+    let out: Value = resp
+        .json()
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
+    if code.is_success() {
+        Ok(Json(out))
+    } else {
+        Err((code, out.to_string()))
+    }
+}
 
 /// Minimal Prometheus text-format parser: one entry per non-comment sample line
 /// of the form `name{labels} value` (labels optional).

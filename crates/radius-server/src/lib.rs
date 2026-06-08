@@ -53,6 +53,7 @@ pub mod health;
 pub mod ldap_auth;
 pub mod metrics;
 pub mod mgmt;
+pub mod policy;
 pub mod postgres_auth;
 pub mod proxy;
 pub mod ratelimit;
@@ -65,6 +66,10 @@ pub use cache::{RequestCache, RequestFingerprint};
 pub use config::{Client, Config, ConfigError, User};
 pub use eap_auth::EapAuthHandler;
 pub use ldap_auth::{LdapAuthHandler, LdapConfig, LdapError};
+pub use policy::{
+    AuthzProfile, Condition, Decision, Dictionary, Effect, Operator, PolicyConfig, PolicySet,
+    ReplyAttribute, RequestContext, Rule, dictionary,
+};
 pub use postgres_auth::{PostgresAuthHandler, PostgresConfig, PostgresError};
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use server::{
