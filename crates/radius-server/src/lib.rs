@@ -54,6 +54,7 @@ pub mod ldap_auth;
 pub mod metrics;
 pub mod mgmt;
 pub mod policy;
+pub mod policy_enforce;
 pub mod postgres_auth;
 pub mod proxy;
 pub mod ratelimit;

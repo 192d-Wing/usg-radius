@@ -334,6 +334,10 @@ pub struct ServerConfig {
     pub retry_manager: Option<Arc<RetryManager>>,
     /// Health checker (optional)
     pub health_checker: Option<Arc<crate::proxy::health::HealthChecker>>,
+    /// Authorization policy, shared (and live-editable) with the management API.
+    /// When present AND it has at least one policy set, it is enforced on
+    /// Access-Accept (Phase 2b); otherwise the reply is unchanged.
+    pub policy: Option<Arc<std::sync::RwLock<crate::policy::PolicyConfig>>>,
 }
 
 impl ServerConfig {
@@ -368,6 +372,7 @@ impl ServerConfig {
             proxy_handler: None,
             retry_manager: None,
             health_checker: None,
+            policy: None,
         }
     }
 
@@ -377,6 +382,15 @@ impl ServerConfig {
         accounting_handler: Arc<dyn AccountingHandler>,
     ) -> Self {
         self.accounting_handler = Some(accounting_handler);
+        self
+    }
+
+    /// Attach a shared (live-editable) authorization policy to enforce on accept.
+    pub fn with_policy(
+        mut self,
+        policy: Arc<std::sync::RwLock<crate::policy::PolicyConfig>>,
+    ) -> Self {
+        self.policy = Some(policy);
         self
     }
 
@@ -439,6 +453,7 @@ impl ServerConfig {
             proxy_handler,
             retry_manager,
             health_checker: None,
+            policy: None,
         })
     }
 
@@ -1215,6 +1230,57 @@ impl RadiusServer {
                 // (e.g., EAP-Success EAP-Message from an EAP handler).
                 for attr in extra_attrs {
                     response.add_attribute(attr);
+                }
+
+                // Phase 2b: enforce the authorization policy. Only active when a
+                // policy with at least one policy set is loaded; otherwise the
+                // accept is unchanged. A poisoned lock is recovered (read-only use)
+                // rather than panicking the request handler.
+                if let Some(policy_lock) = config.policy.as_ref() {
+                    let guard = policy_lock
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !guard.policy_sets.is_empty() {
+                        let ctx = crate::policy_enforce::request_context(request, &username);
+                        let decision = guard.evaluate(&ctx);
+                        drop(guard);
+                        match decision.effect {
+                            crate::policy::Effect::Reject => {
+                                warn!(
+                                    username = %username,
+                                    reason = %decision.reason,
+                                    "Authorization policy denied access"
+                                );
+                                response =
+                                    Packet::new(Code::AccessReject, request.identifier, [0u8; 16]);
+                                if let Some(msg) = decision.reply_message
+                                    && let Ok(a) =
+                                        Attribute::string(AttributeType::ReplyMessage as u8, msg)
+                                {
+                                    response.add_attribute(a);
+                                }
+                            }
+                            crate::policy::Effect::Accept => {
+                                for ra in &decision.attributes {
+                                    match crate::policy_enforce::reply_attribute(ra) {
+                                        Some(a) => response.add_attribute(a),
+                                        None => tracing::debug!(
+                                            attribute = %ra.name,
+                                            "policy reply attribute not encodable; skipped"
+                                        ),
+                                    }
+                                }
+                                if let Some(msg) = &decision.reply_message
+                                    && let Ok(a) = Attribute::string(
+                                        AttributeType::ReplyMessage as u8,
+                                        msg.clone(),
+                                    )
+                                {
+                                    response.add_attribute(a);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 copy_proxy_state(request, &mut response);
