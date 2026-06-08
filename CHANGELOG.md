@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Live session index
+
+- **`GET /api/v1/sessions` now returns real active accounting sessions** instead of
+  an empty stub. The server records Accounting-Start/Interim/Stop into a shared
+  in-memory `SimpleAccountingHandler`, and the management API reads the **same**
+  store — a session appears on Start and is removed on Stop (or reaped after the
+  inactivity timeout by a periodic cleanup task). Each entry carries username, NAS
+  IP, framed IP, duration, and in/out octets/packets. The UI **Sessions** page shows
+  this live (auto-refresh every 10s) with duration and data-transfer columns.
+
 ### Added - Management API authentication (mTLS + IAM-style ABAC)
 
 - **Secured the management API.** The `/api/v1/*` endpoints — including

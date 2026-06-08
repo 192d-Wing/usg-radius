@@ -78,6 +78,13 @@ export interface Session {
   username?: string;
   nas_ip?: string;
   framed_ip?: string;
+  start_time?: number;
+  last_update?: number;
+  session_time?: number;
+  input_octets?: number;
+  output_octets?: number;
+  input_packets?: number;
+  output_packets?: number;
   [k: string]: any;
 }
 

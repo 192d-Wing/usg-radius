@@ -5,7 +5,19 @@ import Table from "@cloudscape-design/components/table";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
-import { get, Session } from "../api";
+import { get, Session, fmtDuration } from "../api";
+
+const fmtBytes = (n?: number) => {
+  if (n === undefined || !Number.isFinite(n)) return "—";
+  let v = n;
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`;
+};
 
 export default function SessionsPage() {
   const [rows, setRows] = useState<Session[]>([]);
@@ -33,7 +45,7 @@ export default function SessionsPage() {
       header={
         <Header
           variant="h1"
-          description="Active RADIUS sessions. A queryable live-session index lands in a later phase; this currently reflects what the server exposes."
+          description="Active RADIUS accounting sessions (live), refreshed every 10s. A session appears on Accounting-Start and is removed on Accounting-Stop or after the inactivity timeout."
           actions={<Button iconName="refresh" onClick={load} loading={loading} />}
         >
           Sessions
@@ -49,6 +61,9 @@ export default function SessionsPage() {
           { id: "user", header: "User", cell: (s) => s.username || "—" },
           { id: "nas", header: "NAS IP", cell: (s) => s.nas_ip || "—" },
           { id: "framed", header: "Framed IP", cell: (s) => s.framed_ip || "—" },
+          { id: "duration", header: "Duration", cell: (s) => fmtDuration(s.session_time ?? 0) },
+          { id: "in", header: "Data in", cell: (s) => fmtBytes(s.input_octets) },
+          { id: "out", header: "Data out", cell: (s) => fmtBytes(s.output_octets) },
           { id: "id", header: "Session ID", cell: (s) => s.session_id || "—" },
         ]}
         items={rows}

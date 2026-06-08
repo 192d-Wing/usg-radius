@@ -71,6 +71,7 @@ async fn start_observability(
     config: &Config,
     policy: Arc<std::sync::RwLock<radius_server::PolicyConfig>>,
     policy_file: Option<Arc<str>>,
+    accounting: Arc<dyn radius_server::AccountingHandler>,
 ) {
     use radius_server::state::{MemoryStateBackend, SharedSessionManager};
     use std::env;
@@ -137,6 +138,7 @@ async fn start_observability(
                     policy,
                     policy_file,
                     security,
+                    Some(accounting),
                     addr,
                 )
                 .await
@@ -429,8 +431,31 @@ async fn main() {
     // path (enforcement) and the management API (live editing).
     let (policy, policy_file) = load_policy();
 
+    // Shared in-memory accounting session store. The request path records
+    // Start/Interim/Stop into it; the management API reads the same store for its
+    // live-session view (`GET /api/v1/sessions`).
+    let accounting = Arc::new(radius_server::SimpleAccountingHandler::new());
+
+    // Reap sessions that never received a Stop (and went silent past the timeout)
+    // so the live-session view doesn't accumulate stale entries.
+    {
+        let acct = Arc::clone(&accounting);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                let removed = acct.cleanup_stale_sessions();
+                if removed > 0 {
+                    info!("reaped {removed} stale accounting session(s)");
+                }
+            }
+        });
+    }
+
     let server_config = match ServerConfig::from_config(config.clone(), handler) {
-        Ok(cfg) => cfg.with_policy(Arc::clone(&policy)),
+        Ok(cfg) => cfg
+            .with_policy(Arc::clone(&policy))
+            .with_accounting_handler(accounting.clone()),
         Err(e) => {
             error!("Invalid configuration: {}", e);
             process::exit(1);
@@ -457,9 +482,15 @@ async fn main() {
     // externalTrafficPolicy: Local the readiness state gates whether Cilium
     // advertises the anycast VIP from this node.
     #[cfg(feature = "observability")]
-    start_observability(&config, Arc::clone(&policy), policy_file).await;
+    start_observability(
+        &config,
+        Arc::clone(&policy),
+        policy_file,
+        accounting.clone(),
+    )
+    .await;
     #[cfg(not(feature = "observability"))]
-    let _ = policy_file;
+    let _ = (policy_file, &accounting);
 
     info!("");
     info!("Server started successfully!");
