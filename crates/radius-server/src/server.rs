@@ -98,6 +98,31 @@ fn add_message_authenticator_if_eap(
     Ok(())
 }
 
+/// RADIUS attribute numbers that may appear at most once in a reply. When a policy
+/// returns one of these, it must REPLACE any value already added by the auth
+/// handler (e.g. a default Session-Timeout) rather than appending a duplicate —
+/// duplicates of single-valued attributes have undefined behavior at the NAS.
+/// Multi-valued attributes (Filter-Id, Class, Reply-Message) are intentionally
+/// absent so they accumulate.
+const SINGLE_VALUED_REPLY_ATTRS: &[u8] = &[
+    AttributeType::SessionTimeout as u8,
+    AttributeType::IdleTimeout as u8,
+    64, // Tunnel-Type        (we only ever return one tunnel group)
+    65, // Tunnel-Medium-Type
+    81, // Tunnel-Private-Group-ID
+];
+
+/// Add a policy-derived reply attribute, replacing any prior value for the
+/// single-valued types so the policy result wins over auth-handler defaults.
+fn add_policy_reply_attribute(response: &mut Packet, attr: Attribute) {
+    if SINGLE_VALUED_REPLY_ATTRS.contains(&attr.attr_type) {
+        response
+            .attributes
+            .retain(|a| a.attr_type != attr.attr_type);
+    }
+    response.add_attribute(attr);
+}
+
 #[derive(Error, Debug)]
 pub enum ServerError {
     #[error("IO error: {0}")]
@@ -334,6 +359,10 @@ pub struct ServerConfig {
     pub retry_manager: Option<Arc<RetryManager>>,
     /// Health checker (optional)
     pub health_checker: Option<Arc<crate::proxy::health::HealthChecker>>,
+    /// Authorization policy, shared (and live-editable) with the management API.
+    /// When present AND it has at least one policy set, it is enforced on
+    /// Access-Accept (Phase 2b); otherwise the reply is unchanged.
+    pub policy: Option<Arc<std::sync::RwLock<crate::policy::PolicyConfig>>>,
 }
 
 impl ServerConfig {
@@ -368,6 +397,7 @@ impl ServerConfig {
             proxy_handler: None,
             retry_manager: None,
             health_checker: None,
+            policy: None,
         }
     }
 
@@ -377,6 +407,15 @@ impl ServerConfig {
         accounting_handler: Arc<dyn AccountingHandler>,
     ) -> Self {
         self.accounting_handler = Some(accounting_handler);
+        self
+    }
+
+    /// Attach a shared (live-editable) authorization policy to enforce on accept.
+    pub fn with_policy(
+        mut self,
+        policy: Arc<std::sync::RwLock<crate::policy::PolicyConfig>>,
+    ) -> Self {
+        self.policy = Some(policy);
         self
     }
 
@@ -439,6 +478,7 @@ impl ServerConfig {
             proxy_handler,
             retry_manager,
             health_checker: None,
+            policy: None,
         })
     }
 
@@ -1199,7 +1239,9 @@ impl RadiusServer {
                             .with_username(&username)
                             .with_client_ip(source_ip)
                             .with_request_id(request.identifier)
-                            .with_client_name(client_name.unwrap_or_else(|| "unknown".to_string())),
+                            .with_client_name(
+                                client_name.clone().unwrap_or_else(|| "unknown".to_string()),
+                            ),
                     )
                     .await;
 
@@ -1215,6 +1257,108 @@ impl RadiusServer {
                 // (e.g., EAP-Success EAP-Message from an EAP handler).
                 for attr in extra_attrs {
                     response.add_attribute(attr);
+                }
+
+                // Phase 2b: enforce the authorization policy. Only active when a
+                // policy with at least one policy set is loaded; otherwise the
+                // accept is unchanged. A poisoned lock is recovered (read-only use)
+                // rather than panicking the request handler.
+                if let Some(policy_lock) = config.policy.as_ref() {
+                    // Evaluate under the lock in a tight scope that yields an OWNED
+                    // Decision, so the non-Send RwLockReadGuard is dropped before the
+                    // audit `.await` below (the future must stay Send).
+                    let decision = {
+                        let guard = policy_lock
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if guard.policy_sets.is_empty() {
+                            None
+                        } else {
+                            let ctx = crate::policy_enforce::request_context(request, &username);
+                            Some(guard.evaluate(&ctx))
+                        }
+                    };
+                    if let Some(decision) = decision {
+                        match decision.effect {
+                            crate::policy::Effect::Reject => {
+                                warn!(
+                                    username = %username,
+                                    reason = %decision.reason,
+                                    "Authorization policy denied access"
+                                );
+
+                                // Audit the authorization denial. Authentication
+                                // itself succeeded (logged above), so this is a
+                                // distinct AuthFailure carrying the policy reason —
+                                // without it, the audit trail shows only the success
+                                // and the access reject is invisible.
+                                config
+                                    .audit_logger
+                                    .log(
+                                        AuditEntry::new(AuditEventType::AuthFailure)
+                                            .with_username(&username)
+                                            .with_client_ip(source_ip)
+                                            .with_request_id(request.identifier)
+                                            .with_client_name(
+                                                client_name
+                                                    .clone()
+                                                    .unwrap_or_else(|| "unknown".to_string()),
+                                            )
+                                            .with_details(format!(
+                                                "authorization policy denied: {}",
+                                                decision.reason
+                                            )),
+                                    )
+                                    .await;
+
+                                // Build the reject, preserving EAP semantics: if this
+                                // was an EAP conversation the reject MUST carry an
+                                // EAP-Failure EAP-Message (RFC 3579 §2.6.3), else the
+                                // supplicant sees a malformed/again-Success state. The
+                                // Message-Authenticator is added below for any reply
+                                // that ends up carrying EAP-Message.
+                                response =
+                                    Packet::new(Code::AccessReject, request.identifier, [0u8; 16]);
+                                if let Some(eap_id) = request
+                                    .find_attribute(AttributeType::EapMessage as u8)
+                                    .and_then(|a| a.value.get(1).copied())
+                                {
+                                    let failure =
+                                        radius_proto::eap::EapPacket::failure(eap_id).to_bytes();
+                                    if let Ok(a) =
+                                        Attribute::new(AttributeType::EapMessage as u8, failure)
+                                    {
+                                        response.add_attribute(a);
+                                    }
+                                }
+                                if let Some(msg) = decision.reply_message
+                                    && let Ok(a) =
+                                        Attribute::string(AttributeType::ReplyMessage as u8, msg)
+                                {
+                                    response.add_attribute(a);
+                                }
+                            }
+                            crate::policy::Effect::Accept => {
+                                for ra in &decision.attributes {
+                                    match crate::policy_enforce::reply_attribute(ra) {
+                                        Some(a) => add_policy_reply_attribute(&mut response, a),
+                                        None => tracing::debug!(
+                                            attribute = %ra.name,
+                                            "policy reply attribute not encodable; skipped"
+                                        ),
+                                    }
+                                }
+                                if let Some(msg) = &decision.reply_message
+                                    && let Ok(a) = Attribute::string(
+                                        AttributeType::ReplyMessage as u8,
+                                        msg.clone(),
+                                    )
+                                {
+                                    response.add_attribute(a);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 copy_proxy_state(request, &mut response);

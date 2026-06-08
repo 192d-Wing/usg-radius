@@ -18,11 +18,13 @@ use radius_proto::auth::{
 use radius_proto::chap::{ChapChallenge, ChapResponse, compute_chap_response};
 use radius_proto::{Attribute, AttributeType, Code, Packet, calculate_message_authenticator};
 use radius_server::{
-    AccountingHandler, AuthHandler, AuthResult, Config, RadiusServer, ServerConfig,
+    AccountingHandler, AuthHandler, AuthResult, AuthzProfile, Condition, Config, Effect,
+    PolicyConfig, PolicySet, RadiusServer, ReplyAttribute, Rule, ServerConfig,
     SimpleAccountingHandler, SimpleAuthHandler,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -158,6 +160,102 @@ async fn test_successful_authentication() {
     // Verify Access-Accept response
     assert_eq!(response.code, Code::AccessAccept);
     assert_eq!(response.identifier, 1);
+}
+
+/// Build + run a server (user testuser/testpass, secret testing123) with the given
+/// authorization policy enforced, and return its address.
+async fn spawn_server_with_policy(policy: PolicyConfig) -> SocketAddr {
+    let mut config = Config::default();
+    config.listen_address = "127.0.0.1".to_string();
+    config.listen_port = 0;
+    config.secret = "testing123".to_string();
+    let mut handler = SimpleAuthHandler::new();
+    handler.add_user("testuser", "testpass");
+    let server_config = ServerConfig::from_config(config, Arc::new(handler))
+        .expect("config")
+        .with_policy(Arc::new(RwLock::new(policy)));
+    let server = RadiusServer::new(server_config).await.expect("server");
+    let addr = server.local_addr().expect("addr");
+    tokio::spawn(async move { server.run().await.expect("run") });
+    sleep(Duration::from_millis(500)).await;
+    addr
+}
+
+fn always_rule(profile: &str) -> Rule {
+    Rule {
+        id: "r".into(),
+        name: "r".into(),
+        enabled: true,
+        condition: Condition::Always,
+        profile: profile.into(),
+    }
+}
+
+fn one_set(profile: &str) -> Vec<PolicySet> {
+    vec![PolicySet {
+        id: "s".into(),
+        name: "s".into(),
+        enabled: true,
+        condition: Condition::Always,
+        rules: vec![always_rule(profile)],
+    }]
+}
+
+#[tokio::test]
+async fn test_policy_denies_authenticated_user() {
+    // Auth succeeds, but the policy rejects -> Access-Reject.
+    let policy = PolicyConfig {
+        authz_profiles: vec![AuthzProfile {
+            id: "deny".into(),
+            name: "Deny".into(),
+            effect: Effect::Reject,
+            attributes: vec![],
+            reply_message: None,
+        }],
+        default_profile: None,
+        policy_sets: one_set("deny"),
+    };
+    let addr = spawn_server_with_policy(policy).await;
+    let packet = create_access_request("testuser", "testpass", b"testing123", 7);
+    let response = send_radius_request(&packet, addr).await.expect("send");
+    assert_eq!(response.code, Code::AccessReject);
+    assert_eq!(response.identifier, 7);
+}
+
+#[tokio::test]
+async fn test_policy_injects_reply_attributes() {
+    // Auth + policy accept, with a returned Filter-Id attribute.
+    let policy = PolicyConfig {
+        authz_profiles: vec![AuthzProfile {
+            id: "permit".into(),
+            name: "Permit".into(),
+            effect: Effect::Accept,
+            attributes: vec![ReplyAttribute {
+                name: "Filter-Id".into(),
+                value: "staff-acl".into(),
+            }],
+            reply_message: None,
+        }],
+        default_profile: None,
+        policy_sets: one_set("permit"),
+    };
+    let addr = spawn_server_with_policy(policy).await;
+    let packet = create_access_request("testuser", "testpass", b"testing123", 8);
+    let response = send_radius_request(&packet, addr).await.expect("send");
+    assert_eq!(response.code, Code::AccessAccept);
+    let filter_id = response
+        .find_attribute(AttributeType::FilterId as u8)
+        .and_then(|a| a.as_string().ok());
+    assert_eq!(filter_id.as_deref(), Some("staff-acl"));
+}
+
+#[tokio::test]
+async fn test_empty_policy_does_not_change_accept() {
+    // An empty policy (no sets) must not affect the normal Access-Accept.
+    let addr = spawn_server_with_policy(PolicyConfig::default()).await;
+    let packet = create_access_request("testuser", "testpass", b"testing123", 9);
+    let response = send_radius_request(&packet, addr).await.expect("send");
+    assert_eq!(response.code, Code::AccessAccept);
 }
 
 #[tokio::test]
