@@ -11,4 +11,4 @@ resources:
 
 images:
   - name: ghcr.io/192d-wing/usg-radius-ui
-    newTag: "0.9.1"
+    newTag: "0.9.2"
