@@ -4,7 +4,7 @@
 
 [package]
 name = "radius-ui-bff"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Backend-for-frontend for the usg-radius operator UI: serves the Cloudscape SPA and aggregates the RADIUS server's health/metrics. Identity comes from oauth2-proxy headers."
