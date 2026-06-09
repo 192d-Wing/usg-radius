@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-06-09
+
+### Fixed
+
+- **BFF in-cluster calls no longer routed through an env HTTP proxy.** The
+  operator UI's BFF builds its reqwest client with `.no_proxy()`; a node/cluster
+  -injected `HTTP(S)_PROXY` (e.g. for registry pulls) was hijacking its in-cluster
+  requests to the server's health/metrics/management API, breaking the
+  status/clients/sessions/policy pages. Found during uk8w deployment.
+
+### Added
+
+- `deploy/ui` prepared for `0.9.x`: image bump, `RADIUS_API_URL` wired to the
+  server's management API, and an OIDC secret template + `.gitignore`.
+
 ## [0.9.0] - 2026-06-08
 
 ### Fixed - IPv4 clients rejected on a dual-stack listener

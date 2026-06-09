@@ -3,7 +3,7 @@ members = ["crates/radius-proto", "crates/radius-server"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 authors = ["John Edward Willman V <john.willman.1@us.af.mil>"]
 license = "Apache-2.0"
