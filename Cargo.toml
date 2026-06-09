@@ -18,7 +18,7 @@ hmac = "0.12"
 md5-digest = { package = "md-5", version = "0.10" }
 md5 = "0.8"
 rand = "0.9"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # TLS (for EAP-TLS, EAP-TTLS, PEAP)
 rustls = "0.23"
