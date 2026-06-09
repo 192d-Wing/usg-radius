@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-06-09
+
+### Changed
+
+- **Operator UI BFF now resolves DNS with the pure-Rust `hickory-dns` resolver**
+  instead of the system `getaddrinfo`. This is the durable fix for the dual-stack
+  Service issue (replacing the IPv4 pin from 0.9.2): musl's resolver mishandles a
+  dual-stack A+AAAA answer, breaking all BFF->server calls; hickory does not depend
+  on musl's resolver and handles dual-stack correctly.
+
 ## [0.9.2] - 2026-06-09
 
 ### Fixed
