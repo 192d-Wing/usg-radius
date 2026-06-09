@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-06-09
+
+### Fixed
+
+- **Operator UI: BFF management pages worked nowhere on a dual-stack cluster.** The
+  internal Service is dual-stack, so its DNS name returns both A and AAAA records;
+  the musl `reqwest` build mishandled the dual-stack answer and every BFF→server
+  call (status/clients/users/sessions/policy/health/metrics) failed, even though
+  both the v4 and v6 ClusterIPs were individually reachable. The BFF now binds its
+  HTTP client to an IPv4 local address to force IPv4. Diagnosed on uk8w.
+
 ## [0.9.1] - 2026-06-09
 
 ### Fixed

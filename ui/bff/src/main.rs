@@ -45,7 +45,13 @@ fn build_http_client() -> anyhow::Result<reqwest::Client> {
         // pod network). Never route those through an environment HTTP(S)_PROXY —
         // some clusters inject a node-level proxy (e.g. for registry pulls) that
         // would otherwise hijack and break these in-cluster requests.
-        .no_proxy();
+        .no_proxy()
+        // Force IPv4. The internal Service is dual-stack, so its DNS name returns
+        // both A and AAAA records; binding the client to an IPv4 local address
+        // makes it connect over IPv4 only. Without this, the musl reqwest build
+        // mishandles the dual-stack answer and every upstream call fails — even
+        // though both the v4 and v6 ClusterIPs are individually reachable.
+        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
     Ok(configure_mtls(builder)?.build()?)
 }
 
