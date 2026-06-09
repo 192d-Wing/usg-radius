@@ -25,17 +25,20 @@ spec:
           type: RuntimeDefault
       containers:
         - name: ui
-          image: ghcr.io/192d-wing/usg-radius-ui:0.8.0
+          image: ghcr.io/192d-wing/usg-radius-ui:0.9.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8088
               name: http
           env:
-            # The BFF reaches the radius server's internal (health/metrics) service.
+            # The BFF reaches the radius server's internal service for health,
+            # metrics, and the management API (clients/users/sessions/policy).
             - name: RADIUS_METRICS_URL
               value: "http://usg-radius-internal.radius.svc:3812"
             - name: RADIUS_HEALTH_URL
               value: "http://usg-radius-internal.radius.svc:2812"
+            - name: RADIUS_API_URL
+              value: "http://usg-radius-internal.radius.svc:4812"
           readinessProbe:
             httpGet:
               path: /healthz

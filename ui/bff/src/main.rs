@@ -39,7 +39,13 @@ fn env_or(key: &str, default: &str) -> String {
 /// default, keeping the musl build free of a TLS backend (terminate mTLS at the
 /// service mesh instead).
 fn build_http_client() -> anyhow::Result<reqwest::Client> {
-    let builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
+    let builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        // The BFF only ever calls in-cluster services (health/metrics/mgmt on the
+        // pod network). Never route those through an environment HTTP(S)_PROXY —
+        // some clusters inject a node-level proxy (e.g. for registry pulls) that
+        // would otherwise hijack and break these in-cluster requests.
+        .no_proxy();
     Ok(configure_mtls(builder)?.build()?)
 }
 
