@@ -1,0 +1,6 @@
+# Operator-provided secrets — never commit filled-in copies.
+radius-ui-oidc.secret.yaml
+radius-ui-tls.secret.yaml
+oopl-ca.secret.yaml
+*.secret.yaml
+!*.secret.example.yaml
