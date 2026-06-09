@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-08
+
 ### Fixed - IPv4 clients rejected on a dual-stack listener
 
 - When the server binds dual-stack (`listen_address: "::"`), IPv4 datagrams arrive
