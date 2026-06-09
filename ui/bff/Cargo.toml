@@ -4,7 +4,7 @@
 
 [package]
 name = "radius-ui-bff"
-version = "0.9.2"
+version = "0.9.3"
 edition = "2021"
 license = "Apache-2.0"
 description = "Backend-for-frontend for the usg-radius operator UI: serves the Cloudscape SPA and aggregates the RADIUS server's health/metrics. Identity comes from oauth2-proxy headers."
@@ -20,7 +20,12 @@ tower-http = { version = "0.6", features = ["fs", "trace"] }
 # HTTP only by default (in-cluster http://) — no TLS backend, keeps the musl build
 # free of aws-lc-sys/ring. The optional `mtls` feature adds a rustls TLS backend so
 # the BFF can present a client certificate to the mgmt API.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# `hickory-dns` replaces the system getaddrinfo with a pure-Rust async resolver, so
+# DNS doesn't depend on musl's resolver (which mishandles dual-stack A+AAAA answers).
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "hickory-dns",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
