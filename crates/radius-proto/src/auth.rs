@@ -13,7 +13,9 @@ pub fn generate_request_authenticator() -> [u8; 16] {
 ///
 /// Request Authenticator = MD5(Code + ID + Length + 16 zero octets + Attributes + Secret)
 ///
-/// This is used for Accounting-Request packets (Code 4).
+/// This is used for Accounting-Request packets (Code 4), and — by the same
+/// algorithm (RFC 5176 §3.4) — for Disconnect-Request (40) and CoA-Request (43).
+/// The function keys off `packet.code`, so it is correct for all of them.
 /// The authenticator field should be set to all zeros before calling this function.
 pub fn calculate_accounting_request_authenticator(packet: &Packet, secret: &[u8]) -> [u8; 16] {
     let mut data = Vec::new();
