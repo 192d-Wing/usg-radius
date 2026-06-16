@@ -553,8 +553,9 @@ async fn main() {
                     }
                 };
                 let server_config = Arc::new(server_config);
+                let registry = radius_server::coa::NasRegistry::new();
                 tokio::select! {
-                    res = radius_server::radsec::run(radsec_cfg, server_config) => {
+                    res = radius_server::radsec::run(radsec_cfg, server_config, registry) => {
                         if let Err(e) = res {
                             error!("RadSec listener error: {}", e);
                             process::exit(1);
