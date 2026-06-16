@@ -123,6 +123,17 @@ pub fn request_context(request: &Packet, username: &str) -> RequestContext {
         );
     }
 
+    // NAS-IPv6-Address (16-byte IPv6, RFC 3162). The fleet is IPv6-first, so an
+    // authenticator may identify itself by IPv6 with no IPv4 NAS-IP-Address.
+    if let Some(a) = request.find_attribute(AttributeType::NasIpv6Address as u8)
+        && let Ok(octets) = a.as_ipv6()
+    {
+        attrs.insert(
+            "NAS-IPv6-Address".into(),
+            std::net::Ipv6Addr::from(octets).to_string(),
+        );
+    }
+
     // Integer-coded attributes, mapped to the names the dictionary advertises.
     if let Some(n) = read_u32(request, AttributeType::NasPortType as u8) {
         attrs.insert("NAS-Port-Type".into(), nas_port_type_name(n));
@@ -229,6 +240,25 @@ mod tests {
         assert_eq!(
             ctx.attributes.get("Calling-Station-Id").unwrap(),
             "aa-bb-cc"
+        );
+    }
+
+    #[test]
+    fn context_extracts_nas_ipv6_address() {
+        // 2001:db8::1 in network byte order.
+        let mut octets = [0u8; 16];
+        octets[0] = 0x20;
+        octets[1] = 0x01;
+        octets[2] = 0x0d;
+        octets[3] = 0xb8;
+        octets[15] = 0x01;
+        let p = req(vec![
+            Attribute::new(AttributeType::NasIpv6Address as u8, octets.to_vec()).unwrap(),
+        ]);
+        let ctx = request_context(&p, "alice");
+        assert_eq!(
+            ctx.attributes.get("NAS-IPv6-Address").unwrap(),
+            "2001:db8::1"
         );
     }
 

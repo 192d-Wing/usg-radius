@@ -1145,9 +1145,14 @@ impl RadiusServer {
             }
         }
 
-        // RFC 2869: Validate Message-Authenticator if present
-        if let Some(_msg_auth_attr) =
-            request.find_attribute(AttributeType::MessageAuthenticator as u8)
+        // RFC 3579 §3.2 / RFC 5080 / "Blast-RADIUS" (CVE-2024-3596): an
+        // Access-Request that carries EAP-Message MUST also carry a valid
+        // Message-Authenticator. Verify it whenever present, and reject an
+        // EAP-bearing request that omits it — otherwise an attacker could strip
+        // the attribute to defeat the integrity check.
+        if request
+            .find_attribute(AttributeType::MessageAuthenticator as u8)
+            .is_some()
         {
             // Encode the packet to get raw bytes for verification
             let packet_bytes = request.encode()?;
@@ -1184,6 +1189,18 @@ impl RadiusServer {
                     "Message-Authenticator validated successfully"
                 );
             }
+        } else if request
+            .find_attribute(AttributeType::EapMessage as u8)
+            .is_some()
+        {
+            warn!(
+                client_ip = %source_ip,
+                request_id = request.identifier,
+                "Rejected EAP Access-Request without required Message-Authenticator (RFC 3579 / Blast-RADIUS)"
+            );
+            return Err(ServerError::Validation(
+                "EAP Access-Request missing required Message-Authenticator".to_string(),
+            ));
         }
 
         // Audit log authentication attempt
@@ -1738,5 +1755,95 @@ mod tests {
         assert!(handler.authenticate("testuser", "testpass"));
         assert!(!handler.authenticate("testuser", "wrongpass"));
         assert!(!handler.authenticate("wronguser", "testpass"));
+    }
+
+    // --- V-3: Message-Authenticator requirement on EAP Access-Requests ---
+
+    fn msgauth_test_config() -> Arc<ServerConfig> {
+        // Lenient validation so the packet-level validator doesn't pre-empt the
+        // handler's Message-Authenticator check we're exercising.
+        let config = Config {
+            strict_rfc_compliance: false,
+            ..Config::default()
+        };
+        let handler = Arc::new(SimpleAuthHandler::new());
+        Arc::new(ServerConfig::from_config(config, handler).unwrap())
+    }
+
+    fn access_request_bytes(attrs: Vec<Attribute>) -> Vec<u8> {
+        let mut p = Packet::new(Code::AccessRequest, 1, [0u8; 16]);
+        // RFC 2865 requires a NAS identifier on Access-Requests; add one so the
+        // packet validator passes and we reach the handler's checks.
+        p.add_attribute(Attribute::string(AttributeType::NasIdentifier as u8, "test-nas").unwrap());
+        for a in attrs {
+            p.add_attribute(a);
+        }
+        p.encode().unwrap()
+    }
+
+    async fn process(data: &[u8]) -> Result<Option<Vec<u8>>, ServerError> {
+        let cfg = msgauth_test_config();
+        RadiusServer::process_request(data, "10.0.0.1".parse().unwrap(), b"s3cret", &cfg).await
+    }
+
+    fn eap_identity_attr() -> Attribute {
+        // EAP-Response/Identity: code=2, id=1, len=6, type=1, data='a'.
+        Attribute::new(AttributeType::EapMessage as u8, vec![2, 1, 0, 6, 1, b'a']).unwrap()
+    }
+
+    #[tokio::test]
+    async fn eap_access_request_without_message_authenticator_is_rejected() {
+        let data = access_request_bytes(vec![
+            Attribute::string(AttributeType::UserName as u8, "alice").unwrap(),
+            eap_identity_attr(),
+        ]);
+        match process(&data).await {
+            Err(ServerError::Validation(m)) => {
+                assert!(
+                    m.contains("missing required Message-Authenticator"),
+                    "unexpected error: {m}"
+                );
+            }
+            other => panic!("expected Validation rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn eap_access_request_with_invalid_message_authenticator_is_rejected() {
+        let data = access_request_bytes(vec![
+            Attribute::string(AttributeType::UserName as u8, "alice").unwrap(),
+            eap_identity_attr(),
+            // All-zero Message-Authenticator can't match the real HMAC.
+            Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]).unwrap(),
+        ]);
+        match process(&data).await {
+            Err(ServerError::Validation(m)) => {
+                assert!(
+                    m.contains("Invalid Message-Authenticator"),
+                    "unexpected error: {m}"
+                );
+            }
+            other => panic!("expected Validation rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_eap_access_request_without_message_authenticator_is_not_rejected_for_it() {
+        // A PAP request (no EAP-Message) must NOT be forced to carry a
+        // Message-Authenticator — the requirement is scoped to EAP.
+        let data = access_request_bytes(vec![
+            Attribute::string(AttributeType::UserName as u8, "nobody").unwrap(),
+            Attribute::new(AttributeType::UserPassword as u8, vec![0u8; 16]).unwrap(),
+        ]);
+        // Unknown user → AuthFailed, but never the EAP/Message-Authenticator error.
+        match process(&data).await {
+            Err(ServerError::Validation(m)) => {
+                assert!(
+                    !m.contains("Message-Authenticator"),
+                    "non-EAP request wrongly rejected for Message-Authenticator: {m}"
+                );
+            }
+            _ => {} // any non-Validation outcome is fine for this scoping check
+        }
     }
 }

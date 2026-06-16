@@ -119,6 +119,10 @@ pub enum AttributeType {
     EapMessage = 79,
     /// Message-Authenticator (80) - RFC 2869
     MessageAuthenticator = 80,
+    /// NAS-IPv6-Address (95) - RFC 3162
+    /// The IPv6 address of the NAS, for IPv6-first deployments where the
+    /// authenticator has no IPv4 NAS-IP-Address to advertise.
+    NasIpv6Address = 95,
 }
 
 impl AttributeType {
@@ -181,6 +185,7 @@ impl AttributeType {
             63 => Some(AttributeType::LoginLatPort),
             79 => Some(AttributeType::EapMessage),
             80 => Some(AttributeType::MessageAuthenticator),
+            95 => Some(AttributeType::NasIpv6Address),
             _ => None,
         }
     }
