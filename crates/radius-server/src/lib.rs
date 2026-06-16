@@ -48,6 +48,7 @@ pub mod accounting;
 pub mod audit;
 pub mod buffer_pool;
 pub mod cache;
+pub mod coa;
 pub mod config;
 pub mod eap_auth;
 pub mod health;

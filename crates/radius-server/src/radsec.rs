@@ -16,15 +16,22 @@
 //!   §2.3 the RADIUS Authenticator/Message-Authenticator math uses the fixed
 //!   shared secret `"radsec"`; the real transport security is TLS.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use radius_proto::{
+    Code, Packet, calculate_accounting_request_authenticator, verify_response_authenticator,
+};
+use rustls::pki_types::CertificateDer;
 use rustls::version::TLS13;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
+use crate::coa::{CoaJob, NasRegistry};
 use crate::config::RadSecConfig;
 use crate::server::{RadiusServer, ServerConfig};
 
@@ -92,7 +99,11 @@ pub fn build_server_config(cfg: &RadSecConfig) -> Result<Arc<rustls::ServerConfi
 /// Run the RadSec listener until the process is shut down. Binds TCP and accepts
 /// one long-lived TLS connection per NAS, dispatching each framed RADIUS packet
 /// into the shared request pipeline.
-pub async fn run(cfg: RadSecConfig, server_config: Arc<ServerConfig>) -> Result<(), RadSecError> {
+pub async fn run(
+    cfg: RadSecConfig,
+    server_config: Arc<ServerConfig>,
+    registry: Arc<NasRegistry>,
+) -> Result<(), RadSecError> {
     let tls_config = build_server_config(&cfg)?;
     let acceptor = TlsAcceptor::from(tls_config);
 
@@ -105,7 +116,7 @@ pub async fn run(cfg: RadSecConfig, server_config: Arc<ServerConfig>) -> Result<
     let listener = TcpListener::bind(bind_addr).await?;
     info!("RadSec listening on {bind_addr} (RFC 6614, TLS 1.3, ML-KEM-1024-only, mTLS)");
 
-    serve(listener, acceptor, server_config).await
+    serve(listener, acceptor, server_config, registry).await
 }
 
 /// Accept loop over an already-bound listener. Split out from [`run`] so tests
@@ -114,13 +125,16 @@ async fn serve(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     server_config: Arc<ServerConfig>,
+    registry: Arc<NasRegistry>,
 ) -> Result<(), RadSecError> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let server_config = Arc::clone(&server_config);
+        let registry = Arc::clone(&registry);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, peer, acceptor, server_config).await {
+            if let Err(e) = handle_connection(stream, peer, acceptor, server_config, registry).await
+            {
                 debug!("RadSec connection from {peer} ended: {e}");
             }
         });
@@ -128,17 +142,21 @@ async fn serve(
 }
 
 /// Terminate TLS for one NAS connection, enforce the FIPS/PQ allow-list, then
-/// serve framed RADIUS packets over the tunnel until it closes.
+/// serve the connection bidirectionally: inbound NAS requests are processed and
+/// answered, while server-originated CoA/Disconnect requests (submitted via the
+/// [`NasRegistry`]) are written out and their ACK/NAK routed back to the caller.
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
     acceptor: TlsAcceptor,
     server_config: Arc<ServerConfig>,
+    registry: Arc<NasRegistry>,
 ) -> Result<(), RadSecError> {
-    let mut tls = acceptor.accept(stream).await?;
+    let tls = acceptor.accept(stream).await?;
 
     // Fail closed on anything outside the allow-list, and require the client cert.
-    {
+    // The cert CN is this NAS's authenticated identity — the CoA registry key.
+    let nas_id = {
         let (_, conn) = tls.get_ref();
         usg_fips_tls::params::enforce_fips_parameters(
             conn.protocol_version(),
@@ -147,52 +165,201 @@ async fn handle_connection(
         )
         .map_err(RadSecError::DisallowedParameters)?;
 
-        if conn.peer_certificates().is_none_or(<[_]>::is_empty) {
-            return Err(RadSecError::NoClientCert);
-        }
-    }
+        let leaf = conn
+            .peer_certificates()
+            .and_then(<[_]>::first)
+            .ok_or(RadSecError::NoClientCert)?;
+        nas_identity(leaf, peer)
+    };
 
     let peer_ip = peer.ip();
-    debug!("RadSec connection established from {peer} (mTLS verified)");
+    debug!("RadSec connection from {peer} established as NAS '{nas_id}' (mTLS verified)");
 
-    // NOTE: unlike the UDP path, RadSec does not yet apply per-source rate
-    // limiting — admission is gated by the mTLS handshake (a valid NAS client
-    // cert) and its cost. Per-connection / per-identity rate limiting is a
-    // follow-up if a trusted NAS is ever a flooding concern.
+    // NOTE: unlike the UDP path, RadSec does not apply per-source rate limiting —
+    // admission is gated by the mTLS handshake (a valid NAS client cert).
+
+    let (mut rd, mut wr) = tokio::io::split(tls);
+
+    // Channel for server-originated CoA/Disconnect jobs; registered under the NAS
+    // identity so a trigger can reach this connection. The guard deregisters on
+    // return (connection close).
+    let (coa_tx, mut coa_rx) = tokio::sync::mpsc::channel::<CoaJob>(32);
+    let _guard = registry.register(nas_id, coa_tx);
+
+    // Outstanding server-originated requests, keyed by RADIUS Identifier.
+    let mut pending: HashMap<u8, Pending> = HashMap::new();
+    let mut next_id: u8 = 0;
+
+    // Accumulating read buffer: `read_buf` is cancel-safe in `select!` (unlike
+    // `read_exact`), so a CoA job firing mid-read never corrupts the stream.
+    let mut buf: Vec<u8> = Vec::with_capacity(RADIUS_MAX_LEN);
 
     loop {
-        // Read the fixed RADIUS header, then the remainder per the Length field.
-        let mut header = [0u8; RADIUS_HEADER_LEN];
-        match tls.read_exact(&mut header).await {
-            Ok(_) => {}
-            // Clean connection close between packets.
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
+        // Drain every complete frame already buffered before awaiting more I/O.
+        while let Some(frame) = take_frame(&mut buf)? {
+            dispatch_inbound(&frame, peer_ip, &server_config, &mut wr, &mut pending).await?;
         }
 
-        let length = u16::from_be_bytes([header[2], header[3]]) as usize;
-        if !(RADIUS_MIN_LEN..=RADIUS_MAX_LEN).contains(&length) {
-            return Err(RadSecError::BadRadiusLength(length));
-        }
-
-        let mut packet = vec![0u8; length];
-        packet[..RADIUS_HEADER_LEN].copy_from_slice(&header);
-        tls.read_exact(&mut packet[RADIUS_HEADER_LEN..]).await?;
-
-        match RadiusServer::process_request(&packet, peer_ip, RADSEC_SECRET, &server_config).await {
-            Ok(Some(response)) => {
-                tls.write_all(&response).await?;
-                tls.flush().await?;
+        tokio::select! {
+            read = rd.read_buf(&mut buf) => {
+                if read? == 0 {
+                    break; // clean EOF
+                }
             }
-            // No reply warranted (e.g. unsupported packet type); keep the tunnel open.
-            Ok(None) => {}
-            // A bad request drops this packet but not the connection — a transient
-            // malformed frame from one NAS shouldn't tear down its session.
-            Err(e) => warn!("RadSec request from {peer} rejected: {e}"),
+            Some(job) = coa_rx.recv() => {
+                send_coa(job, &mut wr, &mut pending, &mut next_id).await?;
+            }
         }
     }
 
     Ok(())
+}
+
+/// Pull one complete RADIUS frame off the front of `buf` (delimited by the
+/// `Length` header field), or `None` if a full frame isn't buffered yet.
+fn take_frame(buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>, RadSecError> {
+    if buf.len() < RADIUS_HEADER_LEN {
+        return Ok(None);
+    }
+    let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    if !(RADIUS_MIN_LEN..=RADIUS_MAX_LEN).contains(&length) {
+        return Err(RadSecError::BadRadiusLength(length));
+    }
+    if buf.len() < length {
+        return Ok(None);
+    }
+    Ok(Some(buf.drain(..length).collect()))
+}
+
+/// A server-originated request awaiting its ACK/NAK: where to deliver the reply,
+/// and the Request Authenticator needed to verify the response (RFC 5176 §3.5).
+struct Pending {
+    reply: oneshot::Sender<Packet>,
+    request_authenticator: [u8; 16],
+}
+
+/// Route one inbound frame: a CoA/Disconnect ACK/NAK with a valid Response
+/// Authenticator resolves the matching pending request; anything else goes through
+/// the normal request pipeline and its response (if any) is written back.
+async fn dispatch_inbound(
+    frame: &[u8],
+    peer_ip: IpAddr,
+    server_config: &Arc<ServerConfig>,
+    wr: &mut (impl AsyncWriteExt + Unpin),
+    pending: &mut HashMap<u8, Pending>,
+) -> Result<(), RadSecError> {
+    let code = frame.first().copied().and_then(Code::from_u8);
+    if matches!(
+        code,
+        Some(Code::CoaAck | Code::CoaNak | Code::DisconnectAck | Code::DisconnectNak)
+    ) {
+        let id = frame[1]; // take_frame guarantees len >= 20
+        match Packet::decode(frame) {
+            Ok(packet) => {
+                // Verify the Response Authenticator before trusting the reply, even
+                // over TLS — a buggy/misconfigured NAS must not be believed. A bad
+                // packet is ignored (the request stays pending) so a single stray
+                // frame can't fail an otherwise-valid in-flight request.
+                match pending.get(&id).map(|p| {
+                    verify_response_authenticator(&packet, &p.request_authenticator, RADSEC_SECRET)
+                }) {
+                    Some(true) => {
+                        if let Some(p) = pending.remove(&id) {
+                            let _ = p.reply.send(packet);
+                        }
+                    }
+                    Some(false) => warn!(
+                        "RadSec: {code:?} (id {id}) failed the Response Authenticator; ignoring"
+                    ),
+                    None => {
+                        debug!("RadSec: unsolicited {code:?} (id {id}) with no pending request");
+                    }
+                }
+            }
+            Err(e) => warn!("RadSec: failed to decode {code:?}: {e}"),
+        }
+        return Ok(());
+    }
+
+    match RadiusServer::process_request(frame, peer_ip, RADSEC_SECRET, server_config).await {
+        Ok(Some(response)) => {
+            wr.write_all(&response).await?;
+            wr.flush().await?;
+        }
+        Ok(None) => {}
+        Err(e) => warn!("RadSec request rejected: {e}"),
+    }
+    Ok(())
+}
+
+/// Write a server-originated CoA/Disconnect request: allocate a free Identifier,
+/// compute the Request Authenticator (RFC 5176 §3.4), register the reply waiter,
+/// and send it.
+async fn send_coa(
+    job: CoaJob,
+    wr: &mut (impl AsyncWriteExt + Unpin),
+    pending: &mut HashMap<u8, Pending>,
+    next_id: &mut u8,
+) -> Result<(), RadSecError> {
+    let Some(id) = alloc_identifier(pending, next_id) else {
+        // 256 requests already in flight; drop the job (caller sees ConnectionClosed).
+        warn!("RadSec: no free Identifier for CoA/Disconnect; dropping request");
+        return Ok(());
+    };
+
+    let mut request = job.request;
+    request.identifier = id;
+    request.authenticator = [0u8; 16];
+    request.authenticator = calculate_accounting_request_authenticator(&request, RADSEC_SECRET);
+
+    match request.encode() {
+        Ok(bytes) => {
+            pending.insert(
+                id,
+                Pending {
+                    reply: job.reply,
+                    request_authenticator: request.authenticator,
+                },
+            );
+            wr.write_all(&bytes).await?;
+            wr.flush().await?;
+        }
+        // Drop the reply sender; the caller's await resolves to ConnectionClosed.
+        Err(e) => warn!("RadSec: failed to encode CoA/Disconnect request: {e}"),
+    }
+    Ok(())
+}
+
+/// Find a RADIUS Identifier not currently outstanding, or `None` if all 256 are.
+/// First reclaims slots whose caller has given up (timed out → receiver dropped),
+/// so a stream of timed-out requests can't permanently exhaust the Identifier space.
+fn alloc_identifier(pending: &mut HashMap<u8, Pending>, next_id: &mut u8) -> Option<u8> {
+    pending.retain(|_, p| !p.reply.is_closed());
+    for _ in 0..=u8::MAX {
+        let id = *next_id;
+        *next_id = next_id.wrapping_add(1);
+        if !pending.contains_key(&id) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// The NAS's authenticated identity for the CoA registry: its client-cert Common
+/// Name, falling back to the peer IP when the cert carries no CN.
+fn nas_identity(der: &CertificateDer<'_>, peer: SocketAddr) -> String {
+    use x509_parser::prelude::*;
+
+    if let Ok((_, cert)) = X509Certificate::from_der(der.as_ref())
+        && let Some(cn) = cert
+            .subject()
+            .iter_common_name()
+            .next()
+            .and_then(|a| a.as_str().ok())
+    {
+        return cn.to_string();
+    }
+    format!("peer:{}", peer.ip())
 }
 
 #[cfg(test)]
@@ -269,7 +436,9 @@ mod tests {
     /// Write the server cert/key + CA to temp files and start `serve` on an
     /// ephemeral loopback port. Returns the bound address (and keeps the temp
     /// dir alive for the test's duration).
-    async fn start_listener(chain: &TestChain) -> (SocketAddr, tempfile::TempDir) {
+    async fn start_listener(
+        chain: &TestChain,
+    ) -> (SocketAddr, Arc<NasRegistry>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let write = |name: &str, data: &str| {
             let path = dir.path().join(name);
@@ -290,10 +459,12 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_config = test_server_config();
+        let registry = NasRegistry::new();
+        let reg = Arc::clone(&registry);
         tokio::spawn(async move {
-            let _ = serve(listener, acceptor, server_config).await;
+            let _ = serve(listener, acceptor, server_config, reg).await;
         });
-        (addr, dir)
+        (addr, registry, dir)
     }
 
     /// Client config pinned to the given kx-group provider, with the NAS client
@@ -324,7 +495,7 @@ mod tests {
     #[tokio::test]
     async fn mlkem_handshake_round_trip() {
         let chain = gen_chain();
-        let (addr, _dir) = start_listener(&chain).await;
+        let (addr, _registry, _dir) = start_listener(&chain).await;
 
         // Client offers the same ML-KEM-1024-only provider the server requires.
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config(
@@ -354,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn non_mlkem_client_fails_closed() {
         let chain = gen_chain();
-        let (addr, _dir) = start_listener(&chain).await;
+        let (addr, _registry, _dir) = start_listener(&chain).await;
 
         // Client offering only classical X25519 — no group in common with the
         // ML-KEM-1024-only server, so the handshake must fail closed.
@@ -372,5 +543,160 @@ mod tests {
             result.is_err(),
             "a non-ML-KEM client must not complete the RadSec handshake"
         );
+    }
+
+    #[tokio::test]
+    async fn coa_disconnect_round_trip() {
+        use radius_proto::calculate_response_authenticator;
+
+        // gen_chain's client cert CN is "switch-eth0" — the registry key.
+        let chain = gen_chain();
+        let (addr, registry, _dir) = start_listener(&chain).await;
+
+        // Connect as the NAS over ML-KEM mTLS.
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config(
+            &chain,
+            usg_fips_tls::provider::fips_provider(),
+        )));
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut tls = connector
+            .connect(ServerName::try_from("localhost").unwrap(), stream)
+            .await
+            .unwrap();
+
+        // NAS side: receive one Disconnect-Request and answer Disconnect-ACK.
+        let nas = tokio::spawn(async move {
+            let mut header = [0u8; RADIUS_HEADER_LEN];
+            tls.read_exact(&mut header).await.unwrap();
+            let length = u16::from_be_bytes([header[2], header[3]]) as usize;
+            let mut frame = vec![0u8; length];
+            frame[..RADIUS_HEADER_LEN].copy_from_slice(&header);
+            tls.read_exact(&mut frame[RADIUS_HEADER_LEN..])
+                .await
+                .unwrap();
+
+            let req = Packet::decode(&frame).unwrap();
+            assert_eq!(req.code, Code::DisconnectRequest);
+            assert!(
+                req.find_attribute(radius_proto::AttributeType::AcctSessionId as u8)
+                    .is_some(),
+                "Disconnect-Request should carry the session key"
+            );
+
+            let mut ack = Packet::new(Code::DisconnectAck, req.identifier, [0u8; 16]);
+            ack.authenticator =
+                calculate_response_authenticator(&ack, &req.authenticator, RADSEC_SECRET);
+            tls.write_all(&ack.encode().unwrap()).await.unwrap();
+            tls.flush().await.unwrap();
+            // Hold the connection open long enough for the server to read the ACK.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+
+        // Wait for the server to register the connection under the cert CN.
+        let mut registered = false;
+        for _ in 0..200 {
+            if registry.connected().iter().any(|n| n == "switch-eth0") {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(registered, "NAS did not register under its cert CN");
+
+        // Originate the Disconnect over the existing connection; expect the ACK.
+        let session = crate::coa::SessionKey {
+            acct_session_id: Some("sess-1".into()),
+            calling_station_id: Some("AA-BB-CC-DD-EE-FF".into()),
+            nas_port_id: Some("Ethernet0".into()),
+        };
+        let reply = registry
+            .send(
+                "switch-eth0",
+                crate::coa::disconnect_request(&session),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("expected a Disconnect-ACK");
+        assert_eq!(reply.code, Code::DisconnectAck);
+
+        nas.await.unwrap();
+
+        // A request to an unknown NAS fails fast.
+        let err = registry
+            .send(
+                "no-such-nas",
+                crate::coa::disconnect_request(&session),
+                std::time::Duration::from_millis(200),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::coa::CoaError::NasNotConnected(_)));
+    }
+
+    #[tokio::test]
+    async fn coa_reply_with_bad_authenticator_is_rejected() {
+        let chain = gen_chain();
+        let (addr, registry, _dir) = start_listener(&chain).await;
+
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config(
+            &chain,
+            usg_fips_tls::provider::fips_provider(),
+        )));
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut tls = connector
+            .connect(ServerName::try_from("localhost").unwrap(), stream)
+            .await
+            .unwrap();
+
+        // NAS answers with a forged/garbage Response Authenticator.
+        let nas = tokio::spawn(async move {
+            let mut header = [0u8; RADIUS_HEADER_LEN];
+            tls.read_exact(&mut header).await.unwrap();
+            let length = u16::from_be_bytes([header[2], header[3]]) as usize;
+            let mut frame = vec![0u8; length];
+            frame[..RADIUS_HEADER_LEN].copy_from_slice(&header);
+            tls.read_exact(&mut frame[RADIUS_HEADER_LEN..])
+                .await
+                .unwrap();
+            let req = Packet::decode(&frame).unwrap();
+
+            let mut ack = Packet::new(Code::DisconnectAck, req.identifier, [0xFFu8; 16]);
+            ack.authenticator = [0xFFu8; 16]; // not the real HMAC
+            tls.write_all(&ack.encode().unwrap()).await.unwrap();
+            tls.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+
+        for _ in 0..200 {
+            if registry.connected().iter().any(|n| n == "switch-eth0") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // The forged ACK is dropped, so the caller never gets a reply → times out.
+        let session = crate::coa::SessionKey {
+            acct_session_id: Some("sess-1".into()),
+            ..Default::default()
+        };
+        // Either way the forged ACK was NOT delivered as success: the caller times
+        // out, or sees the connection close — never a delivered Disconnect-ACK.
+        let err = registry
+            .send(
+                "switch-eth0",
+                crate::coa::disconnect_request(&session),
+                std::time::Duration::from_millis(400),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::coa::CoaError::Timeout | crate::coa::CoaError::ConnectionClosed
+            ),
+            "forged ACK must not be delivered as success, got {err:?}"
+        );
+
+        nas.await.unwrap();
     }
 }
