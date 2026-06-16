@@ -54,5 +54,13 @@
   "rate_limit_per_client_rps": 100,
   "rate_limit_per_client_burst": 200,
   "rate_limit_global_rps": 1000,
-  "rate_limit_global_burst": 2000
+  "rate_limit_global_burst": 2000,
+  "transport": "udp-insecure",
+  "radsec": {
+    "listen_address": "::",
+    "listen_port": 2083,
+    "cert_path": "/etc/radius/radsec/server.pem",
+    "key_path": "/etc/radius/radsec/server.key",
+    "client_ca_path": "/etc/radius/radsec/nas-ca.pem"
+  }
 }

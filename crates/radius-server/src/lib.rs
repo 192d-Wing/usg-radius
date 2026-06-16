@@ -58,9 +58,13 @@ pub mod policy;
 pub mod policy_enforce;
 pub mod postgres_auth;
 pub mod proxy;
+#[cfg(feature = "tls")]
+pub mod radsec;
 pub mod ratelimit;
 pub mod server;
 pub mod state;
+#[cfg(feature = "tls")]
+pub mod tls_certs;
 
 pub use access::{
     AccessContext, AccessDecision, AccessPolicy, ConditionEntry, ConditionOp,

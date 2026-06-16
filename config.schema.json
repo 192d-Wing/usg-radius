@@ -183,6 +183,47 @@
       "minimum": 0,
       "maximum": 200000,
       "examples": [2000, 10000, 20000]
+    },
+    "transport": {
+      "type": "string",
+      "description": "RADIUS transport. 'radsec' is RADIUS over mutually-authenticated TLS 1.3 with ML-KEM-1024-only key exchange (RFC 6614, FIPS 203) and is the FIPS-posture default for config files; 'udp-insecure' is plain UDP with a per-client shared secret — not FIPS-approved and spoofable, for development only",
+      "enum": ["radsec", "udp-insecure"],
+      "default": "radsec",
+      "examples": ["radsec", "udp-insecure"]
+    },
+    "radsec": {
+      "type": "object",
+      "description": "RadSec listener settings. Required when transport is 'radsec'. The listener terminates TLS 1.3 and requires a NAS client certificate (mTLS)",
+      "required": ["cert_path", "key_path", "client_ca_path"],
+      "properties": {
+        "listen_address": {
+          "type": "string",
+          "description": "IP address the RadSec listener binds to. Use :: for dual-stack",
+          "default": "::",
+          "examples": ["::", "0.0.0.0", "127.0.0.1"]
+        },
+        "listen_port": {
+          "type": "integer",
+          "description": "TCP port for RadSec. IANA-assigned RadSec port is 2083",
+          "default": 2083,
+          "minimum": 1,
+          "maximum": 65535,
+          "examples": [2083]
+        },
+        "cert_path": {
+          "type": "string",
+          "description": "Path to the server certificate chain (PEM, leaf first) presented to the NAS"
+        },
+        "key_path": {
+          "type": "string",
+          "description": "Path to the server private key (PEM)"
+        },
+        "client_ca_path": {
+          "type": "string",
+          "description": "Path to the CA bundle (PEM) used to verify NAS client certificates (mTLS)"
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false,

@@ -468,14 +468,9 @@ async fn main() {
         info!("Audit logging enabled: {}", path);
     }
 
-    // Create and run server
-    let server = match RadiusServer::new(server_config).await {
-        Ok(srv) => srv,
-        Err(e) => {
-            error!("Failed to create server: {}", e);
-            process::exit(1);
-        }
-    };
+    // The RADIUS server is created per-transport below (UDP binds a socket here;
+    // RadSec terminates TLS in its own listener). `server_config` is moved into
+    // whichever transport is selected.
 
     // Start health-check + metrics HTTP servers and connect the state backend.
     // Kubernetes liveness/readiness probes depend on the health endpoints; with
@@ -517,15 +512,65 @@ async fn main() {
         }
     };
 
-    tokio::select! {
-        res = server.run() => {
-            if let Err(e) = res {
-                error!("Server error: {}", e);
-                process::exit(1);
+    // Select the transport per the SERVER-CONTRACT (G-1): RadSec is the locked,
+    // FIPS-posture transport; plain UDP is a transitional, non-FIPS fallback.
+    match config.transport {
+        radius_server::config::Transport::UdpInsecure => {
+            warn!(
+                "transport = \"udp-insecure\": plain UDP RADIUS is NOT FIPS-approved \
+                 and is spoofable — use RadSec (transport = \"radsec\") in production"
+            );
+            let server = match RadiusServer::new(server_config).await {
+                Ok(srv) => srv,
+                Err(e) => {
+                    error!("Failed to create server: {}", e);
+                    process::exit(1);
+                }
+            };
+            tokio::select! {
+                res = server.run() => {
+                    if let Err(e) = res {
+                        error!("Server error: {}", e);
+                        process::exit(1);
+                    }
+                }
+                _ = shutdown => {
+                    info!("Graceful shutdown complete");
+                }
             }
         }
-        _ = shutdown => {
-            info!("Graceful shutdown complete");
+        radius_server::config::Transport::Radsec => {
+            #[cfg(feature = "tls")]
+            {
+                let radsec_cfg = match config.radsec.clone() {
+                    Some(c) => c,
+                    None => {
+                        error!(
+                            "transport = \"radsec\" but no `radsec` config block was provided \
+                             (needs cert_path, key_path, client_ca_path)"
+                        );
+                        process::exit(1);
+                    }
+                };
+                let server_config = Arc::new(server_config);
+                tokio::select! {
+                    res = radius_server::radsec::run(radsec_cfg, server_config) => {
+                        if let Err(e) = res {
+                            error!("RadSec listener error: {}", e);
+                            process::exit(1);
+                        }
+                    }
+                    _ = shutdown => {
+                        info!("Graceful shutdown complete");
+                    }
+                }
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                let _ = server_config;
+                error!("transport = \"radsec\" requires building with the `tls` feature");
+                process::exit(1);
+            }
         }
     }
 }

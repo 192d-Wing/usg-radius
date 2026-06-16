@@ -33,6 +33,9 @@ pbkdf2.workspace = true
 sha2.workspace = true
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
+# Canonical FIPS/PQ crypto core: the ML-KEM-1024-only TLS 1.3 provider and the
+# fail-closed negotiated-parameter allow-list shared with the 802.1X supplicant.
+usg-fips-tls = { version = "0.1", optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 x509-parser = { workspace = true, optional = true }
@@ -48,6 +51,8 @@ tower-http = { workspace = true, optional = true }
 [dev-dependencies]
 hex.workspace = true
 tempfile.workspace = true
+# RadSec handshake tests: generate a throwaway CA + server/client cert chain.
+rcgen = "0.13"
 
 [features]
 default = ["observability", "tls"]
@@ -55,6 +60,7 @@ tls = [
     "radius-proto/tls",
     "dep:rustls",
     "dep:tokio-rustls",
+    "dep:usg-fips-tls",
     "dep:hyper",
     "dep:hyper-util",
     "dep:x509-parser",

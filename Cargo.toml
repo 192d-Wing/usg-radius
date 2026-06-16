@@ -24,7 +24,9 @@ sha2 = "0.10"
 rustls = "0.23"
 x509-parser = "0.18"
 # `std` enables the PEM reader API (replaces the unmaintained rustls-pemfile).
-pki-types = { package = "rustls-pki-types", version = "1.12", features = ["std"] }
+pki-types = { package = "rustls-pki-types", version = "1.14", features = [
+    "std",
+] }
 
 # Error handling
 thiserror = "2.0"
@@ -41,13 +43,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 ipnetwork = "0.21"
 
 # Caching and concurrency
-dashmap = "6.1"
+dashmap = "6.2"
 
 # Async traits
 async-trait = "0.1"
 
 # Regular expressions
-regex = "1.10"
+regex = "1.12"
 
 # Time
 chrono = "0.4"
@@ -75,7 +77,7 @@ hyper-util = { version = "0.1", features = [
 ] }
 
 # CLI
-clap = { version = "4.5", features = ["derive", "cargo"] }
+clap = { version = "4.6", features = ["derive", "cargo"] }
 
 # LDAP
 ldap3 = "0.12"
@@ -95,7 +97,7 @@ pbkdf2 = { version = "0.12", features = ["simple"] }
 
 # Development
 hex = "0.4"
-tempfile = "3.24"
+tempfile = "3.27"
 criterion = "0.8"
 base64 = "0.22"
 
