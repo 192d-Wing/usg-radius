@@ -72,6 +72,7 @@ async fn start_observability(
     policy: Arc<std::sync::RwLock<radius_server::PolicyConfig>>,
     policy_file: Option<Arc<str>>,
     accounting: Arc<dyn radius_server::AccountingHandler>,
+    coa_registry: Arc<radius_server::coa::NasRegistry>,
 ) {
     use radius_server::state::{MemoryStateBackend, SharedSessionManager};
     use std::env;
@@ -139,6 +140,7 @@ async fn start_observability(
                     policy_file,
                     security,
                     Some(accounting),
+                    coa_registry,
                     addr,
                 )
                 .await
@@ -476,12 +478,18 @@ async fn main() {
     // Kubernetes liveness/readiness probes depend on the health endpoints; with
     // externalTrafficPolicy: Local the readiness state gates whether Cilium
     // advertises the anycast VIP from this node.
+    // Shared registry of live RadSec connections, for server-originated
+    // CoA/Disconnect (RFC 5176): the RadSec listener registers connections, the
+    // management API originates requests against them.
+    let coa_registry = radius_server::coa::NasRegistry::new();
+
     #[cfg(feature = "observability")]
     start_observability(
         &config,
         Arc::clone(&policy),
         policy_file,
         accounting.clone(),
+        Arc::clone(&coa_registry),
     )
     .await;
     #[cfg(not(feature = "observability"))]
@@ -553,9 +561,8 @@ async fn main() {
                     }
                 };
                 let server_config = Arc::new(server_config);
-                let registry = radius_server::coa::NasRegistry::new();
                 tokio::select! {
-                    res = radius_server::radsec::run(radsec_cfg, server_config, registry) => {
+                    res = radius_server::radsec::run(radsec_cfg, server_config, coa_registry) => {
                         if let Err(e) = res {
                             error!("RadSec listener error: {}", e);
                             process::exit(1);

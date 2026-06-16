@@ -131,8 +131,7 @@ async fn serve(
         let server_config = Arc::clone(&server_config);
         let registry = Arc::clone(&registry);
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(stream, peer, acceptor, server_config, registry).await
+            if let Err(e) = handle_connection(stream, peer, acceptor, server_config, registry).await
             {
                 debug!("RadSec connection from {peer} ended: {e}");
             }
@@ -303,7 +302,10 @@ async fn send_coa(
 }
 
 /// Find a RADIUS Identifier not currently outstanding, or `None` if all 256 are.
-fn alloc_identifier(pending: &HashMap<u8, oneshot::Sender<Packet>>, next_id: &mut u8) -> Option<u8> {
+fn alloc_identifier(
+    pending: &HashMap<u8, oneshot::Sender<Packet>>,
+    next_id: &mut u8,
+) -> Option<u8> {
     for _ in 0..=u8::MAX {
         let id = *next_id;
         *next_id = next_id.wrapping_add(1);
@@ -405,7 +407,9 @@ mod tests {
     /// Write the server cert/key + CA to temp files and start `serve` on an
     /// ephemeral loopback port. Returns the bound address (and keeps the temp
     /// dir alive for the test's duration).
-    async fn start_listener(chain: &TestChain) -> (SocketAddr, Arc<NasRegistry>, tempfile::TempDir) {
+    async fn start_listener(
+        chain: &TestChain,
+    ) -> (SocketAddr, Arc<NasRegistry>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let write = |name: &str, data: &str| {
             let path = dir.path().join(name);
@@ -538,12 +542,15 @@ mod tests {
             let length = u16::from_be_bytes([header[2], header[3]]) as usize;
             let mut frame = vec![0u8; length];
             frame[..RADIUS_HEADER_LEN].copy_from_slice(&header);
-            tls.read_exact(&mut frame[RADIUS_HEADER_LEN..]).await.unwrap();
+            tls.read_exact(&mut frame[RADIUS_HEADER_LEN..])
+                .await
+                .unwrap();
 
             let req = Packet::decode(&frame).unwrap();
             assert_eq!(req.code, Code::DisconnectRequest);
             assert!(
-                req.find_attribute(radius_proto::AttributeType::AcctSessionId as u8).is_some(),
+                req.find_attribute(radius_proto::AttributeType::AcctSessionId as u8)
+                    .is_some(),
                 "Disconnect-Request should carry the session key"
             );
 

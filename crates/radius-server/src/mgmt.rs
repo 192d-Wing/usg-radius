@@ -123,6 +123,8 @@ pub struct MgmtState {
     /// Live accounting sessions, shared with the request path. `None` ⇒ the
     /// `sessions` endpoint returns an empty list.
     accounting: Option<Arc<dyn AccountingHandler>>,
+    /// Live RadSec connections, for originating CoA/Disconnect (RFC 5176).
+    coa_registry: Arc<crate::coa::NasRegistry>,
     started: Instant,
 }
 
@@ -135,6 +137,7 @@ impl MgmtState {
         policy_file: Option<Arc<str>>,
         security: MgmtSecurity,
         accounting: Option<Arc<dyn AccountingHandler>>,
+        coa_registry: Arc<crate::coa::NasRegistry>,
     ) -> Self {
         Self {
             config,
@@ -143,6 +146,7 @@ impl MgmtState {
             policy_file,
             security,
             accounting,
+            coa_registry,
             started: Instant::now(),
         }
     }
@@ -355,6 +359,7 @@ fn route_action(method: &Method, path: &str) -> Option<(&'static str, &'static s
         (&M::POST, "/api/v1/policy/dry-run") => {
             Some(("radius:SimulatePolicy", "arn:usgradius:mgmt:::policy"))
         }
+        (&M::POST, "/api/v1/coa") => Some(("radius:SendCoA", "arn:usgradius:mgmt:::coa")),
         _ => None,
     }
 }
@@ -489,6 +494,7 @@ pub fn create_mgmt_server(
     policy_file: Option<Arc<str>>,
     security: MgmtSecurity,
     accounting: Option<Arc<dyn AccountingHandler>>,
+    coa_registry: Arc<crate::coa::NasRegistry>,
 ) -> Router {
     let enforce = security.access_policy.is_some();
     let state = MgmtState::new(
@@ -498,6 +504,7 @@ pub fn create_mgmt_server(
         policy_file,
         security,
         accounting,
+        coa_registry,
     );
     let mut app = Router::new()
         .route("/api/v1/status", get(status))
@@ -506,11 +513,118 @@ pub fn create_mgmt_server(
         .route("/api/v1/sessions", get(sessions))
         .route("/api/v1/policy", get(policy).put(policy_put))
         .route("/api/v1/dictionary", get(dictionary_handler))
-        .route("/api/v1/policy/dry-run", post(policy_dry_run));
+        .route("/api/v1/policy/dry-run", post(policy_dry_run))
+        .route("/api/v1/coa", post(coa));
     if enforce {
         app = app.layer(middleware::from_fn_with_state(state.clone(), authorize));
     }
     app.layer(TraceLayer::new_for_http()).with_state(state)
+}
+
+/// What to do to the targeted session.
+#[cfg(feature = "observability")]
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CoaAction {
+    /// Terminate the session (Disconnect-Request).
+    Disconnect,
+    /// Change authorization in place (CoA-Request).
+    Coa,
+}
+
+/// `POST /api/v1/coa` body: which NAS, which session, and what to do.
+#[cfg(feature = "observability")]
+#[derive(Deserialize)]
+struct CoaBody {
+    /// NAS identity — its RadSec client-cert Common Name.
+    nas: String,
+    action: CoaAction,
+    /// Session-identifying attributes (RFC 5176 §2.3); at least one should be set.
+    #[serde(default)]
+    acct_session_id: Option<String>,
+    #[serde(default)]
+    calling_station_id: Option<String>,
+    #[serde(default)]
+    nas_port_id: Option<String>,
+    /// For `action = "coa"`: authorization changes to apply, named like policy
+    /// reply attributes (e.g. `Filter-Id`, `Tunnel-Private-Group-ID`).
+    #[serde(default)]
+    changes: Vec<crate::policy::ReplyAttribute>,
+}
+
+/// `POST /api/v1/coa` result.
+#[cfg(feature = "observability")]
+#[derive(Serialize)]
+struct CoaResult {
+    /// `"ack"` or `"nak"`.
+    result: &'static str,
+    /// The RADIUS response code (41/44 = ACK, 42/45 = NAK).
+    code: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_cause: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_cause_name: Option<String>,
+}
+
+/// Originate an RFC 5176 CoA/Disconnect to a connected NAS over its RadSec link
+/// and report the NAS's ACK/NAK. 404 if the NAS isn't connected, 504 on timeout.
+#[cfg(feature = "observability")]
+async fn coa(State(st): State<MgmtState>, Json(body): Json<CoaBody>) -> Response {
+    use radius_proto::{AttributeType, Code, ErrorCause};
+
+    let session = crate::coa::SessionKey {
+        acct_session_id: body.acct_session_id,
+        calling_station_id: body.calling_station_id,
+        nas_port_id: body.nas_port_id,
+    };
+    let request = match body.action {
+        CoaAction::Disconnect => crate::coa::disconnect_request(&session),
+        CoaAction::Coa => {
+            let changes = body
+                .changes
+                .iter()
+                .filter_map(crate::policy_enforce::reply_attribute)
+                .collect();
+            crate::coa::coa_request(&session, changes)
+        }
+    };
+
+    match st
+        .coa_registry
+        .send(&body.nas, request, std::time::Duration::from_secs(5))
+        .await
+    {
+        Ok(reply) => {
+            let is_ack = matches!(reply.code, Code::CoaAck | Code::DisconnectAck);
+            let error_cause = reply
+                .find_attribute(AttributeType::ErrorCause as u8)
+                .and_then(|a| a.value.get(..4))
+                .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+            let dto = CoaResult {
+                result: if is_ack { "ack" } else { "nak" },
+                code: reply.code.as_u8(),
+                error_cause,
+                error_cause_name: error_cause
+                    .and_then(ErrorCause::from_u32)
+                    .map(|c| format!("{c:?}")),
+            };
+            let status = if is_ack {
+                StatusCode::OK
+            } else {
+                StatusCode::CONFLICT
+            };
+            (status, Json(dto)).into_response()
+        }
+        Err(crate::coa::CoaError::NasNotConnected(n)) => (
+            StatusCode::NOT_FOUND,
+            format!("NAS '{n}' is not connected\n"),
+        )
+            .into_response(),
+        Err(crate::coa::CoaError::Timeout) => {
+            (StatusCode::GATEWAY_TIMEOUT, "NAS did not answer in time\n").into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e}\n")).into_response(),
+    }
 }
 
 /// Start the management API server on `addr`.
@@ -523,6 +637,10 @@ pub fn create_mgmt_server(
 /// * otherwise it serves plain HTTP. When no access policy is configured the API
 ///   is **unauthenticated** and a prominent warning is logged.
 #[cfg(feature = "observability")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "server wiring: each is a distinct dependency"
+)]
 pub async fn start_mgmt_server(
     config: Arc<Config>,
     session_manager: Arc<SharedSessionManager>,
@@ -530,6 +648,7 @@ pub async fn start_mgmt_server(
     policy_file: Option<Arc<str>>,
     security: MgmtSecurity,
     accounting: Option<Arc<dyn AccountingHandler>>,
+    coa_registry: Arc<crate::coa::NasRegistry>,
     addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if security.access_policy.is_none() {
@@ -552,6 +671,7 @@ pub async fn start_mgmt_server(
         policy_file,
         security,
         accounting,
+        coa_registry,
     );
 
     match tls {
@@ -933,6 +1053,7 @@ mod tests {
             None,
             MgmtSecurity::default(),
             accounting,
+            crate::coa::NasRegistry::new(),
         )
     }
 
