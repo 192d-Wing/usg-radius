@@ -177,6 +177,16 @@ pub fn reply_attribute(ra: &ReplyAttribute) -> Option<Attribute> {
             .parse::<u32>()
             .ok()
             .and_then(|n| Attribute::integer(AttributeType::IdleTimeout as u8, n).ok()),
+        // RFC 2865 §5.29: Default(0) terminates the session on Session-Timeout;
+        // RADIUS-Request(1) asks the NAS to re-authenticate in place instead.
+        // Accept the symbolic names or the raw code; reject anything else.
+        "Termination-Action" => match ra.value.to_ascii_lowercase().as_str() {
+            "radius-request" | "1" => {
+                Attribute::integer(AttributeType::TerminationAction as u8, 1).ok()
+            }
+            "default" | "0" => Attribute::integer(AttributeType::TerminationAction as u8, 0).ok(),
+            _ => None,
+        },
         // RFC 2868 §3.1: tagged integer — high octet is the tag, low 3 octets the
         // value. Encoding these as a plain 4-byte integer (the old behavior) put the
         // value's top byte where the tag belongs, corrupting the VLAN assignment.
@@ -320,6 +330,36 @@ mod tests {
             reply_attribute(&ReplyAttribute {
                 name: "Bogus".into(),
                 value: "x".into()
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn reply_attribute_termination_action() {
+        // Symbolic and numeric both encode to the RFC 2865 §5.29 integer.
+        for value in ["RADIUS-Request", "radius-request", "1"] {
+            let a = reply_attribute(&ReplyAttribute {
+                name: "Termination-Action".into(),
+                value: value.into(),
+            })
+            .unwrap();
+            assert_eq!(a.attr_type, AttributeType::TerminationAction as u8);
+            assert_eq!(a.value, 1u32.to_be_bytes());
+        }
+        for value in ["Default", "0"] {
+            let a = reply_attribute(&ReplyAttribute {
+                name: "Termination-Action".into(),
+                value: value.into(),
+            })
+            .unwrap();
+            assert_eq!(a.value, 0u32.to_be_bytes());
+        }
+        // Out-of-range / nonsense values are rejected (not silently coerced).
+        assert!(
+            reply_attribute(&ReplyAttribute {
+                name: "Termination-Action".into(),
+                value: "2".into()
             })
             .is_none()
         );

@@ -107,6 +107,7 @@ fn add_message_authenticator_if_eap(
 const SINGLE_VALUED_REPLY_ATTRS: &[u8] = &[
     AttributeType::SessionTimeout as u8,
     AttributeType::IdleTimeout as u8,
+    AttributeType::TerminationAction as u8,
     64, // Tunnel-Type        (we only ever return one tunnel group)
     65, // Tunnel-Medium-Type
     81, // Tunnel-Private-Group-ID
