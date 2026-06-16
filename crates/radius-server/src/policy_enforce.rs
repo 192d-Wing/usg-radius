@@ -126,7 +126,7 @@ pub fn request_context(request: &Packet, username: &str) -> RequestContext {
     // NAS-IPv6-Address (16-byte IPv6, RFC 3162). The fleet is IPv6-first, so an
     // authenticator may identify itself by IPv6 with no IPv4 NAS-IP-Address.
     if let Some(a) = request.find_attribute(AttributeType::NasIpv6Address as u8)
-        && let Ok(octets) = <[u8; 16]>::try_from(a.value.as_slice())
+        && let Ok(octets) = a.as_ipv6()
     {
         attrs.insert(
             "NAS-IPv6-Address".into(),

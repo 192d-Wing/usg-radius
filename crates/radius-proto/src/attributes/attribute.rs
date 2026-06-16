@@ -149,6 +149,19 @@ impl Attribute {
         addr.copy_from_slice(&self.value);
         Ok(addr)
     }
+
+    /// Interpret the value as a 16-octet IPv6 address (RFC 3162).
+    pub fn as_ipv6(&self) -> Result<[u8; 16], PacketError> {
+        if self.value.len() != 16 {
+            return Err(PacketError::AttributeError(format!(
+                "Expected 16 bytes for IPv6, got {}",
+                self.value.len()
+            )));
+        }
+        let mut addr = [0u8; 16];
+        addr.copy_from_slice(&self.value);
+        Ok(addr)
+    }
 }
 
 #[cfg(test)]
