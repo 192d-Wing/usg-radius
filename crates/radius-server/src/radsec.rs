@@ -20,7 +20,9 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use radius_proto::{Code, Packet, calculate_accounting_request_authenticator};
+use radius_proto::{
+    Code, Packet, calculate_accounting_request_authenticator, verify_response_authenticator,
+};
 use rustls::pki_types::CertificateDer;
 use rustls::version::TLS13;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -185,7 +187,7 @@ async fn handle_connection(
     let _guard = registry.register(nas_id, coa_tx);
 
     // Outstanding server-originated requests, keyed by RADIUS Identifier.
-    let mut pending: HashMap<u8, oneshot::Sender<Packet>> = HashMap::new();
+    let mut pending: HashMap<u8, Pending> = HashMap::new();
     let mut next_id: u8 = 0;
 
     // Accumulating read buffer: `read_buf` is cancel-safe in `select!` (unlike
@@ -229,15 +231,22 @@ fn take_frame(buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>, RadSecError> {
     Ok(Some(buf.drain(..length).collect()))
 }
 
-/// Route one inbound frame: a CoA/Disconnect ACK/NAK resolves the matching
-/// pending server-originated request; anything else goes through the normal
-/// request pipeline and its response (if any) is written back.
+/// A server-originated request awaiting its ACK/NAK: where to deliver the reply,
+/// and the Request Authenticator needed to verify the response (RFC 5176 §3.5).
+struct Pending {
+    reply: oneshot::Sender<Packet>,
+    request_authenticator: [u8; 16],
+}
+
+/// Route one inbound frame: a CoA/Disconnect ACK/NAK with a valid Response
+/// Authenticator resolves the matching pending request; anything else goes through
+/// the normal request pipeline and its response (if any) is written back.
 async fn dispatch_inbound(
     frame: &[u8],
     peer_ip: IpAddr,
     server_config: &Arc<ServerConfig>,
     wr: &mut (impl AsyncWriteExt + Unpin),
-    pending: &mut HashMap<u8, oneshot::Sender<Packet>>,
+    pending: &mut HashMap<u8, Pending>,
 ) -> Result<(), RadSecError> {
     let code = frame.first().copied().and_then(Code::from_u8);
     if matches!(
@@ -247,10 +256,24 @@ async fn dispatch_inbound(
         let id = frame[1]; // take_frame guarantees len >= 20
         match Packet::decode(frame) {
             Ok(packet) => {
-                if let Some(tx) = pending.remove(&id) {
-                    let _ = tx.send(packet);
-                } else {
-                    debug!("RadSec: unsolicited {code:?} (id {id}) with no pending request");
+                // Verify the Response Authenticator before trusting the reply, even
+                // over TLS — a buggy/misconfigured NAS must not be believed. A bad
+                // packet is ignored (the request stays pending) so a single stray
+                // frame can't fail an otherwise-valid in-flight request.
+                match pending.get(&id).map(|p| {
+                    verify_response_authenticator(&packet, &p.request_authenticator, RADSEC_SECRET)
+                }) {
+                    Some(true) => {
+                        if let Some(p) = pending.remove(&id) {
+                            let _ = p.reply.send(packet);
+                        }
+                    }
+                    Some(false) => warn!(
+                        "RadSec: {code:?} (id {id}) failed the Response Authenticator; ignoring"
+                    ),
+                    None => {
+                        debug!("RadSec: unsolicited {code:?} (id {id}) with no pending request");
+                    }
                 }
             }
             Err(e) => warn!("RadSec: failed to decode {code:?}: {e}"),
@@ -275,7 +298,7 @@ async fn dispatch_inbound(
 async fn send_coa(
     job: CoaJob,
     wr: &mut (impl AsyncWriteExt + Unpin),
-    pending: &mut HashMap<u8, oneshot::Sender<Packet>>,
+    pending: &mut HashMap<u8, Pending>,
     next_id: &mut u8,
 ) -> Result<(), RadSecError> {
     let Some(id) = alloc_identifier(pending, next_id) else {
@@ -291,7 +314,13 @@ async fn send_coa(
 
     match request.encode() {
         Ok(bytes) => {
-            pending.insert(id, job.reply);
+            pending.insert(
+                id,
+                Pending {
+                    reply: job.reply,
+                    request_authenticator: request.authenticator,
+                },
+            );
             wr.write_all(&bytes).await?;
             wr.flush().await?;
         }
@@ -302,10 +331,10 @@ async fn send_coa(
 }
 
 /// Find a RADIUS Identifier not currently outstanding, or `None` if all 256 are.
-fn alloc_identifier(
-    pending: &HashMap<u8, oneshot::Sender<Packet>>,
-    next_id: &mut u8,
-) -> Option<u8> {
+/// First reclaims slots whose caller has given up (timed out → receiver dropped),
+/// so a stream of timed-out requests can't permanently exhaust the Identifier space.
+fn alloc_identifier(pending: &mut HashMap<u8, Pending>, next_id: &mut u8) -> Option<u8> {
+    pending.retain(|_, p| !p.reply.is_closed());
     for _ in 0..=u8::MAX {
         let id = *next_id;
         *next_id = next_id.wrapping_add(1);
@@ -602,5 +631,72 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, crate::coa::CoaError::NasNotConnected(_)));
+    }
+
+    #[tokio::test]
+    async fn coa_reply_with_bad_authenticator_is_rejected() {
+        let chain = gen_chain();
+        let (addr, registry, _dir) = start_listener(&chain).await;
+
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config(
+            &chain,
+            usg_fips_tls::provider::fips_provider(),
+        )));
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut tls = connector
+            .connect(ServerName::try_from("localhost").unwrap(), stream)
+            .await
+            .unwrap();
+
+        // NAS answers with a forged/garbage Response Authenticator.
+        let nas = tokio::spawn(async move {
+            let mut header = [0u8; RADIUS_HEADER_LEN];
+            tls.read_exact(&mut header).await.unwrap();
+            let length = u16::from_be_bytes([header[2], header[3]]) as usize;
+            let mut frame = vec![0u8; length];
+            frame[..RADIUS_HEADER_LEN].copy_from_slice(&header);
+            tls.read_exact(&mut frame[RADIUS_HEADER_LEN..])
+                .await
+                .unwrap();
+            let req = Packet::decode(&frame).unwrap();
+
+            let mut ack = Packet::new(Code::DisconnectAck, req.identifier, [0xFFu8; 16]);
+            ack.authenticator = [0xFFu8; 16]; // not the real HMAC
+            tls.write_all(&ack.encode().unwrap()).await.unwrap();
+            tls.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+
+        for _ in 0..200 {
+            if registry.connected().iter().any(|n| n == "switch-eth0") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // The forged ACK is dropped, so the caller never gets a reply → times out.
+        let session = crate::coa::SessionKey {
+            acct_session_id: Some("sess-1".into()),
+            ..Default::default()
+        };
+        // Either way the forged ACK was NOT delivered as success: the caller times
+        // out, or sees the connection close — never a delivered Disconnect-ACK.
+        let err = registry
+            .send(
+                "switch-eth0",
+                crate::coa::disconnect_request(&session),
+                std::time::Duration::from_millis(400),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::coa::CoaError::Timeout | crate::coa::CoaError::ConnectionClosed
+            ),
+            "forged ACK must not be delivered as success, got {err:?}"
+        );
+
+        nas.await.unwrap();
     }
 }

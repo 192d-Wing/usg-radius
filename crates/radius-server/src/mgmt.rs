@@ -580,11 +580,26 @@ async fn coa(State(st): State<MgmtState>, Json(body): Json<CoaBody>) -> Response
     let request = match body.action {
         CoaAction::Disconnect => crate::coa::disconnect_request(&session),
         CoaAction::Coa => {
-            let changes = body
-                .changes
-                .iter()
-                .filter_map(crate::policy_enforce::reply_attribute)
-                .collect();
+            // Encode every requested change; reject the whole request if any name
+            // is unsupported rather than silently applying a partial change.
+            let mut changes = Vec::with_capacity(body.changes.len());
+            let mut unknown = Vec::new();
+            for c in &body.changes {
+                match crate::policy_enforce::reply_attribute(c) {
+                    Some(attr) => changes.push(attr),
+                    None => unknown.push(c.name.clone()),
+                }
+            }
+            if !unknown.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "unsupported or invalid CoA change attribute(s): {}\n",
+                        unknown.join(", ")
+                    ),
+                )
+                    .into_response();
+            }
             crate::coa::coa_request(&session, changes)
         }
     };
@@ -654,8 +669,9 @@ pub async fn start_mgmt_server(
     if security.access_policy.is_none() {
         tracing::warn!(
             "management API is UNAUTHENTICATED (no mgmt.access_policy_file): anyone who can \
-             reach {addr} can read state and REWRITE the live authorization policy. Configure \
-             mgmt.tls + mgmt.access_policy_file to enforce IAM-style access control."
+             reach {addr} can read state, REWRITE the live authorization policy, and \
+             DISCONNECT or CoA active sessions. Configure mgmt.tls + mgmt.access_policy_file \
+             to enforce IAM-style access control."
         );
     }
 
