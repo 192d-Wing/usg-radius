@@ -376,6 +376,7 @@ pub const KNOWN_REPLY_ATTRIBUTES: &[&str] = &[
     "Class",
     "Session-Timeout",
     "Idle-Timeout",
+    "Termination-Action",
     "Tunnel-Type",
     "Tunnel-Medium-Type",
     "Tunnel-Private-Group-ID",
