@@ -63,6 +63,8 @@ pub mod radsec;
 pub mod ratelimit;
 pub mod server;
 pub mod state;
+#[cfg(feature = "tls")]
+pub mod tls_certs;
 
 pub use access::{
     AccessContext, AccessDecision, AccessPolicy, ConditionEntry, ConditionOp,

@@ -649,19 +649,12 @@ async fn serve_mtls(
 fn build_mgmt_server_config(
     tls: &crate::config::MgmtTlsConfig,
 ) -> Result<rustls::ServerConfig, Box<dyn std::error::Error>> {
-    use rustls::pki_types::pem::PemObject;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-
-    let certs: Vec<CertificateDer<'static>> =
-        CertificateDer::pem_file_iter(&tls.cert_path)?.collect::<Result<_, _>>()?;
-    let key = PrivateKeyDer::from_pem_file(&tls.key_path)?;
+    let certs = crate::tls_certs::load_cert_chain(&tls.cert_path)?;
+    let key = crate::tls_certs::load_private_key(&tls.key_path)?;
 
     let builder = rustls::ServerConfig::builder();
     let config = if let Some(ca_path) = &tls.client_ca_path {
-        let mut roots = rustls::RootCertStore::empty();
-        for c in CertificateDer::pem_file_iter(ca_path)? {
-            roots.add(c?)?;
-        }
+        let roots = crate::tls_certs::load_root_store(ca_path)?;
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
         builder.with_client_cert_verifier(verifier)
     } else {

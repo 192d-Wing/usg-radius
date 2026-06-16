@@ -19,8 +19,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::version::TLS13;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -50,6 +48,8 @@ pub enum RadSecError {
     Tls(#[from] rustls::Error),
     #[error("certificate/key PEM error: {0}")]
     Pem(#[from] rustls::pki_types::pem::Error),
+    #[error("client CA bundle error: {0}")]
+    RootStore(#[from] crate::tls_certs::RootStoreError),
     #[error("invalid listen address {0:?}: {1}")]
     BadListenAddr(String, std::net::AddrParseError),
     #[error(
@@ -69,15 +69,11 @@ pub enum RadSecError {
 pub fn build_server_config(cfg: &RadSecConfig) -> Result<Arc<rustls::ServerConfig>, RadSecError> {
     let provider = usg_fips_tls::provider::fips_provider_arc();
 
-    let certs: Vec<CertificateDer<'static>> =
-        CertificateDer::pem_file_iter(&cfg.cert_path)?.collect::<Result<_, _>>()?;
-    let key = PrivateKeyDer::from_pem_file(&cfg.key_path)?;
+    let certs = crate::tls_certs::load_cert_chain(&cfg.cert_path)?;
+    let key = crate::tls_certs::load_private_key(&cfg.key_path)?;
 
     // RadSec is always mutually authenticated: require + verify a NAS client cert.
-    let mut roots = rustls::RootCertStore::empty();
-    for c in CertificateDer::pem_file_iter(&cfg.client_ca_path)? {
-        roots.add(c?)?;
-    }
+    let roots = crate::tls_certs::load_root_store(&cfg.client_ca_path)?;
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
         Arc::new(roots),
         provider.clone(),
@@ -158,6 +154,11 @@ async fn handle_connection(
 
     let peer_ip = peer.ip();
     debug!("RadSec connection established from {peer} (mTLS verified)");
+
+    // NOTE: unlike the UDP path, RadSec does not yet apply per-source rate
+    // limiting — admission is gated by the mTLS handshake (a valid NAS client
+    // cert) and its cost. Per-connection / per-identity rate limiting is a
+    // follow-up if a trusted NAS is ever a flooding concern.
 
     loop {
         // Read the fixed RADIUS header, then the remainder per the Length field.
