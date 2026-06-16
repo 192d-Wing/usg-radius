@@ -40,6 +40,7 @@ pub mod accounting;
 pub mod attributes;
 pub mod auth;
 pub mod chap;
+pub mod dynauth;
 pub mod eap;
 pub mod message_auth;
 pub mod packet;
@@ -57,6 +58,7 @@ pub use auth::{
 pub use chap::{
     ChapChallenge, ChapError, ChapResponse, compute_chap_response, verify_chap_response,
 };
+pub use dynauth::ErrorCause;
 pub use eap::{
     EapCode, EapError, EapPacket, EapSession, EapSessionManager, EapState, EapType, SessionStats,
     add_eap_to_radius_packet, eap_from_radius_packet, eap_to_radius_attributes,

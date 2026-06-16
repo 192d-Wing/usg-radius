@@ -123,6 +123,10 @@ pub enum AttributeType {
     /// The IPv6 address of the NAS, for IPv6-first deployments where the
     /// authenticator has no IPv4 NAS-IP-Address to advertise.
     NasIpv6Address = 95,
+    /// Error-Cause (101) - RFC 5176 §3.5
+    /// Carried in a CoA-NAK / Disconnect-NAK to explain why the request failed
+    /// (e.g. Session-Context-Not-Found = 503).
+    ErrorCause = 101,
 }
 
 impl AttributeType {
@@ -186,6 +190,7 @@ impl AttributeType {
             79 => Some(AttributeType::EapMessage),
             80 => Some(AttributeType::MessageAuthenticator),
             95 => Some(AttributeType::NasIpv6Address),
+            101 => Some(AttributeType::ErrorCause),
             _ => None,
         }
     }
