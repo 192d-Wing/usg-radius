@@ -217,6 +217,52 @@ pub struct Config {
     /// the management API stays open (today's behavior) and logs a warning.
     #[serde(default)]
     pub mgmt: Option<MgmtConfig>,
+
+    /// RADIUS transport. Per the authenticator SERVER-CONTRACT (G-1) the locked
+    /// transport is RadSec (RADIUS over TLS 1.3, ML-KEM-1024-only); plain UDP is a
+    /// transitional, non-FIPS fallback that must be opted into explicitly.
+    #[serde(default)]
+    pub transport: Transport,
+
+    /// RadSec listener settings. Required when `transport = "radsec"`.
+    #[serde(default)]
+    pub radsec: Option<RadSecConfig>,
+}
+
+/// RADIUS transport selector (SERVER-CONTRACT §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Transport {
+    /// RadSec: RADIUS over mutually-authenticated TLS 1.3 with ML-KEM-1024-only
+    /// key exchange (RFC 6614, FIPS 203). The locked, FIPS-posture transport.
+    #[default]
+    Radsec,
+    /// Plain UDP/1812+1813 with a per-client shared secret. **Not FIPS-approved**
+    /// and spoofable; permitted only for development against legacy NASes. The
+    /// daemon logs a prominent warning when this is selected.
+    UdpInsecure,
+}
+
+/// RadSec listener configuration (RFC 6614). The listener terminates TLS 1.3 with
+/// the ML-KEM-1024-only FIPS provider and requires a client certificate (mTLS):
+/// the NAS client-cert identity replaces UDP's spoofable shared-secret + source-IP
+/// trust. Inside the tunnel the payload is standard RADIUS, using the fixed
+/// shared secret `"radsec"` for the Authenticator/Message-Authenticator math.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RadSecConfig {
+    /// Listen address (default `::`, dual-stack).
+    #[serde(default = "default_listen_address")]
+    pub listen_address: String,
+    /// Listen port (default 2083, the RadSec IANA port).
+    #[serde(default = "default_radsec_port")]
+    pub listen_port: u16,
+    /// Server certificate chain (PEM, leaf first) presented to the NAS.
+    pub cert_path: String,
+    /// Server private key (PEM).
+    pub key_path: String,
+    /// CA bundle used to verify NAS client certificates (PEM). Always required —
+    /// RadSec is mutually authenticated.
+    pub client_ca_path: String,
 }
 
 /// Management API security configuration. Enforcement is *opt-in*: when an
@@ -285,6 +331,10 @@ fn default_listen_port() -> u16 {
     1812 // Standard RADIUS authentication port
 }
 
+fn default_radsec_port() -> u16 {
+    2083 // RadSec (RADIUS over TLS), IANA-assigned
+}
+
 fn default_secret() -> String {
     "testing123".to_string()
 }
@@ -321,6 +371,11 @@ impl Default for Config {
             proxy: None,
             eap: None,
             mgmt: None,
+            // The in-code Default is the legacy UDP dev object (secret + port
+            // 1812 above), so it stays udp-insecure. Config *files* default to
+            // RadSec via the field's `#[serde(default)]` (SERVER-CONTRACT §1).
+            transport: Transport::UdpInsecure,
+            radsec: None,
         }
     }
 }
@@ -522,6 +577,17 @@ impl Config {
             proxy: None,
             eap: None,
             mgmt: None,
+            // Example ships udp-insecure so it runs out of the box for dev; the
+            // `radsec` block below shows the production transport (just flip
+            // `transport` to "radsec" once the certs exist).
+            transport: Transport::UdpInsecure,
+            radsec: Some(RadSecConfig {
+                listen_address: "::".to_string(),
+                listen_port: 2083,
+                cert_path: "/etc/radius/radsec/server.pem".to_string(),
+                key_path: "/etc/radius/radsec/server.key".to_string(),
+                client_ca_path: "/etc/radius/radsec/nas-ca.pem".to_string(),
+            }),
         }
     }
 }

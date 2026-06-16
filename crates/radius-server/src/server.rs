@@ -883,8 +883,36 @@ impl RadiusServer {
             return Err(ServerError::InvalidClient);
         }
 
+        // Resolve the shared secret from the source IP (UDP transport) and run the
+        // transport-agnostic processing pipeline, then send any response back over
+        // UDP. RadSec calls `process_request` directly with the fixed "radsec"
+        // secret and writes the response over its TLS stream.
+        let secret = config.get_secret_for_client(addr.ip()).to_vec();
+        if let Some(response_data) =
+            Self::process_request(&data, addr.ip(), &secret, &config).await?
+        {
+            socket.send_to(&response_data, addr).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Transport-agnostic RADIUS request pipeline: decode, validate, replay-check,
+    /// dispatch by packet type, and encode the response. Returns the response
+    /// bytes to send (or `None` for request types that warrant no reply).
+    ///
+    /// `secret` is the shared secret to use for Response/Message-Authenticator
+    /// computation — the per-client secret for UDP, or the fixed `"radsec"` for
+    /// RadSec (RFC 6614 §2.3). `source_ip` is the peer address, used for policy
+    /// conditions (NAS-IP), logging, and replay fingerprinting.
+    pub(crate) async fn process_request(
+        data: &[u8],
+        source_ip: std::net::IpAddr,
+        secret: &[u8],
+        config: &Arc<ServerConfig>,
+    ) -> Result<Option<Vec<u8>>, ServerError> {
         // Decode the packet
-        let request = Packet::decode(&data)?;
+        let request = Packet::decode(data)?;
 
         // Validate the packet
         let validation_mode = if config
@@ -900,7 +928,7 @@ impl RadiusServer {
 
         if let Err(e) = validate_packet(&request, validation_mode) {
             warn!(
-                client_ip = %addr.ip(),
+                client_ip = %source_ip,
                 request_id = request.identifier,
                 error = %e,
                 "Rejected malformed packet"
@@ -910,13 +938,13 @@ impl RadiusServer {
 
         // Check for duplicate request (replay attack prevention)
         let fingerprint =
-            RequestFingerprint::new(addr.ip(), request.identifier, &request.authenticator);
+            RequestFingerprint::new(source_ip, request.identifier, &request.authenticator);
         if config
             .request_cache
             .is_duplicate(fingerprint, request.authenticator)
         {
             warn!(
-                client_ip = %addr.ip(),
+                client_ip = %source_ip,
                 request_id = request.identifier,
                 "Rejected duplicate request"
             );
@@ -926,7 +954,7 @@ impl RadiusServer {
                 .audit_logger
                 .log(
                     AuditEntry::new(AuditEventType::DuplicateRequest)
-                        .with_client_ip(addr.ip())
+                        .with_client_ip(source_ip)
                         .with_request_id(request.identifier),
                 )
                 .await;
@@ -936,7 +964,7 @@ impl RadiusServer {
 
         debug!(
             packet_type = ?request.code,
-            client_addr = %addr,
+            client_ip = %source_ip,
             request_id = request.identifier,
             "Received RADIUS packet"
         );
@@ -944,30 +972,29 @@ impl RadiusServer {
         // Handle based on packet type
         let response = match request.code {
             Code::AccessRequest => {
-                Self::handle_access_request(&request, &config, addr.ip()).await?
+                Self::handle_access_request(&request, config, source_ip, secret).await?
             }
             Code::AccountingRequest => {
-                Self::handle_accounting_request(&request, &config, addr.ip()).await?
+                Self::handle_accounting_request(&request, config, source_ip, secret).await?
             }
-            Code::StatusServer => Self::handle_status_server(&request, &config, addr.ip())?,
+            Code::StatusServer => Self::handle_status_server(&request, source_ip, secret)?,
             _ => {
                 warn!(packet_type = ?request.code, "Unsupported packet type");
-                return Ok(());
+                return Ok(None);
             }
         };
 
-        // Send response
+        // Encode the response
         let response_data = response.encode()?;
-        socket.send_to(&response_data, addr).await?;
 
         debug!(
             response_type = ?response.code,
-            client_addr = %addr,
+            client_ip = %source_ip,
             request_id = response.identifier,
-            "Sent RADIUS response"
+            "Encoded RADIUS response"
         );
 
-        Ok(())
+        Ok(Some(response_data))
     }
 
     /// Handle Access-Request packet
@@ -975,6 +1002,7 @@ impl RadiusServer {
         request: &Packet,
         config: &ServerConfig,
         source_ip: std::net::IpAddr,
+        secret: &[u8],
     ) -> Result<Packet, ServerError> {
         // Check if proxy routing is enabled
         if let (Some(router), Some(proxy_handler)) = (&config.router, &config.proxy_handler) {
@@ -1005,8 +1033,9 @@ impl RadiusServer {
                         );
                     }
 
-                    // Get client secret
-                    let secret = config.get_secret_for_client(source_ip).to_vec();
+                    // Forward to the home server using the resolved shared secret
+                    // (per-client for UDP, "radsec" for RadSec).
+                    let secret = secret.to_vec();
 
                     // Forward the request
                     let source_addr = SocketAddr::new(source_ip, 0); // NAS address
@@ -1042,8 +1071,8 @@ impl RadiusServer {
             }
         }
 
-        // Get the appropriate shared secret for this client
-        let secret = config.get_secret_for_client(source_ip);
+        // `secret` is provided by the caller (per-client for UDP, "radsec" for
+        // RadSec) and used for the Response/Message-Authenticator below.
 
         // Extract username
         let username = request
@@ -1497,6 +1526,7 @@ impl RadiusServer {
         request: &Packet,
         config: &ServerConfig,
         source_ip: std::net::IpAddr,
+        secret: &[u8],
     ) -> Result<Packet, ServerError> {
         // Check if accounting is enabled
         let accounting_handler = config
@@ -1504,8 +1534,7 @@ impl RadiusServer {
             .as_ref()
             .ok_or_else(|| ServerError::Validation("Accounting not enabled".to_string()))?;
 
-        // Get the appropriate shared secret for this client
-        let secret = config.get_secret_for_client(source_ip);
+        // `secret` is provided by the caller (per-client for UDP, "radsec" for RadSec).
 
         // Validate Request Authenticator (RFC 2866 Section 3)
         // The Request Authenticator must be MD5(Code + ID + Length + 16 zero octets + Attributes + Secret)
@@ -1674,8 +1703,8 @@ impl RadiusServer {
     /// Handle Status-Server packet (RFC 5997)
     fn handle_status_server(
         request: &Packet,
-        config: &ServerConfig,
         source_ip: std::net::IpAddr,
+        secret: &[u8],
     ) -> Result<Packet, ServerError> {
         debug!(
             client_ip = %source_ip,
@@ -1683,8 +1712,7 @@ impl RadiusServer {
             "Status-Server request received"
         );
 
-        // Get the appropriate shared secret for this client
-        let secret = config.get_secret_for_client(source_ip);
+        // `secret` is provided by the caller (per-client for UDP, "radsec" for RadSec).
 
         // Respond with Access-Accept to indicate server is alive
         let mut response = Packet::new(Code::AccessAccept, request.identifier, [0u8; 16]);
