@@ -9,7 +9,7 @@ resources:
 images:
   - name: usg-radius-server
     newName: ghcr.io/192d-wing/usg-radius-server
-    newTag: "0.10.0"
+    newTag: "0.10.1"
 
 replicas:
   - name: usg-radius-server

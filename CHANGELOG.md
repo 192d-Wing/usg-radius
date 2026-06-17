@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-06-17
+
+### Fixed
+
+- **Container image was built without the `tls` feature**, so RadSec and
+  EAP-TLS/TEAP — the headline 0.10.0 features — were compiled out: configuring
+  `eap` made the server exit (`config.eap is set but the binary was built without
+  the tls feature`) and `transport = "radsec"` was unavailable. The Dockerfile now
+  builds `--features observability,tls` and installs `cmake` + `perl` so
+  `aws-lc-rs` compiles on the Alpine musl base. (The release tarball binary was
+  unaffected — it already built with default features.)
+
 ## [0.10.0] - 2026-06-17
 
 Implements the usg-authenticator `SERVER-CONTRACT` (the NAS ↔ RADIUS leg) for the
