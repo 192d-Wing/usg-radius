@@ -8,7 +8,7 @@ resources:
 
 images:
   - name: usg-radius-server
-    newName: usg-radius-server
+    newName: ghcr.io/192d-wing/usg-radius-server
     newTag: v0.10.0
 
 replicas:
