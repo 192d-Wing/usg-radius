@@ -24,4 +24,34 @@ resources:
 images:
   - name: usg-radius-server
     newName: ghcr.io/192d-wing/usg-radius-server
-    newTag: "0.10.0"
+    newTag: "0.10.1"
+
+# EAP (EAP-TLS / EAP-TEAP) server cert + key + client-cert CA, from the dev CA.
+# Files are gitignored (private key); stable name so the volume can reference it.
+secretGenerator:
+  - name: radius-eap-cert
+    files:
+      - eap/server.pem
+      - eap/server.key
+      - eap/ca.pem
+    options:
+      disableNameSuffixHash: true
+
+# Mount the EAP cert Secret at /etc/radius/eap (the paths the eap config block uses).
+patches:
+  - target:
+      kind: Deployment
+      name: usg-radius-server
+    patch: |-
+      - op: add
+        path: /spec/template/spec/volumes/-
+        value:
+          name: eap-cert
+          secret:
+            secretName: radius-eap-cert
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts/-
+        value:
+          name: eap-cert
+          mountPath: /etc/radius/eap
+          readOnly: true
