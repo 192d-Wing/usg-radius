@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-17
+
+Implements the usg-authenticator `SERVER-CONTRACT` (the NAS ↔ RADIUS leg) for the
+802.1X trio: the FIPS-posture RadSec transport, server-initiated CoA/Disconnect,
+and the associated hardening and interop vectors.
+
+### Added
+
+- **RadSec transport (RFC 6614)** — RADIUS over mutually-authenticated TLS 1.3
+  with **ML-KEM-1024-only** key exchange (FIPS 203), via the shared `usg-fips-tls`
+  crypto core. The NAS client-cert CN is the authenticated identity. Selected by
+  `transport = "radsec"` (the default for config files); plain UDP is now an
+  explicit, non-FIPS `transport = "udp-insecure"` fallback.
+- **CoA / Disconnect (RFC 5176)** originated by the server over the established
+  RadSec connection, triggered by the management API: `POST /api/v1/coa`
+  (action `disconnect` | `coa`), gated by the mTLS + IAM/ABAC layer
+  (`radius:SendCoA`). The connection loop is now bidirectional, correlating each
+  ACK/NAK by Identifier and verifying its Response Authenticator.
+- **`Termination-Action`** reply attribute, so a profile can request silent
+  in-place re-auth on Session-Timeout instead of a full de-auth.
+- **`NAS-IPv6-Address` (95)** parsing for IPv6-first NAS identification.
+- **Shared KAT vectors** (`radius_proto::kat`) locking the wire format with the
+  authenticator: VLAN Access-Accept, `Filter-Id` Access-Accept, and a fragmented
+  EAP-Message Access-Request.
+
+### Security
+
+- **Require `Message-Authenticator` on EAP Access-Requests** (RFC 3579 §3.2 /
+  RFC 5080 / "Blast-RADIUS", CVE-2024-3596) — previously verified only when
+  present; an EAP request without one is now rejected.
+
 ## [0.9.3] - 2026-06-09
 
 ### Changed
