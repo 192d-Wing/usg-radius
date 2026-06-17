@@ -9,7 +9,7 @@ resources:
 images:
   - name: usg-radius-server
     newName: usg-radius-server
-    newTag: latest
+    newTag: v0.10.0
 
 replicas:
   - name: usg-radius-server
