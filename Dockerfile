@@ -26,6 +26,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 RUN apk add --no-cache \
         build-base musl-dev pkgconfig curl ca-certificates \
         openssl-dev openssl-libs-static \
+        cmake perl \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --profile minimal --default-toolchain "${RUST_VERSION}" \
     && cargo install cargo-chef --locked
@@ -41,11 +42,12 @@ FROM chef AS builder
 # Statically link OpenSSL if any transitive dep pulls openssl-sys.
 ENV OPENSSL_STATIC=1
 COPY --from=planner /build/recipe.json recipe.json
-# Cook only the dependencies for the feature set we ship (observability =
-# health + Prometheus metrics HTTP servers; no Redis/HA).
-RUN cargo chef cook --release -p radius-server --no-default-features --features observability --recipe-path recipe.json
+# Build the feature set we ship: observability (health + Prometheus metrics HTTP
+# servers) and tls (RadSec transport + EAP-TLS/TEAP via rustls + aws-lc-rs, which
+# is why the chef stage needs cmake + perl to compile aws-lc on musl).
+RUN cargo chef cook --release -p radius-server --no-default-features --features observability,tls --recipe-path recipe.json
 COPY . .
-RUN cargo build --release -p radius-server --no-default-features --features observability --bin usg-radius \
+RUN cargo build --release -p radius-server --no-default-features --features observability,tls --bin usg-radius \
     && strip target/release/usg-radius
 
 # ---- runtime: minimal Iron Bank Alpine, non-root ----
