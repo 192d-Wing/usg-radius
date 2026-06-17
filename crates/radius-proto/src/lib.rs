@@ -42,6 +42,7 @@ pub mod auth;
 pub mod chap;
 pub mod dynauth;
 pub mod eap;
+pub mod kat;
 pub mod message_auth;
 pub mod packet;
 #[cfg(feature = "revocation")]
