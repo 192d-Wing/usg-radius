@@ -52,7 +52,7 @@ tower-http = { workspace = true, optional = true }
 hex.workspace = true
 tempfile.workspace = true
 # RadSec handshake tests: generate a throwaway CA + server/client cert chain.
-rcgen = "0.13"
+rcgen = "0.14"
 
 [features]
 default = ["observability", "tls"]
