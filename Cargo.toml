@@ -91,7 +91,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     "postgres",
     "chrono",
 ] }
-bcrypt = "0.17"
+bcrypt = "0.19"
 argon2 = "0.5"
 pbkdf2 = { version = "0.12", features = ["simple"] }
 
