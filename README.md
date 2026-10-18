@@ -53,6 +53,8 @@ A RADIUS (Remote Authentication Dial-In User Service) server implementation in R
 
 - **RFC 2865**: Remote Authentication Dial In User Service (RADIUS) - PAP, CHAP, Access-Challenge, strict attribute validation
 - **RFC 2866**: RADIUS Accounting - Full implementation with PostgreSQL backend
+- **RFC 2548**: Microsoft Vendor-Specific Attributes - MS-MPPE-Send-Key / MS-MPPE-Recv-Key on EAP Access-Accepts (WPA-Enterprise key delivery)
+- **RFC 2868**: Tunnel Attributes - Tunnel-Password codec and proxy re-encryption
 - **RFC 2869**: RADIUS Extensions - Message-Authenticator, Gigaword counters
 - **RFC 3579**: RADIUS Support for EAP - EAP-Message, Message-Authenticator required on EAP requests
 - **RFC 3748**: Extensible Authentication Protocol (EAP) - Core framework and state machine
@@ -60,9 +62,10 @@ A RADIUS (Remote Authentication Dial-In User Service) server implementation in R
 - **RFC 5216**: EAP-TLS - Certificate-based authentication with RFC 5705 key export
 - **RFC 5997**: RADIUS Status-Server packets
 - **RFC 6614**: RADIUS over TLS (RadSec) - TLS 1.3 mutual authentication, default transport
-- **RFC 7170**: EAP-TEAP - TLS tunnel and TLV protocol with Crypto-Binding (inner methods with real keying material pending)
+- **RFC 7170**: EAP-TEAP - TLS tunnel and TLV protocol with Crypto-Binding and MSK derivation (inner methods with real keying material pending)
+- **RFC 9190**: EAP-TLS 1.3 - Version-correct exporter labels and EAP-Key-Name
 
-See [RFC Compliance](docs/docs/protocol/RFC-COMPLIANCE.md) for the gap analysis, including what is not yet implemented (MS-MPPE key attributes, DTLS, CoA over UDP, CRL/OCSP integration).
+See [RFC Compliance](docs/docs/protocol/RFC-COMPLIANCE.md) for the gap analysis, including what is not yet implemented (DTLS, CoA over UDP, CRL/OCSP integration).
 
 ## Installation
 
