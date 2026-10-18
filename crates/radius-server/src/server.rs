@@ -17,8 +17,8 @@ use radius_proto::auth::{
     decrypt_user_password,
 };
 use radius_proto::{
-    ChapChallenge, ChapResponse, Code, Packet, PacketError, ValidationMode, validate_packet,
-    verify_chap_response,
+    ChapChallenge, ChapResponse, Code, MppeKeys, Packet, PacketError, ValidationMode,
+    validate_packet, verify_chap_response,
 };
 use radius_proto::{calculate_message_authenticator, verify_message_authenticator};
 use std::net::SocketAddr;
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::UdpSocket;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Copy every Proxy-State attribute from `request` into `response`,
 /// preserving their relative order (RFC 2865 §5.33).
@@ -153,7 +153,18 @@ pub enum AuthResult {
     /// the AuthHandler returns from `get_accept_attributes`. EAP methods
     /// use this to attach the EAP-Success EAP-Message (RFC 3748 §4.2);
     /// for PAP/CHAP success pass an empty Vec.
-    Accept { attributes: Vec<Attribute> },
+    ///
+    /// `msk` is the EAP Master Session Key (RFC 3748 §7.10, ≥ 64 octets) of a
+    /// key-deriving EAP method. When present, the Access-Accept builder
+    /// encrypts it into MS-MPPE-Recv-Key (MSK[0..32]) and MS-MPPE-Send-Key
+    /// (MSK[32..64]) per RFC 2548 §2.4, using the shared secret in force for
+    /// the transport (per-client for UDP, `"radsec"` for RadSec) and the
+    /// Request Authenticator — neither of which the handler needs to know.
+    /// `None` for methods without key material (PAP/CHAP).
+    Accept {
+        attributes: Vec<Attribute>,
+        msk: Option<Vec<u8>>,
+    },
     /// Authentication failed
     Reject,
     /// Server needs more information (Access-Challenge)
@@ -168,11 +179,13 @@ pub enum AuthResult {
 }
 
 impl AuthResult {
-    /// Shorthand for `AuthResult::Accept { attributes: vec![] }` — use when
-    /// the response carries no protocol-specific attributes (typical PAP/CHAP).
+    /// Shorthand for `AuthResult::Accept { attributes: vec![], msk: None }` —
+    /// use when the response carries no protocol-specific attributes or key
+    /// material (typical PAP/CHAP).
     pub fn accept() -> Self {
         AuthResult::Accept {
             attributes: Vec::new(),
+            msk: None,
         }
     }
 }
@@ -1272,6 +1285,7 @@ impl RadiusServer {
         match auth_result {
             AuthResult::Accept {
                 attributes: extra_attrs,
+                msk,
             } => {
                 info!(
                     username = %username,
@@ -1312,6 +1326,29 @@ impl RadiusServer {
                 // (e.g., EAP-Success EAP-Message from an EAP handler).
                 for attr in extra_attrs {
                     response.add_attribute(attr);
+                }
+
+                // RFC 2548 §2.4: hand the EAP MSK to the NAS as MS-MPPE-Recv-Key /
+                // MS-MPPE-Send-Key. The keys are encrypted under this request's
+                // authenticator and the transport's shared secret, so this is
+                // the one place with everything needed. A key-deriving method
+                // whose keys cannot be encoded must not yield a usable
+                // session — fail the request rather than send a keyless Accept
+                // that would strand the supplicant in the 4-way handshake.
+                if let Some(msk) = msk {
+                    let attrs = MppeKeys::from_msk(&msk)
+                        .and_then(|keys| keys.to_attributes(secret, &request.authenticator))
+                        .map_err(|e| {
+                            error!(
+                                username = %username,
+                                error = %e,
+                                "Failed to encode MS-MPPE keys for Access-Accept"
+                            );
+                            ServerError::AuthFailed
+                        })?;
+                    for attr in attrs {
+                        response.add_attribute(attr);
+                    }
                 }
 
                 // Phase 2b: enforce the authorization policy. Only active when a

@@ -7,6 +7,7 @@
 //!
 //! - Packet encoding and decoding
 //! - All standard RADIUS attributes (Types 1-80+)
+//! - Vendor-Specific (26) sub-attribute codec and RFC 2548 MS-MPPE key encryption
 //! - MD5-based password encryption
 //! - Request/Response Authenticator calculation
 //! - Zero-copy packet parsing where possible
@@ -44,13 +45,14 @@ pub mod dynauth;
 pub mod eap;
 pub mod kat;
 pub mod message_auth;
+pub mod mppe;
 pub mod packet;
 #[cfg(feature = "revocation")]
 pub mod revocation;
 pub mod validation;
 
 pub use accounting::{AccountingError, AcctAuthentic, AcctStatusType, AcctTerminateCause};
-pub use attributes::{Attribute, AttributeType};
+pub use attributes::{Attribute, AttributeType, VendorSpecific};
 pub use auth::{
     calculate_accounting_request_authenticator, calculate_response_authenticator,
     decrypt_user_password, encrypt_user_password, generate_request_authenticator,
@@ -65,5 +67,6 @@ pub use eap::{
     add_eap_to_radius_packet, eap_from_radius_packet, eap_to_radius_attributes,
 };
 pub use message_auth::{calculate_message_authenticator, verify_message_authenticator};
+pub use mppe::{MppeError, MppeKeys};
 pub use packet::{Code, Packet, PacketError};
 pub use validation::{ValidationError, ValidationMode, validate_packet};
