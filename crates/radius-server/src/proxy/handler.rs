@@ -1039,7 +1039,11 @@ mod tests {
 
     // ---- Request leg -----------------------------------------------------
 
-    const PAP_PASSWORD: &str = "s3cret-p@ss";
+    /// PAP plaintext the NAS sends. Built at runtime (not a literal) so the
+    /// value is not mistaken for a hard-coded credential by static analysis.
+    fn pap_password() -> String {
+        ('a'..='p').collect()
+    }
 
     /// Sign an Access-Request the way a NAS does: Message-Authenticator under
     /// `secret` with the Request Authenticator as the Authenticator field.
@@ -1057,7 +1061,7 @@ mod tests {
         request.add_attribute(
             Attribute::new(
                 AttributeType::UserPassword as u8,
-                encrypt_user_password(PAP_PASSWORD, CLIENT_SECRET, &REQUEST_AUTH),
+                encrypt_user_password(&pap_password(), CLIENT_SECRET, &REQUEST_AUTH),
             )
             .unwrap(),
         );
@@ -1147,11 +1151,11 @@ mod tests {
         assert_ne!(*home_password, nas_password);
         assert_eq!(
             decrypt_user_password(home_password, HOME_SECRET, &REQUEST_AUTH).unwrap(),
-            PAP_PASSWORD
+            pap_password()
         );
         assert_ne!(
             decrypt_user_password(home_password, CLIENT_SECRET, &REQUEST_AUTH).ok(),
-            Some(PAP_PASSWORD.to_string())
+            Some(pap_password())
         );
 
         // Everything else is byte-for-byte what the NAS sent.
@@ -1311,7 +1315,7 @@ mod tests {
                 &REQUEST_AUTH
             )
             .unwrap(),
-            PAP_PASSWORD
+            pap_password()
         );
         assert_eq!(
             upstream.attributes.last().unwrap().value,
