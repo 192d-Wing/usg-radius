@@ -293,10 +293,14 @@ correct stripping of server-added Proxy-State on the response leg.
 **Cryptography (⚠️ partial)**:
 
 - ✅ Production key extraction using RFC 5705 (export_keying_material)
-- ✅ MSK derivation (64 bytes) - RFC 5216 Section 2.3
+- ✅ MSK derivation (64 bytes) - RFC 5216 Section 2.3 (TLS 1.2) / RFC 9190 Section 2.3 (TLS 1.3)
 - ✅ EMSK derivation (64 bytes) - RFC 5295
-- ✅ Correct label usage: "client EAP encryption"
-- ❌ MS-MPPE-Send-Key / MS-MPPE-Recv-Key (RFC 2548, Vendor-Specific 311) are **not** derived from the MSK or attached to the Access-Accept. `crates/radius-server/src/eap_auth.rs` carries a `TODO` at the Accept path and no VSA 311 encoder exists, so a NAS cannot obtain the PMK for 802.11 4-way handshake from this server yet. **Gap, priority HIGH for WPA-Enterprise.**
+- ✅ Version-correct exporter labels: `"client EAP encryption"` (TLS 1.2),
+  `"EXPORTER_EAP_TLS_Key_Material"` with the `0x0D` Type-Code context (TLS 1.3)
+- ✅ MS-MPPE-Recv-Key (MSK[0..32]) / MS-MPPE-Send-Key (MSK[32..64]) on the
+  Access-Accept, salt-encrypted per RFC 2548 §2.4 under the client secret and
+  Request Authenticator (`"radsec"` under RadSec)
+- ✅ EAP-Key-Name (RFC 9190 §2.5 Session-Id) on TLS 1.3 Access-Accepts
 - ✅ Cryptographically secure session binding
 
 **Session Management (100%)**:
@@ -417,12 +421,17 @@ eap_handler.configure_tls("", cert_config)?;
 
 #### Tunnel Attributes
 
-**RFC**: RFC 2869 Section 5.1-5.12
+**RFC**: RFC 2868 Section 3.1-3.11
 **Purpose**: VPN and tunnel configuration
 **Priority**: MEDIUM
 **Status**: Future enhancement
 
-**Missing**: All tunnel-related attributes (Types 64-69)
+**Implemented**: Tunnel-Password (Type 69, RFC 2868 §3.5) salt-encrypt /
+decrypt codec in [crates/radius-proto/src/tunnel_password.rs](../../crates/radius-proto/src/tunnel_password.rs),
+used by the proxy to re-encrypt home-server passwords for the NAS.
+
+**Missing**: Tagged tunnel attribute codecs (Types 64-68, 81-83, 90-91); the
+server does not originate tunnel attributes itself.
 
 ---
 
@@ -748,9 +757,11 @@ Set `"audit_log_path": "stdout"` (or `"-"`) to emit JSON Lines on stdout for the
 
 #### 1. Vendor-Specific Attributes (Type 26)
 
-**Status**: Structure defined, not fully parsed
+**Status**: Sub-attribute codec implemented (`radius_proto::attributes::VendorSpecific`:
+Vendor-Id + vendor-type/vendor-length TLVs, RFC 2865 §5.26), used for the RFC 2548
+MS-MPPE keys
 **Priority**: MEDIUM
-**Missing**: Vendor-ID parsing, vendor attribute handling
+**Missing**: Vendor dictionaries / named vendor attributes in policy reply attributes
 
 ---
 
@@ -880,8 +891,8 @@ Total:         156+ tests
 
 ### Priority 4 (LOW) - ❌ NOT PLANNED
 
-1. ❌ **Vendor Attributes** - Structure defined, not prioritized (blocks MS-MPPE)
-2. ❌ **Tunnel Attributes** - Future enhancement
+1. ⚠️ **Vendor Attributes** - Type 26 codec and RFC 2548 MS-MPPE keys implemented; vendor dictionaries not prioritized
+2. ⚠️ **Tunnel Attributes** - Tunnel-Password (69) codec + proxy re-encryption only; the rest is a future enhancement
 3. ❌ **CoA/Disconnect over UDP** - Only the RadSec path shipped (v0.10.0)
 4. ❌ **DTLS (RFC 7360)** - Not planned; RadSec is TLS-only
 5. ❌ **Accounting on a dedicated 1813 socket** - Single UDP socket; 1813 advertised but not bound
@@ -902,6 +913,9 @@ Total:         156+ tests
 | Bandwidth Throttling | - | ✅ Complete | v0.2.0 | CRITICAL | Bandwidth protection |
 | Accounting | 2866 | ✅ Complete | v0.3.0 | HIGH | Session tracking |
 | EAP-TLS | 5216 | ✅ Complete | v0.5.0 | HIGH | Modern auth |
+| EAP-TLS over TLS 1.3 keys | 9190 | ✅ Complete | unreleased | HIGH | Exporter labels + EAP-Key-Name |
+| MS-MPPE-Send/Recv-Key | 2548 | ✅ Complete | unreleased | HIGH | Required for the 802.11i 4-way handshake |
+| Vendor-Specific codec | 2865 §5.26 | ✅ Complete | unreleased | MEDIUM | Sub-attribute encode/decode; no dictionaries |
 | EAP Framework | 3748 | ✅ Complete | v0.5.0 | HIGH | Infrastructure |
 | Audit Logging | - | ✅ Complete | v0.1.1+ | HIGH | Compliance |
 | LDAP Backend | - | ✅ Complete | - | MEDIUM | Enterprise auth |
@@ -913,12 +927,11 @@ Total:         156+ tests
 | CoA/Disconnect | 5176 | ✅ RadSec only | v0.10.0 | MEDIUM | Server-originated via mgmt API; no UDP path |
 | NAS Identification | 2865 | ✅ Complete | v0.2.0 | MEDIUM | NAS-IP-Address or NAS-Identifier enforced |
 | Enumerated Values | 2865 | ✅ Strict mode | v0.2.0 | LOW | Lenient mode accepts unknown values |
-| MS-MPPE Keys | 2548 | ❌ Missing | - | HIGH | MSK derived, VSA 311 not encoded |
 | Certificate Revocation | 5280 / 6960 | ⚠️ Not integrated | v0.7.x | HIGH | `revocation` feature in radius-proto only |
 | Accounting Port 1813 | 2866 | ⚠️ Not bound | - | MEDIUM | Single UDP socket on listen_port |
 | Proxy-State | 2865 | ⚠️ Echoed | v0.x | MEDIUM | Ordering tests pending |
 | Hot Reload | - | ❌ Deferred | - | MEDIUM | Only mgmt access policy reloads on SIGHUP |
-| EAP-TEAP | 7170 | ⚠️ Phase 1+2 | v0.7.x | MEDIUM | Crypto-binding RFC-correct; inner methods with real IMSK pending |
+| EAP-TEAP | 7170 | ⚠️ Phase 1+2 | v0.7.x | MEDIUM | Crypto-binding RFC-correct; MSK (§5.4) emitted as MS-MPPE keys; inner methods with real IMSK pending |
 
 ---
 
@@ -964,6 +977,12 @@ The current implementation is **PRODUCTION-READY** for:
 
 1. **RADIUS Proxy**
    - Basic forwarding works
+   - Response leg verifies the home server's Response Authenticator, re-encrypts
+     RFC 2548 MS-MPPE-Send/Recv-Key and RFC 2868 §3.5 Tunnel-Password (Tag
+     preserved, fresh per-packet-unique salts) from the home server secret to
+     the client secret, dropping any that fail to decrypt, and recomputes
+     Message-Authenticator / Response Authenticator for the NAS
+     ([crates/radius-server/src/proxy/handler.rs](../../crates/radius-server/src/proxy/handler.rs))
    - Proxy-State echoed; multi-Proxy-State ordering regression tests pending
    - Hot reload not available
    - Upstream (proxy) leg is UDP only

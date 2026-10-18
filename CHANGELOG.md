@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MS-MPPE-Send-Key / MS-MPPE-Recv-Key (RFC 2548 §2.4)** on the Access-Accept
+  that concludes an EAP-TLS or EAP-TEAP exchange, so the NAS receives the PMK
+  for the 802.11i 4-way handshake. The keys are salt-encrypted under the
+  client's shared secret (`"radsec"` under RadSec) and the Request
+  Authenticator in the Access-Accept builder; EAP handlers now return the MSK
+  on `AuthResult::Accept { msk }` instead of attaching raw attributes.
+- **Vendor-Specific (26) sub-attribute codec** (`radius_proto::VendorSpecific`,
+  `Packet::find_vendor_attributes`) and `radius_proto::mppe` with known-answer
+  and round-trip tests.
+- **EAP-Key-Name (102)** carrying the RFC 9190 §2.5 EAP Session-Id on TLS 1.3
+  EAP-TLS Access-Accepts.
+- **EAP-TEAP MSK derivation** (RFC 7170 §5.4) from S-IMCK, gated on a verified
+  Crypto-Binding response.
+
 ### Security
 
 - Updated transitive dependencies to clear `cargo audit` findings published since
@@ -20,10 +36,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Proxied Access-Accepts forwarded Tunnel-Password the NAS could not decrypt.**
+  RFC 2868 §3.5 Tunnel-Password is salt-encrypted with the same MD5 chain as the
+  MS-MPPE keys (`MD5(secret || Request-Authenticator || Salt)`, Tag octet in
+  front), so a home server's tunnel password relayed through the proxy was
+  bound to the wrong secret and unusable by the NAS. `radius-proto` gained an
+  RFC 2868 §3.5 codec (`radius_proto::tunnel_password`, `AttributeType::TunnelPassword`)
+  with known-answer and round-trip tests, and the proxy now decrypts every
+  Tunnel-Password under the home server secret and re-encrypts it under the
+  client secret with a fresh salt — unique across the packet, including the
+  MS-MPPE salts — keeping its Tag and position. Passwords that fail to decrypt
+  are dropped and logged, as for the MS-MPPE keys.
+- **Proxied Access-Accepts forwarded MS-MPPE keys the NAS could not decrypt.**
+  RFC 2548 §2.4.2 binds MS-MPPE-Send-Key / MS-MPPE-Recv-Key to the shared
+  secret of the hop that encrypted them, so a home server's keys were relayed
+  under the wrong secret and every EAP-TLS/TEAP session authenticated through
+  the proxy stalled in the 802.11i 4-way handshake. The proxy now decrypts the
+  keys with the home server secret, re-encrypts them with the client's secret
+  and fresh salts, and drops any key that fails to decrypt instead of
+  forwarding garbage. On the same path it now verifies the home server's
+  Response Authenticator before relaying (the documented step was never
+  implemented) and recomputes Message-Authenticator under the client secret
+  (RFC 3579 §3.2), which was previously left as the home server's HMAC and
+  rejected by the NAS on every proxied EAP response.
+- **EAP-TLS over TLS 1.3 derived the MSK with the TLS 1.2 exporter label.**
+  RFC 9190 §2.3 requires `"EXPORTER_EAP_TLS_Key_Material"` with the `0x0D`
+  Type-Code context; using `"client EAP encryption"` produced an MSK no
+  RFC 9190 supplicant shares. Derivation is now selected by the negotiated
+  TLS version.
+- An EAP-TEAP conversation that reached `Complete` without a verified
+  Crypto-Binding is now rejected instead of accepted.
+
 - `cargo clippy -D warnings` on current stable (1.99) failed with
   `double_must_use` inside the `#[async_trait]` expansion of `StateBackend`;
   bumped `async-trait` 0.1.89→0.1.92, whose release resolves that lint in the
   generated code. No source changes.
+
+### Changed
+
+- `AuthResult::Accept` gained an `msk: Option<Vec<u8>>` field (breaking for
+  direct constructors; use `AuthResult::accept()` for key-less success).
 
 ## [0.10.1] - 2026-06-17
 
