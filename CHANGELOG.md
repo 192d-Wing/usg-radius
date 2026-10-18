@@ -36,6 +36,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Proxied Access-Requests were forwarded under the NAS's secret, so home
+  servers rejected PAP and EAP.** The request leg appended Proxy-State and
+  relayed the packet otherwise verbatim: its User-Password (RFC 2865 §5.2,
+  encrypted under the client secret and Request Authenticator) and its
+  Message-Authenticator (RFC 3579 §3.2, HMAC-MD5 under the client secret and
+  mandatory on EAP requests) were invalid for any home server whose secret
+  differs. The proxy now decrypts User-Password under the client secret and
+  re-encrypts it under the home server secret, then recomputes
+  Message-Authenticator under the home server secret over the packet including
+  our Proxy-State (adding one when the request carries EAP-Message). The
+  Request Authenticator is forwarded unchanged, as RFC 2865 §2.3 allows, so the
+  response leg keeps keying off the NAS's value; CHAP-Password is bound to the
+  challenge rather than the secret and is forwarded as is. A User-Password that
+  does not decrypt under the client secret fails the forward instead of sending
+  the home server garbage. The cached entry (and therefore every retry) now
+  holds the re-keyed packet.
 - **Proxy timeout Access-Reject was signed with an empty secret, so the NAS
   discarded it.** After a proxied request exhausted its retries, `RetryManager`
   computed the Response Authenticator of the Access-Reject it sends back to the
