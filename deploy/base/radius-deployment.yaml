@@ -53,7 +53,14 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - /etc/radius/config.json
+          # Which RADIUS ports are live depends on `transport` in the config
+          # Secret: "radsec" (base default) listens on 2083/tcp only; the dev-only
+          # "udp-insecure" transport listens on 1812/udp + 1813/udp instead. All
+          # three are declared so either Service can target them by name.
           ports:
+            - containerPort: 2083
+              protocol: TCP
+              name: radsec
             - containerPort: 1812
               protocol: UDP
               name: radius-auth
@@ -107,6 +114,11 @@ spec:
             - name: config
               mountPath: /etc/radius
               readOnly: true
+            # RadSec server cert/key + NAS client CA (paths used by the `radsec`
+            # block in config.json).
+            - name: radsec-cert
+              mountPath: /etc/radius/radsec
+              readOnly: true
             - name: logs
               mountPath: /var/log/radius
       volumes:
@@ -116,6 +128,9 @@ spec:
             items:
               - key: config.json
                 path: config.json
+        - name: radsec-cert
+          secret:
+            secretName: radius-radsec-cert
         - name: logs
           emptyDir: {}
       terminationGracePeriodSeconds: 30

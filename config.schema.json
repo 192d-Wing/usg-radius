@@ -22,11 +22,19 @@
     },
     "listen_port": {
       "type": "integer",
-      "description": "UDP port the server listens on. Standard RADIUS authentication port is 1812",
+      "description": "UDP port the server listens on for authentication (transport 'udp-insecure'). Standard RADIUS authentication port is 1812",
       "default": 1812,
       "minimum": 1,
       "maximum": 65535,
-      "examples": [1812, 1813, 1645]
+      "examples": [1812, 1645]
+    },
+    "accounting_port": {
+      "type": "integer",
+      "description": "UDP port for RADIUS accounting (RFC 2866 §3; transport 'udp-insecure'). A second socket is bound on it that feeds the same request pipeline as listen_port. Set equal to listen_port to serve accounting on the authentication socket only. Standard accounting port is 1813",
+      "default": 1813,
+      "minimum": 1,
+      "maximum": 65535,
+      "examples": [1813, 1646]
     },
     "secret": {
       "type": "string",
@@ -231,6 +239,7 @@
     {
       "listen_address": "::",
       "listen_port": 1812,
+      "accounting_port": 1813,
       "secret": "testing123",
       "clients": [
         {

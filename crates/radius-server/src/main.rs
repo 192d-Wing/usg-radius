@@ -317,6 +317,17 @@ async fn main() {
         println!();
         println!("Configuration summary:");
         println!("  Listen: {}:{}", config.listen_address, config.listen_port);
+        println!(
+            "  Accounting: {}:{}",
+            config.listen_address, config.accounting_port
+        );
+        println!(
+            "  Transport: {}",
+            match config.transport {
+                radius_server::config::Transport::Radsec => "radsec",
+                radius_server::config::Transport::UdpInsecure => "udp-insecure",
+            }
+        );
         println!("  Clients: {}", config.clients.len());
         println!("  Users: {}", config.users.len());
         println!(

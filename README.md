@@ -78,6 +78,7 @@ cargo run
 {
   "listen_address": "::",
   "listen_port": 1812,
+  "accounting_port": 1813,
   "secret": "testing123",
   "clients": [
     {
@@ -151,8 +152,16 @@ A complete JSON Schema is provided in [`config.schema.json`](config.schema.json)
 
 **Server Settings:**
 
-- `listen_address`: IP address to bind to (default: "0.0.0.0")
-- `listen_port`: Port to listen on (default: 1812)
+- `listen_address`: IP address to bind to (default: "::", dual-stack)
+- `listen_port`: UDP port for authentication (default: 1812)
+- `accounting_port`: UDP port for accounting, RFC 2866 §3 (default: 1813). The
+  server binds a second socket on it that feeds the same request pipeline; set it
+  equal to `listen_port` to serve accounting on the authentication socket only.
+  UDP ports apply to `transport = "udp-insecure"`; RadSec carries auth and
+  accounting over its single TLS port (`radsec.listen_port`, default 2083).
+- `transport`: `"radsec"` (default for config files; RADIUS over mutually
+  authenticated TLS 1.3, requires a `radsec` block) or `"udp-insecure"` (plain
+  UDP, development only)
 - `secret`: Default shared secret for clients
 
 **Security & Logging:**
@@ -343,7 +352,7 @@ impl AuthHandler for DatabaseAuthHandler {
 
 4. **Network Security**: RADIUS does not encrypt the entire packet. Use VPNs or other network security measures for sensitive deployments.
 
-5. **Port Security**: Standard RADIUS uses UDP port 1812. Ensure proper firewall rules.
+5. **Port Security**: RadSec uses TCP port 2083; plain RADIUS uses UDP 1812 (auth) and 1813 (accounting). Ensure proper firewall rules.
 
 ## Development
 

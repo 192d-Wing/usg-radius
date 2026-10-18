@@ -1,6 +1,6 @@
 ---
 # Cluster-internal service for health checks and Prometheus metrics. These are NOT
-# exposed on the anycast VIP — only the RADIUS auth/acct UDP ports are.
+# exposed on the anycast VIP — only the RADIUS transport port(s) are.
 apiVersion: v1
 kind: Service
 metadata:

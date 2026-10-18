@@ -126,6 +126,7 @@ async fn test_successful_authentication() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0; // Let OS assign port
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     // Create authentication handler
@@ -168,6 +169,7 @@ async fn spawn_server_with_policy(policy: PolicyConfig) -> SocketAddr {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
     let mut handler = SimpleAuthHandler::new();
     handler.add_user("testuser", "testpass");
@@ -263,6 +265,7 @@ async fn test_failed_authentication_wrong_password() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut handler = SimpleAuthHandler::new();
@@ -298,6 +301,7 @@ async fn test_failed_authentication_unknown_user() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut handler = SimpleAuthHandler::new();
@@ -333,6 +337,7 @@ async fn test_multiple_sequential_authentications() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut handler = SimpleAuthHandler::new();
@@ -443,6 +448,7 @@ async fn test_rate_limiting() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     // Set very low rate limits for testing
@@ -533,6 +539,7 @@ async fn test_client_ip_validation() {
 
     // Override to use OS-assigned port for testing
     config.listen_port = 0;
+    config.accounting_port = 0;
 
     let mut handler = SimpleAuthHandler::new();
     handler.add_user("testuser", "testpass");
@@ -594,6 +601,7 @@ async fn test_nas_identifier_validation() {
 
     let mut config = Config::from_file(temp_file.path()).expect("Failed to load config");
     config.listen_port = 0; // OS-assigned port
+    config.accounting_port = 0;
 
     let mut handler = SimpleAuthHandler::new();
     handler.add_user("testuser", "testpass");
@@ -706,6 +714,7 @@ async fn test_ipv6_support() {
     let mut config = Config::default();
     config.listen_address = "::1".to_string(); // IPv6 loopback
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut handler = SimpleAuthHandler::new();
@@ -761,6 +770,7 @@ async fn test_duplicate_request_detection() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
     config.request_cache_ttl = Some(10); // 10 second TTL
 
@@ -814,6 +824,7 @@ async fn test_chap_successful_authentication() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     // Create authentication handler
@@ -850,6 +861,7 @@ async fn test_chap_failed_authentication_wrong_password() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut handler = SimpleAuthHandler::new();
@@ -885,6 +897,7 @@ async fn test_chap_failed_authentication_unknown_user() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut handler = SimpleAuthHandler::new();
@@ -921,6 +934,7 @@ async fn test_chap_and_pap_interleaved() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut handler = SimpleAuthHandler::new();
@@ -968,6 +982,7 @@ async fn test_chap_different_identifiers() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut handler = SimpleAuthHandler::new();
@@ -1073,6 +1088,7 @@ async fn test_access_challenge() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     // Create challenge authentication handler
@@ -1159,6 +1175,7 @@ async fn test_access_challenge_wrong_pin() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     // Create challenge authentication handler
@@ -1281,6 +1298,7 @@ async fn test_accounting_session_lifecycle() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0; // Let OS assign a random port
+    config.accounting_port = 0;
 
     let mut auth_handler = SimpleAuthHandler::new();
     auth_handler.add_user("testuser", "testpass");
@@ -1430,6 +1448,7 @@ async fn test_accounting_nas_events() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0; // Let OS assign a random port
+    config.accounting_port = 0;
 
     let mut auth_handler = SimpleAuthHandler::new();
     auth_handler.add_user("testuser", "testpass");
@@ -1502,6 +1521,7 @@ async fn test_accounting_without_handler() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0; // Let OS assign a random port
+    config.accounting_port = 0;
 
     let mut auth_handler = SimpleAuthHandler::new();
     auth_handler.add_user("testuser", "testpass");
@@ -1548,6 +1568,7 @@ async fn test_message_authenticator_valid() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut handler = SimpleAuthHandler::new();
@@ -1635,6 +1656,7 @@ async fn test_message_authenticator_invalid() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut handler = SimpleAuthHandler::new();
@@ -1701,6 +1723,7 @@ async fn test_message_authenticator_optional() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut handler = SimpleAuthHandler::new();
@@ -1738,6 +1761,7 @@ async fn test_accounting_session_timeout() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut auth_handler = SimpleAuthHandler::new();
@@ -1810,6 +1834,7 @@ async fn test_accounting_concurrent_session_limit() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut auth_handler = SimpleAuthHandler::new();
@@ -1915,6 +1940,7 @@ async fn test_accounting_query_by_user() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut auth_handler = SimpleAuthHandler::new();
@@ -1989,6 +2015,7 @@ async fn test_file_accounting_handler() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut auth_handler = SimpleAuthHandler::new();
@@ -2187,6 +2214,7 @@ async fn test_proxy_state_echoed_on_access_accept() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut handler = SimpleAuthHandler::new();
@@ -2218,6 +2246,7 @@ async fn test_proxy_state_echoed_on_access_reject() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut handler = SimpleAuthHandler::new();
@@ -2250,6 +2279,7 @@ async fn test_proxy_state_echoed_on_access_challenge() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut handler = ChallengeAuthHandler::new();
@@ -2281,6 +2311,7 @@ async fn test_proxy_state_echoed_on_accounting_response() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
 
     let auth_handler = SimpleAuthHandler::new();
     let acct_impl = Arc::new(SimpleAccountingHandler::new());
@@ -2327,6 +2358,7 @@ async fn test_proxy_state_order_preserved_with_many_values() {
     let mut config = Config::default();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
+    config.accounting_port = 0;
     config.secret = "testing123".to_string();
 
     let mut handler = SimpleAuthHandler::new();
@@ -2362,4 +2394,77 @@ async fn test_proxy_state_order_preserved_with_many_values() {
 
     assert_eq!(response.code, Code::AccessAccept);
     assert_eq!(extract_proxy_states(&response), values);
+}
+
+/// RFC 2866 §3: accounting gets its own UDP port (1813 by default). The server
+/// binds a second socket for it that feeds the same pipeline as the auth socket,
+/// and replies over the socket the request arrived on.
+#[tokio::test]
+async fn test_accounting_on_dedicated_port() {
+    let mut config = Config::default();
+    config.listen_address = "127.0.0.1".to_string();
+    config.listen_port = 0;
+    config.accounting_port = 0;
+    config.secret = "testing123".to_string();
+
+    let mut auth_handler = SimpleAuthHandler::new();
+    auth_handler.add_user("testuser", "testpass");
+    let accounting_handler_impl = Arc::new(SimpleAccountingHandler::new());
+    let accounting_handler = accounting_handler_impl.clone() as Arc<dyn AccountingHandler>;
+
+    // listen_port == accounting_port (both 0) means "no separate socket", so bind
+    // the accounting socket explicitly on an ephemeral port for the test.
+    let server_config = ServerConfig::from_config(config, Arc::new(auth_handler))
+        .expect("Failed to create server config")
+        .with_accounting_handler(accounting_handler)
+        .with_accounting_bind_addr("127.0.0.1:0".parse().unwrap());
+
+    let server = RadiusServer::new(server_config)
+        .await
+        .expect("Failed to create server");
+    let auth_addr = server.local_addr().expect("auth addr");
+    let acct_addr = server
+        .acct_local_addr()
+        .expect("acct addr")
+        .expect("accounting socket should be bound separately");
+    assert_ne!(auth_addr.port(), acct_addr.port());
+
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    sleep(Duration::from_millis(100)).await;
+
+    let secret = b"testing123";
+
+    // Accounting-Request on the accounting port is acknowledged from that port.
+    let start =
+        create_accounting_request(AcctStatusType::Start, "sess-acct-1", "testuser", 7, secret);
+    let resp = send_radius_request(&start, acct_addr)
+        .await
+        .expect("Accounting-Start on accounting port");
+    assert_eq!(resp.code, Code::AccountingResponse);
+    assert_eq!(resp.identifier, 7);
+    assert_eq!(accounting_handler_impl.session_count(), 1);
+
+    // The auth socket still works alongside it.
+    let access = create_access_request("testuser", "testpass", secret, 8);
+    let resp = send_radius_request(&access, auth_addr)
+        .await
+        .expect("Access-Request on auth port");
+    assert_eq!(resp.code, Code::AccessAccept);
+}
+
+/// With the default config (`accounting_port` = 1813 ≠ `listen_port`), a
+/// `ServerConfig` built from it carries a separate accounting bind address on the
+/// same interface — this is what the Kubernetes manifests advertise.
+#[test]
+fn test_from_config_derives_accounting_bind_addr() {
+    let mut config = Config::default();
+    config.listen_address = "127.0.0.1".to_string();
+    let server_config =
+        ServerConfig::from_config(config, Arc::new(SimpleAuthHandler::new())).expect("config");
+    assert_eq!(server_config.bind_addr.port(), 1812);
+    let acct = server_config.acct_bind_addr.expect("accounting bind addr");
+    assert_eq!(acct.port(), 1813);
+    assert_eq!(acct.ip(), server_config.bind_addr.ip());
 }

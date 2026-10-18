@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Dedicated accounting port.** New `accounting_port` config field (default
+  1813, RFC 2866 §3). The UDP transport now binds a second socket on it that
+  dispatches into the same request pipeline as `listen_port`, so the 1813/udp
+  advertised by the Dockerfile, manifests and docs is actually listened on. Set
+  it equal to `listen_port` to keep accounting on the auth socket.
+- `deploy/overlays/dev-udp`: clearly-labelled dev-only overlay that selects
+  `transport = "udp-insecure"` and advertises 1812/1813 UDP on the VIP.
+
+### Fixed
+
+- **Base Kubernetes deployment crash-looped on 0.10.x.** Config files default
+  `transport` to `radsec`, but `deploy/base/radius-config.secret.yaml` had no
+  `radsec` block, so the pod exited with `transport = "radsec" but no radsec
+  config block was provided`. The base config is now explicit
+  (`transport: "radsec"` + a `radsec` block), a `radius-radsec-cert` Secret
+  (placeholder — replace it) is mounted at `/etc/radius/radsec`, and the
+  Deployment/LoadBalancer Service expose 2083/tcp. The VIP Service advertises
+  only the port the selected transport binds (`kubectl kustomize
+  deploy/overlays/k8s` now renders a config the binary accepts).
+
 ## [0.10.1] - 2026-06-17
 
 ### Fixed

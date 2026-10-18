@@ -1,0 +1,45 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# DEV-ONLY overlay: plain UDP RADIUS (`transport = "udp-insecure"`).
+#
+# This is NOT FIPS-approved and the shared-secret + source-IP trust model is
+# spoofable. It exists only for development against legacy NASes that cannot do
+# RadSec. Production clusters use overlays/k8s or overlays/k3s, which inherit the
+# base RadSec (2083/tcp, mTLS) transport.
+#
+# It replaces the base config.json with one that selects udp-insecure (so no
+# `radsec` block or cert Secret is needed) and swaps the anycast Service's port
+# from 2083/tcp to the UDP auth (1812) + accounting (1813) ports the binary binds
+# in this mode.
+resources:
+  - ../../base
+
+images:
+  - name: usg-radius-server
+    newName: ghcr.io/192d-wing/usg-radius-server
+    newTag: "0.10.1"
+
+replicas:
+  - name: usg-radius-server
+    count: 1
+
+patches:
+  # Dev config: udp-insecure transport, UDP 1812 (auth) + 1813 (acct).
+  - path: radius-config.secret.yaml
+  # Advertise the UDP ports on the VIP instead of RadSec.
+  - target:
+      kind: Service
+      name: usg-radius-server
+    patch: |-
+      - op: replace
+        path: /spec/ports
+        value:
+          - name: radius-auth
+            port: 1812
+            targetPort: radius-auth
+            protocol: UDP
+          - name: radius-acct
+            port: 1813
+            targetPort: radius-acct
+            protocol: UDP

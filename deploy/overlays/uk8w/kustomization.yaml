@@ -15,6 +15,10 @@ resources:
   - ../../base/namespace.yaml
   - ../../base/radius-deployment.yaml
   - ../../base/radius-service-internal.yaml
+  # The base Deployment mounts the RadSec cert Secret at /etc/radius/radsec; the
+  # placeholder keeps the pod schedulable here (this overlay's gitignored config
+  # may use udp-insecure). Replace it with real material if transport = "radsec".
+  - ../../base/radius-radsec-cert.secret.yaml
   # Cluster-specific (override base equivalents; base bgp/ippool/secret/lb omitted):
   - radius-config.secret.yaml
   - radius-service-lb.yaml

@@ -9,6 +9,7 @@ namespace: radius
 resources:
   - namespace.yaml
   - radius-config.secret.yaml
+  - radius-radsec-cert.secret.yaml
   - radius-deployment.yaml
   - radius-service-lb.yaml
   - radius-service-internal.yaml

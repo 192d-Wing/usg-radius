@@ -109,6 +109,7 @@ async fn test_e2e_simple_auth_pap_success() {
     let config = Config {
         listen_address: "127.0.0.1".to_string(),
         listen_port: 0, // Random port
+        accounting_port: 0,
         secret: "testing123".to_string(),
         clients: vec![],
         ..Default::default()
@@ -150,6 +151,7 @@ async fn test_e2e_simple_auth_pap_failure() {
     let config = Config {
         listen_address: "127.0.0.1".to_string(),
         listen_port: 0,
+        accounting_port: 0,
         secret: "testing123".to_string(),
         clients: vec![],
         ..Default::default()
@@ -188,6 +190,7 @@ async fn test_e2e_simple_auth_chap_success() {
     let config = Config {
         listen_address: "127.0.0.1".to_string(),
         listen_port: 0,
+        accounting_port: 0,
         secret: "testing123".to_string(),
         clients: vec![],
         ..Default::default()
@@ -226,6 +229,7 @@ async fn test_e2e_simple_auth_chap_failure() {
     let config = Config {
         listen_address: "127.0.0.1".to_string(),
         listen_port: 0,
+        accounting_port: 0,
         secret: "testing123".to_string(),
         clients: vec![],
         ..Default::default()
@@ -264,6 +268,7 @@ async fn test_e2e_simple_auth_unknown_user() {
     let config = Config {
         listen_address: "127.0.0.1".to_string(),
         listen_port: 0,
+        accounting_port: 0,
         secret: "testing123".to_string(),
         clients: vec![],
         ..Default::default()
@@ -322,6 +327,7 @@ async fn test_e2e_simple_auth_accept_attributes() {
     let config = Config {
         listen_address: "127.0.0.1".to_string(),
         listen_port: 0,
+        accounting_port: 0,
         secret: "testing123".to_string(),
         clients: vec![],
         ..Default::default()

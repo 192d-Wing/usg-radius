@@ -334,8 +334,11 @@ impl AuthHandler for SimpleAuthHandler {
 
 /// RADIUS Server configuration
 pub struct ServerConfig {
-    /// Bind address for the server
+    /// Bind address for the server (RADIUS authentication, UDP)
     pub bind_addr: SocketAddr,
+    /// Bind address for the RADIUS accounting socket (RFC 2866 §3, UDP/1813).
+    /// `None` serves accounting on `bind_addr` only (single socket).
+    pub acct_bind_addr: Option<SocketAddr>,
     /// Shared secret for authenticating clients (used if no client config provided)
     pub secret: Vec<u8>,
     /// Authentication handler
@@ -386,6 +389,7 @@ impl ServerConfig {
 
         ServerConfig {
             bind_addr,
+            acct_bind_addr: None,
             secret: secret.into(),
             auth_handler,
             accounting_handler: None,
@@ -400,6 +404,13 @@ impl ServerConfig {
             health_checker: None,
             policy: None,
         }
+    }
+
+    /// Bind a separate UDP socket for accounting (RFC 2866 §3). Requests on it
+    /// run through the same pipeline as the authentication socket.
+    pub fn with_accounting_bind_addr(mut self, acct_bind_addr: SocketAddr) -> Self {
+        self.acct_bind_addr = Some(acct_bind_addr);
+        self
     }
 
     /// Set the accounting handler
@@ -426,6 +437,9 @@ impl ServerConfig {
         auth_handler: Arc<dyn AuthHandler>,
     ) -> Result<Self, ServerError> {
         let bind_addr = config.socket_addr().map_err(|e| {
+            ServerError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+        let acct_bind_addr = config.accounting_socket_addr().map_err(|e| {
             ServerError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
         })?;
         let secret = config.secret.clone().into_bytes();
@@ -467,6 +481,7 @@ impl ServerConfig {
 
         Ok(ServerConfig {
             bind_addr,
+            acct_bind_addr,
             secret,
             auth_handler,
             accounting_handler: None,
@@ -511,7 +526,11 @@ impl ServerConfig {
 /// RADIUS Server
 pub struct RadiusServer {
     config: Arc<ServerConfig>,
+    /// Authentication socket (`listen_port`, 1812).
     socket: Arc<UdpSocket>,
+    /// Accounting socket (`accounting_port`, 1813), when bound separately. Feeds
+    /// the same request pipeline as `socket`.
+    acct_socket: Option<Arc<UdpSocket>>,
     /// Home servers for health checking (if proxy is enabled)
     home_servers: Vec<Arc<crate::proxy::home_server::HomeServer>>,
     /// Home server pools (if proxy is enabled)
@@ -524,6 +543,17 @@ impl RadiusServer {
         let socket = UdpSocket::bind(config.bind_addr).await?;
         let socket = Arc::new(socket);
         info!("RADIUS server listening on {}", config.bind_addr);
+
+        // RFC 2866 §3: accounting has its own UDP port (1813). Bind it up front so
+        // a port clash fails startup rather than silently dropping accounting.
+        let acct_socket = match config.acct_bind_addr {
+            Some(addr) => {
+                let acct = UdpSocket::bind(addr).await?;
+                info!("RADIUS accounting listening on {}", addr);
+                Some(Arc::new(acct))
+            }
+            None => None,
+        };
 
         let mut home_servers = Vec::new();
         let mut pools = Vec::new();
@@ -552,6 +582,7 @@ impl RadiusServer {
         Ok(RadiusServer {
             config: Arc::new(config),
             socket,
+            acct_socket,
             home_servers,
             pools,
         })
@@ -709,6 +740,16 @@ impl RadiusServer {
         self.socket.local_addr().map_err(ServerError::from)
     }
 
+    /// Get the local address of the accounting socket, if one was bound
+    /// separately (see [`ServerConfig::acct_bind_addr`]). `None` means accounting
+    /// is served on [`Self::local_addr`].
+    pub fn acct_local_addr(&self) -> Result<Option<std::net::SocketAddr>, ServerError> {
+        self.acct_socket
+            .as_ref()
+            .map(|s| s.local_addr().map_err(ServerError::from))
+            .transpose()
+    }
+
     /// Get proxy statistics snapshot
     ///
     /// Returns aggregated statistics from all pools and servers if proxy is enabled.
@@ -759,12 +800,32 @@ impl RadiusServer {
             None
         };
 
+        // Serve the authentication socket and, when bound, the accounting socket
+        // concurrently. Both feed the same request pipeline; the first socket
+        // error ends the server.
+        match self.acct_socket {
+            Some(ref acct_socket) => {
+                tokio::select! {
+                    res = Self::serve_socket(Arc::clone(&self.config), Arc::clone(&self.socket)) => res,
+                    res = Self::serve_socket(Arc::clone(&self.config), Arc::clone(acct_socket)) => res,
+                }
+            }
+            None => Self::serve_socket(Arc::clone(&self.config), Arc::clone(&self.socket)).await,
+        }
+    }
+
+    /// Receive loop for one UDP socket: each datagram is handed to
+    /// [`Self::handle_request`] on its own task, replying over the same socket.
+    async fn serve_socket(
+        config: Arc<ServerConfig>,
+        socket: Arc<UdpSocket>,
+    ) -> Result<(), ServerError> {
         loop {
             // Acquire a buffer from the pool
-            let mut pooled_buf = self.config.buffer_pool.acquire().await;
+            let mut pooled_buf = config.buffer_pool.acquire().await;
 
             // Receive packet into pooled buffer
-            let (len, addr) = self.socket.recv_from(pooled_buf.as_mut()).await?;
+            let (len, addr) = socket.recv_from(pooled_buf.as_mut()).await?;
 
             // Copy the received data (only the received bytes, not the full buffer)
             let data = pooled_buf.as_ref()[..len].to_vec();
@@ -772,8 +833,8 @@ impl RadiusServer {
             // Buffer is automatically returned to pool when pooled_buf is dropped
 
             // Spawn a task to handle this request
-            let config = Arc::clone(&self.config);
-            let socket = Arc::clone(&self.socket);
+            let config = Arc::clone(&config);
+            let socket = Arc::clone(&socket);
 
             tokio::spawn(async move {
                 if let Err(e) = Self::handle_request(data, addr, config, socket).await {

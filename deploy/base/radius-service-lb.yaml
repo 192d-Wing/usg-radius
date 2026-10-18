@@ -2,6 +2,12 @@
 # The anycast RADIUS VIP. Cilium assigns one IPv4 and one IPv6 from the
 # CiliumLoadBalancerIPPool and advertises them via BGP from every node that has a
 # Ready radius pod (because of externalTrafficPolicy: Local).
+#
+# Ports mirror what the binary binds for the base config's transport ("radsec"):
+# a single TLS listener on 2083/tcp carrying both auth and accounting (RFC 6614).
+# The UDP 1812/1813 ports are NOT advertised here because nothing listens on them
+# in RadSec mode; deploy/overlays/dev-udp swaps them in for the udp-insecure dev
+# transport.
 apiVersion: v1
 kind: Service
 metadata:
@@ -28,11 +34,7 @@ spec:
   selector:
     app.kubernetes.io/name: usg-radius-server
   ports:
-    - name: radius-auth
-      port: 1812
-      targetPort: radius-auth
-      protocol: UDP
-    - name: radius-acct
-      port: 1813
-      targetPort: radius-acct
-      protocol: UDP
+    - name: radsec
+      port: 2083
+      targetPort: radsec
+      protocol: TCP

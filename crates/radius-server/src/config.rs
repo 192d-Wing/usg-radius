@@ -111,9 +111,17 @@ pub struct Config {
     #[serde(default = "default_listen_address")]
     pub listen_address: String,
 
-    /// Server listen port
+    /// Server listen port (RADIUS authentication, UDP)
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
+
+    /// RADIUS accounting port (UDP). RFC 2866 §3 gives accounting its own port
+    /// (1813); the server binds a second UDP socket on it that feeds the same
+    /// request pipeline as `listen_port`. Set it equal to `listen_port` to serve
+    /// accounting on the authentication socket only. Only used by the
+    /// `udp-insecure` transport — RadSec multiplexes both over its single TLS port.
+    #[serde(default = "default_accounting_port")]
+    pub accounting_port: u16,
 
     /// Default shared secret (used if client doesn't specify one)
     #[serde(default = "default_secret")]
@@ -331,6 +339,10 @@ fn default_listen_port() -> u16 {
     1812 // Standard RADIUS authentication port
 }
 
+fn default_accounting_port() -> u16 {
+    1813 // Standard RADIUS accounting port (RFC 2866 §3)
+}
+
 fn default_radsec_port() -> u16 {
     2083 // RadSec (RADIUS over TLS), IANA-assigned
 }
@@ -348,6 +360,7 @@ impl Default for Config {
         Config {
             listen_address: default_listen_address(),
             listen_port: default_listen_port(),
+            accounting_port: default_accounting_port(),
             secret: default_secret(),
             clients: vec![],
             users: vec![],
@@ -413,6 +426,17 @@ impl Config {
         Ok(SocketAddr::new(addr, self.listen_port))
     }
 
+    /// Get socket address for the accounting listener (`listen_address` +
+    /// `accounting_port`). Returns `None` when `accounting_port == listen_port`,
+    /// i.e. accounting is served on the authentication socket.
+    pub fn accounting_socket_addr(&self) -> Result<Option<SocketAddr>, ConfigError> {
+        if self.accounting_port == self.listen_port {
+            return Ok(None);
+        }
+        let auth = self.socket_addr()?;
+        Ok(Some(SocketAddr::new(auth.ip(), self.accounting_port)))
+    }
+
     /// Find a client by source IP address
     ///
     /// Returns the first enabled client that matches the source IP.
@@ -452,6 +476,11 @@ impl Config {
         // Validate port
         if self.listen_port == 0 {
             return Err(ConfigError::Invalid("Port cannot be 0".to_string()));
+        }
+        if self.accounting_port == 0 {
+            return Err(ConfigError::Invalid(
+                "accounting_port cannot be 0".to_string(),
+            ));
         }
 
         // Validate secret is not empty
@@ -512,6 +541,7 @@ impl Config {
         Config {
             listen_address: "::".to_string(),
             listen_port: 1812,
+            accounting_port: 1813,
             secret: "testing123".to_string(),
             clients: vec![
                 Client {
@@ -617,6 +647,39 @@ mod tests {
         let config = Config::default();
         let addr = config.socket_addr().unwrap();
         assert_eq!(addr.port(), 1812);
+    }
+
+    #[test]
+    fn test_accounting_port_defaults_to_1813() {
+        // In-code default and a config file that omits the key both land on the
+        // RFC 2866 §3 accounting port, bound on the same address as auth.
+        let config = Config::default();
+        assert_eq!(config.accounting_port, 1813);
+        let acct = config.accounting_socket_addr().unwrap().unwrap();
+        assert_eq!(acct.port(), 1813);
+        assert_eq!(acct.ip(), config.socket_addr().unwrap().ip());
+
+        let parsed: Config =
+            serde_json::from_str(r#"{"listen_address": "::", "listen_port": 1812}"#).unwrap();
+        assert_eq!(parsed.accounting_port, 1813);
+        assert!(parsed.validate().is_ok());
+    }
+
+    #[test]
+    fn test_accounting_port_explicit_and_shared() {
+        let mut config = Config::default();
+        config.accounting_port = 11813;
+        assert_eq!(
+            config.accounting_socket_addr().unwrap().unwrap().port(),
+            11813
+        );
+
+        // Same port as auth → no separate accounting socket.
+        config.accounting_port = config.listen_port;
+        assert!(config.accounting_socket_addr().unwrap().is_none());
+
+        config.accounting_port = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]
