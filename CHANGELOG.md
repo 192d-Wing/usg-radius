@@ -32,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TLS version.
 - An EAP-TEAP conversation that reached `Complete` without a verified
   Crypto-Binding is now rejected instead of accepted.
+- **EAP-TEAP IMCK/CMK derivation did not follow RFC 7170 §5.2.** IMCK[j] was
+  expanded with an ad-hoc HMAC construction instead of the TLS 1.2 PRF, and
+  CMK[j] was taken from the first 20 octets of IMCK[j], overlapping S-IMCK[j],
+  instead of the last 20. Both now match the RFC (and hostapd's
+  `eap_teap_derive_imck`), so the Compound-MAC and the MSK/EMSK derived from
+  S-IMCK interoperate with conforming peers.
 
 ### Changed
 
