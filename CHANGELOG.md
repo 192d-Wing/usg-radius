@@ -36,6 +36,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Proxied Access-Accepts forwarded MS-MPPE keys the NAS could not decrypt.**
+  RFC 2548 §2.4.2 binds MS-MPPE-Send-Key / MS-MPPE-Recv-Key to the shared
+  secret of the hop that encrypted them, so a home server's keys were relayed
+  under the wrong secret and every EAP-TLS/TEAP session authenticated through
+  the proxy stalled in the 802.11i 4-way handshake. The proxy now decrypts the
+  keys with the home server secret, re-encrypts them with the client's secret
+  and fresh salts, and drops any key that fails to decrypt instead of
+  forwarding garbage. On the same path it now verifies the home server's
+  Response Authenticator before relaying (the documented step was never
+  implemented) and recomputes Message-Authenticator under the client secret
+  (RFC 3579 §3.2), which was previously left as the home server's HMAC and
+  rejected by the NAS on every proxied EAP response.
 - **EAP-TLS over TLS 1.3 derived the MSK with the TLS 1.2 exporter label.**
   RFC 9190 §2.3 requires `"EXPORTER_EAP_TLS_Key_Material"` with the `0x0D`
   Type-Code context; using `"client EAP encryption"` produced an MSK no

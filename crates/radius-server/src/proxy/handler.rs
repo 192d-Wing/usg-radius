@@ -3,9 +3,10 @@
 use crate::proxy::cache::{ProxyCache, ProxyCacheEntry, ProxyStateKey, generate_proxy_state_key};
 use crate::proxy::error::{ProxyError, ProxyResult};
 use crate::proxy::home_server::HomeServer;
-use radius_proto::Packet;
-use radius_proto::attributes::{Attribute, AttributeType};
-use radius_proto::auth::calculate_response_authenticator;
+use radius_proto::attributes::{Attribute, AttributeType, VendorSpecific};
+use radius_proto::auth::{calculate_response_authenticator, verify_response_authenticator};
+use radius_proto::mppe::{MICROSOFT_VENDOR_ID, MS_MPPE_RECV_KEY, MS_MPPE_SEND_KEY};
+use radius_proto::{MppeKeys, Packet, calculate_message_authenticator};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -127,14 +128,19 @@ impl ProxyHandler {
     /// 2. Look up original request in cache
     /// 3. Validate response authenticator (with home server secret)
     /// 4. Remove our Proxy-State attribute
-    /// 5. Recalculate response authenticator (with client secret)
-    /// 6. Forward to original NAS
+    /// 5. Re-encrypt MS-MPPE-Send-Key / MS-MPPE-Recv-Key (RFC 2548 §2.4) from
+    ///    the home server secret to the client secret
+    /// 6. Recalculate Message-Authenticator and Response-Authenticator (with
+    ///    client secret)
+    /// 7. Forward to original NAS
+    ///
+    /// Steps 3–6 are [`rewrite_response_for_nas`].
     ///
     /// Note: This method should be called from a background task that listens
     /// for responses on the proxy socket.
     pub async fn handle_response(
         &self,
-        mut response: Packet,
+        response: Packet,
         home_server_addr: SocketAddr,
     ) -> ProxyResult<()> {
         // Extract the last Proxy-State attribute (the one we added)
@@ -170,19 +176,7 @@ impl ProxyHandler {
         // Record statistics
         entry.home_server.stats().record_response();
 
-        // Remove our Proxy-State attribute from response
-        response.attributes.retain(|attr| {
-            !(attr.attr_type == AttributeType::ProxyState as u8 && attr.value == proxy_state)
-        });
-
-        // Recalculate Response-Authenticator with client secret
-        // (response was calculated with home server secret, need to recalculate)
-        let response_auth = calculate_response_authenticator(
-            &response,
-            &entry.original_request.authenticator,
-            &entry.client_secret,
-        );
-        response.authenticator = response_auth;
+        let response = rewrite_response_for_nas(response, &entry)?;
 
         // Forward response to original NAS
         let response_data = response.encode()?;
@@ -212,12 +206,493 @@ impl ProxyHandler {
     }
 }
 
+/// Turn a home server's response into the response the NAS expects.
+///
+/// The home server authenticated its reply against *its* shared secret and
+/// the Request Authenticator of the request we forwarded; the NAS will check
+/// everything against *its* secret and the Request Authenticator it sent. The
+/// proxy forwards the NAS's Request Authenticator unchanged, so the same
+/// 16 octets (`entry.original_request.authenticator`) serve both sides and only
+/// the secret changes.
+///
+/// 1. Verify the Response Authenticator with the home server secret — before
+///    touching any attribute, since it covers the packet as received.
+/// 2. Remove the Proxy-State we appended.
+/// 3. MS-MPPE-Send-Key / MS-MPPE-Recv-Key (RFC 2548 §2.4.2) are encrypted with
+///    `MD5(secret || Request-Authenticator || Salt)`, so they are opaque to the
+///    NAS unless re-encrypted: decrypt under the home server secret, re-encrypt
+///    under the client secret with fresh salts. Keys that do not decrypt are
+///    dropped rather than forwarded as garbage.
+/// 4. Recompute Message-Authenticator (RFC 3579 §3.2) under the client secret
+///    if present — or add one when the response carries EAP-Message.
+/// 5. Recompute the Response Authenticator under the client secret.
+pub(crate) fn rewrite_response_for_nas(
+    mut response: Packet,
+    entry: &ProxyCacheEntry,
+) -> ProxyResult<Packet> {
+    let request_authenticator = &entry.original_request.authenticator;
+
+    // 1. Authenticate the home server's reply.
+    if !verify_response_authenticator(&response, request_authenticator, entry.home_server.secret())
+    {
+        warn!(
+            home_server = %entry.home_server.name,
+            identifier = response.identifier,
+            "Response authenticator from home server is invalid; dropping response"
+        );
+        return Err(ProxyError::InvalidResponseAuthenticator);
+    }
+
+    // 2. Remove our Proxy-State attribute from response
+    let proxy_state = entry.proxy_state;
+    response.attributes.retain(|attr| {
+        !(attr.attr_type == AttributeType::ProxyState as u8 && attr.value == proxy_state)
+    });
+
+    // 3. Re-key MS-MPPE attributes from the home server secret to the client secret.
+    rekey_mppe_attributes(&mut response, entry);
+
+    // 4. Message-Authenticator under the client secret.
+    recompute_message_authenticator(&mut response, request_authenticator, &entry.client_secret)?;
+
+    // 5. Response Authenticator under the client secret.
+    response.authenticator =
+        calculate_response_authenticator(&response, request_authenticator, &entry.client_secret);
+
+    Ok(response)
+}
+
+/// Decrypt the RFC 2548 MS-MPPE keys under the home server pair and re-encrypt
+/// them under the client pair, replacing the sub-attributes in place. A packet
+/// without MPPE keys is left untouched; keys that fail to decrypt (or an
+/// unpaired key) are removed so the NAS never receives undecryptable material.
+fn rekey_mppe_attributes(response: &mut Packet, entry: &ProxyCacheEntry) {
+    let request_authenticator = &entry.original_request.authenticator;
+
+    let keys =
+        match MppeKeys::from_packet(response, entry.home_server.secret(), request_authenticator) {
+            Ok(None) => return,
+            Ok(Some(keys)) => Some(keys),
+            Err(e) => {
+                warn!(
+                    home_server = %entry.home_server.name,
+                    identifier = response.identifier,
+                    error = %e,
+                    "Failed to decrypt MS-MPPE keys from home server; dropping them"
+                );
+                None
+            }
+        };
+
+    strip_mppe_attributes(response);
+
+    if let Some(keys) = keys {
+        match keys.to_attributes(&entry.client_secret, request_authenticator) {
+            Ok(attrs) => {
+                for attr in attrs {
+                    response.add_attribute(attr);
+                }
+                debug!(
+                    home_server = %entry.home_server.name,
+                    identifier = response.identifier,
+                    "Re-encrypted MS-MPPE keys for NAS"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    home_server = %entry.home_server.name,
+                    identifier = response.identifier,
+                    error = %e,
+                    "Failed to re-encrypt MS-MPPE keys for NAS; dropping them"
+                );
+            }
+        }
+    }
+}
+
+/// Remove every Microsoft MS-MPPE-Send-Key / MS-MPPE-Recv-Key sub-attribute.
+/// Other sub-attributes sharing a Vendor-Specific attribute are preserved;
+/// a Vendor-Specific attribute that cannot be decoded is left as is.
+fn strip_mppe_attributes(response: &mut Packet) {
+    let is_mppe_key = |v: &VendorSpecific| {
+        v.vendor_id == MICROSOFT_VENDOR_ID
+            && (v.vendor_type == MS_MPPE_SEND_KEY || v.vendor_type == MS_MPPE_RECV_KEY)
+    };
+
+    let mut rewritten = Vec::with_capacity(response.attributes.len());
+    for attr in response.attributes.drain(..) {
+        if attr.attr_type != AttributeType::VendorSpecific as u8 {
+            rewritten.push(attr);
+            continue;
+        }
+        let Ok(subs) = VendorSpecific::from_attribute(&attr) else {
+            rewritten.push(attr);
+            continue;
+        };
+        if !subs.iter().any(is_mppe_key) {
+            rewritten.push(attr);
+            continue;
+        }
+        let remaining: Vec<VendorSpecific> = subs.into_iter().filter(|v| !is_mppe_key(v)).collect();
+        if remaining.is_empty() {
+            continue;
+        }
+        match VendorSpecific::to_attribute_combined(&remaining) {
+            Ok(a) => rewritten.push(a),
+            // Re-encoding a subset of a decodable VSA cannot grow it; keep the
+            // original rather than lose the vendor's other sub-attributes.
+            Err(_) => rewritten.push(attr),
+        }
+    }
+    response.attributes = rewritten;
+}
+
+/// Recompute Message-Authenticator (RFC 3579 §3.2) over the rewritten response
+/// with the client secret and the NAS's Request Authenticator. One is added when
+/// absent but the response carries EAP-Message, as RFC 3579 requires.
+fn recompute_message_authenticator(
+    response: &mut Packet,
+    request_authenticator: &[u8; 16],
+    secret: &[u8],
+) -> ProxyResult<()> {
+    let has_ma = response
+        .attributes
+        .iter()
+        .any(|a| a.attr_type == AttributeType::MessageAuthenticator as u8);
+    let has_eap = response
+        .attributes
+        .iter()
+        .any(|a| a.attr_type == AttributeType::EapMessage as u8);
+    if !has_ma && !has_eap {
+        return Ok(());
+    }
+    if !has_ma {
+        response.add_attribute(Attribute::new(
+            AttributeType::MessageAuthenticator as u8,
+            vec![0u8; 16],
+        )?);
+    }
+
+    // HMAC input: the packet with Authenticator = Request Authenticator and the
+    // Message-Authenticator value zeroed.
+    for ma in response
+        .attributes
+        .iter_mut()
+        .filter(|a| a.attr_type == AttributeType::MessageAuthenticator as u8)
+    {
+        ma.value = vec![0u8; 16];
+    }
+    let original_auth = response.authenticator;
+    response.authenticator = *request_authenticator;
+    let packet_bytes = response.encode()?;
+    response.authenticator = original_auth;
+
+    let mac = calculate_message_authenticator(&packet_bytes, secret);
+    if let Some(ma) = response
+        .attributes
+        .iter_mut()
+        .find(|a| a.attr_type == AttributeType::MessageAuthenticator as u8)
+    {
+        ma.value = mac.to_vec();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::proxy::home_server::HomeServerConfig;
     use radius_proto::Code;
+    use radius_proto::mppe::encrypt_key;
     use std::time::Duration;
+
+    const HOME_SECRET: &[u8] = b"home_secret";
+    const CLIENT_SECRET: &[u8] = b"test_secret";
+    const REQUEST_AUTH: [u8; 16] = [
+        0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae,
+        0xaf,
+    ];
+    const PROXY_STATE: [u8; 16] = [0x50; 16];
+
+    fn test_keys() -> MppeKeys {
+        MppeKeys {
+            send_key: (0x01..=0x20).collect(),
+            recv_key: (0x21..=0x40).collect(),
+        }
+    }
+
+    /// Cache entry for a request the proxy forwarded: the NAS's request plus our
+    /// Proxy-State, authenticated by `REQUEST_AUTH`.
+    fn create_test_entry(source: SocketAddr) -> ProxyCacheEntry {
+        let mut request = Packet::new(Code::AccessRequest, 7, REQUEST_AUTH);
+        request
+            .add_attribute(Attribute::string(AttributeType::UserName as u8, "testuser").unwrap());
+        request.add_attribute(
+            Attribute::new(AttributeType::ProxyState as u8, PROXY_STATE.to_vec()).unwrap(),
+        );
+        ProxyCacheEntry {
+            original_request: request,
+            original_source: source,
+            home_server: create_test_home_server(),
+            sent_at: Instant::now(),
+            retry_count: 0,
+            proxy_state: PROXY_STATE,
+            client_secret: CLIENT_SECRET.to_vec(),
+        }
+    }
+
+    /// Finalize a home server reply: zero Message-Authenticator (the proxy does
+    /// not verify it), echo our Proxy-State, sign with the home server secret.
+    fn finalize_home_response(mut response: Packet) -> Packet {
+        response.add_attribute(
+            Attribute::new(AttributeType::ProxyState as u8, PROXY_STATE.to_vec()).unwrap(),
+        );
+        response.authenticator =
+            calculate_response_authenticator(&response, &REQUEST_AUTH, HOME_SECRET);
+        response
+    }
+
+    /// Access-Accept as a home server would send it after EAP-TLS: EAP-Success,
+    /// Message-Authenticator and the MPPE keys encrypted under the home pair.
+    fn home_access_accept_with_keys() -> Packet {
+        let mut response = Packet::new(Code::AccessAccept, 7, [0u8; 16]);
+        response.add_attribute(
+            Attribute::new(
+                AttributeType::EapMessage as u8,
+                vec![0x03, 0x01, 0x00, 0x04],
+            )
+            .unwrap(),
+        );
+        response.add_attribute(
+            Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]).unwrap(),
+        );
+        for attr in test_keys()
+            .to_attributes_with_salts(HOME_SECRET, &REQUEST_AUTH, [0x80, 0x01], [0x80, 0x02])
+            .unwrap()
+        {
+            response.add_attribute(attr);
+        }
+        finalize_home_response(response)
+    }
+
+    fn mppe_ciphertexts(packet: &Packet) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let send = packet
+            .find_vendor_attributes(MICROSOFT_VENDOR_ID, MS_MPPE_SEND_KEY)
+            .into_iter()
+            .map(|v| v.value)
+            .collect();
+        let recv = packet
+            .find_vendor_attributes(MICROSOFT_VENDOR_ID, MS_MPPE_RECV_KEY)
+            .into_iter()
+            .map(|v| v.value)
+            .collect();
+        (send, recv)
+    }
+
+    /// Message-Authenticator check mirroring what a NAS does (RFC 3579 §3.2).
+    fn message_authenticator_valid(
+        packet: &Packet,
+        request_auth: &[u8; 16],
+        secret: &[u8],
+    ) -> bool {
+        let received = packet
+            .find_attribute(AttributeType::MessageAuthenticator as u8)
+            .map(|a| a.value.clone())
+            .expect("Message-Authenticator present");
+        let mut zeroed = packet.clone();
+        zeroed.authenticator = *request_auth;
+        for ma in zeroed
+            .attributes
+            .iter_mut()
+            .filter(|a| a.attr_type == AttributeType::MessageAuthenticator as u8)
+        {
+            ma.value = vec![0u8; 16];
+        }
+        calculate_message_authenticator(&zeroed.encode().unwrap(), secret).to_vec() == received
+    }
+
+    #[test]
+    fn rewrite_rekeys_mppe_from_home_secret_to_client_secret() {
+        let entry = create_test_entry("192.168.1.100:12345".parse().unwrap());
+        let home_response = home_access_accept_with_keys();
+        let (home_send, home_recv) = mppe_ciphertexts(&home_response);
+
+        let relayed = rewrite_response_for_nas(home_response, &entry).unwrap();
+
+        // The NAS accepts the packet under its own secret ...
+        assert!(verify_response_authenticator(
+            &relayed,
+            &REQUEST_AUTH,
+            CLIENT_SECRET
+        ));
+        assert!(message_authenticator_valid(
+            &relayed,
+            &REQUEST_AUTH,
+            CLIENT_SECRET
+        ));
+        // ... our Proxy-State is gone, everything else survived ...
+        assert!(
+            relayed
+                .find_attribute(AttributeType::ProxyState as u8)
+                .is_none()
+        );
+        assert!(
+            relayed
+                .find_attribute(AttributeType::EapMessage as u8)
+                .is_some()
+        );
+        // ... and the keys decrypt under the client pair to the home server's keys.
+        let decrypted = MppeKeys::from_packet(&relayed, CLIENT_SECRET, &REQUEST_AUTH)
+            .unwrap()
+            .expect("MPPE keys present");
+        assert_eq!(decrypted, test_keys());
+
+        // Exactly one of each, with ciphertext that differs from the home server's
+        // (different secret and fresh salts), and no longer decryptable as-is
+        // under the home pair.
+        let (send, recv) = mppe_ciphertexts(&relayed);
+        assert_eq!(send.len(), 1);
+        assert_eq!(recv.len(), 1);
+        assert_ne!(send, home_send);
+        assert_ne!(recv, home_recv);
+        assert!(
+            MppeKeys::from_packet(&relayed, HOME_SECRET, &REQUEST_AUTH)
+                .map(|k| k != Some(test_keys()))
+                .unwrap_or(true)
+        );
+    }
+
+    #[test]
+    fn rewrite_without_mppe_keys_leaves_attributes_alone() {
+        let entry = create_test_entry("192.168.1.100:12345".parse().unwrap());
+        let mut response = Packet::new(Code::AccessAccept, 7, [0u8; 16]);
+        response
+            .add_attribute(Attribute::integer(AttributeType::SessionTimeout as u8, 3600).unwrap());
+        let home_response = finalize_home_response(response);
+
+        let relayed = rewrite_response_for_nas(home_response, &entry).unwrap();
+
+        assert!(verify_response_authenticator(
+            &relayed,
+            &REQUEST_AUTH,
+            CLIENT_SECRET
+        ));
+        assert_eq!(relayed.attributes.len(), 1);
+        assert_eq!(
+            relayed.attributes[0].attr_type,
+            AttributeType::SessionTimeout as u8
+        );
+        // No EAP-Message, so no Message-Authenticator is invented.
+        assert!(
+            relayed
+                .find_attribute(AttributeType::MessageAuthenticator as u8)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rewrite_drops_undecryptable_mppe_keys_but_keeps_other_vsas() {
+        let entry = create_test_entry("192.168.1.100:12345".parse().unwrap());
+        let mut response = Packet::new(Code::AccessAccept, 7, [0u8; 16]);
+        // A Send-Key encrypted under the wrong Request Authenticator (as a buggy
+        // or misconfigured home server might emit) and no Recv-Key at all.
+        let bad = encrypt_key(
+            &test_keys().send_key,
+            HOME_SECRET,
+            &[0x11; 16],
+            [0x80, 0x09],
+        )
+        .unwrap();
+        // Share the VSA with MS-MPPE-Encryption-Policy (7), which must survive.
+        let policy = VendorSpecific::new(MICROSOFT_VENDOR_ID, 7, vec![0, 0, 0, 1]).unwrap();
+        let send = VendorSpecific::new(MICROSOFT_VENDOR_ID, MS_MPPE_SEND_KEY, bad).unwrap();
+        response
+            .add_attribute(VendorSpecific::to_attribute_combined(&[policy.clone(), send]).unwrap());
+        let home_response = finalize_home_response(response);
+
+        let relayed = rewrite_response_for_nas(home_response, &entry).unwrap();
+
+        assert!(verify_response_authenticator(
+            &relayed,
+            &REQUEST_AUTH,
+            CLIENT_SECRET
+        ));
+        let (send, recv) = mppe_ciphertexts(&relayed);
+        assert!(
+            send.is_empty(),
+            "undecryptable Send-Key must not be forwarded"
+        );
+        assert!(recv.is_empty());
+        assert_eq!(
+            relayed.find_vendor_attributes(MICROSOFT_VENDOR_ID, 7),
+            vec![policy]
+        );
+        assert_eq!(
+            MppeKeys::from_packet(&relayed, CLIENT_SECRET, &REQUEST_AUTH).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn rewrite_rejects_response_with_bad_home_authenticator() {
+        let entry = create_test_entry("192.168.1.100:12345".parse().unwrap());
+        let mut home_response = home_access_accept_with_keys();
+        home_response.authenticator[0] ^= 0xff;
+
+        match rewrite_response_for_nas(home_response, &entry) {
+            Err(ProxyError::InvalidResponseAuthenticator) => {}
+            other => panic!(
+                "expected InvalidResponseAuthenticator, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_response_relays_rekeyed_accept_to_nas() {
+        // A loopback socket stands in for the NAS.
+        let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let nas_addr = nas.local_addr().unwrap();
+
+        let cache = Arc::new(ProxyCache::new(Duration::from_secs(60), 1000));
+        let handler = ProxyHandler::new(cache.clone(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let entry = create_test_entry(nas_addr);
+        let home_addr = entry.home_server.address;
+        cache.insert(entry).unwrap();
+
+        handler
+            .handle_response(home_access_accept_with_keys(), home_addr)
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 4096];
+        let (len, from) = tokio::time::timeout(Duration::from_secs(5), nas.recv_from(&mut buf))
+            .await
+            .expect("relayed response within 5s")
+            .unwrap();
+        assert_eq!(from, handler.socket().local_addr().unwrap());
+        let relayed = Packet::decode(&buf[..len]).unwrap();
+
+        assert_eq!(relayed.code, Code::AccessAccept);
+        assert_eq!(relayed.identifier, 7);
+        assert!(verify_response_authenticator(
+            &relayed,
+            &REQUEST_AUTH,
+            CLIENT_SECRET
+        ));
+        assert!(message_authenticator_valid(
+            &relayed,
+            &REQUEST_AUTH,
+            CLIENT_SECRET
+        ));
+        assert_eq!(
+            MppeKeys::from_packet(&relayed, CLIENT_SECRET, &REQUEST_AUTH).unwrap(),
+            Some(test_keys())
+        );
+        assert!(cache.get(&PROXY_STATE).is_none(), "entry consumed");
+    }
 
     fn create_test_home_server() -> Arc<HomeServer> {
         let config = HomeServerConfig {

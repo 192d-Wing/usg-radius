@@ -135,7 +135,7 @@ pub fn encrypt_key(
     out.extend_from_slice(&salt);
 
     let mut b = md5_chain(secret, request_authenticator, salt);
-    for (i, block) in plaintext.chunks_exact(BLOCK).enumerate() {
+    for (i, block) in plaintext.as_chunks::<BLOCK>().0.iter().enumerate() {
         if i > 0 {
             let prev = &out[out.len() - BLOCK..];
             b = md5_next(secret, prev);
@@ -166,7 +166,7 @@ pub fn decrypt_key(
 
     let mut plaintext = Vec::with_capacity(cipher_len);
     let mut b = md5_chain(secret, request_authenticator, salt);
-    for (i, block) in cipher.chunks_exact(BLOCK).enumerate() {
+    for (i, block) in cipher.as_chunks::<BLOCK>().0.iter().enumerate() {
         if i > 0 {
             b = md5_next(secret, &cipher[(i - 1) * BLOCK..i * BLOCK]);
         }

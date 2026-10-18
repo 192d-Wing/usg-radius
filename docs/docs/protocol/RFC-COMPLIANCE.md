@@ -922,7 +922,6 @@ Total:         156+ tests
 | CoA/Disconnect | 5176 | ✅ RadSec only | v0.10.0 | MEDIUM | Server-originated via mgmt API; no UDP path |
 | NAS Identification | 2865 | ✅ Complete | v0.2.0 | MEDIUM | NAS-IP-Address or NAS-Identifier enforced |
 | Enumerated Values | 2865 | ✅ Strict mode | v0.2.0 | LOW | Lenient mode accepts unknown values |
-| MS-MPPE Keys | 2548 | ❌ Missing | - | HIGH | MSK derived, VSA 311 not encoded |
 | Certificate Revocation | 5280 / 6960 | ⚠️ Not integrated | v0.7.x | HIGH | `revocation` feature in radius-proto only |
 | Accounting Port 1813 | 2866 | ⚠️ Not bound | - | MEDIUM | Single UDP socket on listen_port |
 | Proxy-State | 2865 | ⚠️ Echoed | v0.x | MEDIUM | Ordering tests pending |
@@ -973,6 +972,11 @@ The current implementation is **PRODUCTION-READY** for:
 
 1. **RADIUS Proxy**
    - Basic forwarding works
+   - Response leg verifies the home server's Response Authenticator, re-encrypts
+     RFC 2548 MS-MPPE-Send/Recv-Key from the home server secret to the client
+     secret, and recomputes Message-Authenticator / Response Authenticator for
+     the NAS ([crates/radius-server/src/proxy/handler.rs](../../crates/radius-server/src/proxy/handler.rs))
+   - Tunnel-Password (RFC 2868 §3.5) is not re-encrypted on the response leg
    - Proxy-State echoed; multi-Proxy-State ordering regression tests pending
    - Hot reload not available
    - Upstream (proxy) leg is UDP only
