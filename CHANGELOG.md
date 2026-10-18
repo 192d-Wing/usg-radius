@@ -36,6 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Proxy timeout Access-Reject was signed with an empty secret, so the NAS
+  discarded it.** After a proxied request exhausted its retries, `RetryManager`
+  computed the Response Authenticator of the Access-Reject it sends back to the
+  NAS with `b""` instead of the NAS's shared secret. The NAS verifies that
+  authenticator under the shared secret, silently drops the mismatch, and keeps
+  waiting until its own timeout. The reject is now signed with the client
+  secret recorded in the proxy cache entry, with a loopback test asserting it
+  verifies under that secret and not under an empty one.
 - **Proxied Access-Accepts forwarded Tunnel-Password the NAS could not decrypt.**
   RFC 2868 §3.5 Tunnel-Password is salt-encrypted with the same MD5 chain as the
   MS-MPPE keys (`MD5(secret || Request-Authenticator || Salt)`, Tag octet in

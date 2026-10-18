@@ -243,11 +243,13 @@ impl RetryManager {
             })?,
         );
 
-        // Calculate response authenticator (use empty secret for reject from proxy)
+        // Sign under the NAS's shared secret: the NAS verifies the Response
+        // Authenticator with the secret it shares with us, so a reject signed
+        // with anything else is silently discarded and the NAS keeps waiting.
         let response_auth = calculate_response_authenticator(
             &reject,
             &entry.original_request.authenticator,
-            b"", // Empty secret - reject from proxy itself
+            &entry.client_secret,
         );
         reject.authenticator = response_auth;
 
@@ -274,6 +276,16 @@ impl Drop for RetryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::home_server::{HomeServer, HomeServerConfig};
+    use radius_proto::auth::verify_response_authenticator;
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    const CLIENT_SECRET: &[u8] = b"test_secret";
+    const REQUEST_AUTH: [u8; 16] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10,
+    ];
 
     fn create_test_config() -> RetryConfig {
         RetryConfig {
@@ -341,5 +353,59 @@ mod tests {
 
         // Wait for task to finish
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// Cache entry for a request the proxy forwarded on behalf of `source`,
+    /// authenticated by `REQUEST_AUTH` under `CLIENT_SECRET`.
+    fn create_test_entry(source: SocketAddr) -> ProxyCacheEntry {
+        let config = HomeServerConfig {
+            address: "127.0.0.1:11812".to_string(),
+            secret: "home_secret".to_string(),
+            timeout: 30,
+            max_outstanding: 100,
+            name: Some("Test Server".to_string()),
+        };
+        let mut request = Packet::new(Code::AccessRequest, 7, REQUEST_AUTH);
+        request
+            .add_attribute(Attribute::string(AttributeType::UserName as u8, "testuser").unwrap());
+        ProxyCacheEntry {
+            original_request: request,
+            original_source: source,
+            home_server: Arc::new(HomeServer::new(config).unwrap()),
+            sent_at: Instant::now(),
+            retry_count: 0,
+            proxy_state: [0x50; 16],
+            client_secret: CLIENT_SECRET.to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_reject_signs_with_client_secret() {
+        // A loopback socket stands in for the NAS.
+        let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let nas_addr = nas.local_addr().unwrap();
+        let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let entry = create_test_entry(nas_addr);
+
+        RetryManager::send_reject(&proxy, &entry).await.unwrap();
+
+        let mut buf = [0u8; 4096];
+        let (len, from) = tokio::time::timeout(Duration::from_secs(5), nas.recv_from(&mut buf))
+            .await
+            .expect("reject within 5s")
+            .unwrap();
+        assert_eq!(from, proxy.local_addr().unwrap());
+        let reject = Packet::decode(&buf[..len]).unwrap();
+
+        assert_eq!(reject.code, Code::AccessReject);
+        assert_eq!(reject.identifier, 7);
+        assert!(
+            verify_response_authenticator(&reject, &REQUEST_AUTH, CLIENT_SECRET),
+            "reject must verify under the NAS's shared secret"
+        );
+        assert!(
+            !verify_response_authenticator(&reject, &REQUEST_AUTH, b""),
+            "reject must not be signed with an empty secret"
+        );
     }
 }
