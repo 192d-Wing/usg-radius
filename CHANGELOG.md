@@ -36,6 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Proxied Access-Accepts forwarded Tunnel-Password the NAS could not decrypt.**
+  RFC 2868 §3.5 Tunnel-Password is salt-encrypted with the same MD5 chain as the
+  MS-MPPE keys (`MD5(secret || Request-Authenticator || Salt)`, Tag octet in
+  front), so a home server's tunnel password relayed through the proxy was
+  bound to the wrong secret and unusable by the NAS. `radius-proto` gained an
+  RFC 2868 §3.5 codec (`radius_proto::tunnel_password`, `AttributeType::TunnelPassword`)
+  with known-answer and round-trip tests, and the proxy now decrypts every
+  Tunnel-Password under the home server secret and re-encrypts it under the
+  client secret with a fresh salt — unique across the packet, including the
+  MS-MPPE salts — keeping its Tag and position. Passwords that fail to decrypt
+  are dropped and logged, as for the MS-MPPE keys.
 - **Proxied Access-Accepts forwarded MS-MPPE keys the NAS could not decrypt.**
   RFC 2548 §2.4.2 binds MS-MPPE-Send-Key / MS-MPPE-Recv-Key to the shared
   secret of the hop that encrypted them, so a home server's keys were relayed

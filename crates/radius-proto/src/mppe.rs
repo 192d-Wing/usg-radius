@@ -48,8 +48,8 @@ pub const MS_MPPE_RECV_KEY: u8 = 17;
 pub const SALT_LENGTH: usize = 2;
 /// Size of the Key-Length octet that prefixes the plaintext key.
 const KEY_LENGTH_FIELD: usize = 1;
-/// MD5 block size used by the XOR chain.
-const BLOCK: usize = 16;
+/// MD5 block size used by the XOR chain (shared with Tunnel-Password).
+pub(crate) const BLOCK: usize = 16;
 /// Longest key that still fits in one sub-attribute: the encrypted String is
 /// `2 + 16·ceil((1 + len) / 16)` octets and must not exceed
 /// [`VendorSpecific::MAX_VALUE_LENGTH`] (247), so `1 + len ≤ 240`.
@@ -91,7 +91,11 @@ pub enum MppeError {
 
 /// b(1) = MD5(Secret || Request-Authenticator || Salt) — the first keystream
 /// block of the RFC 2548 §2.4.2 chain.
-fn md5_chain(secret: &[u8], request_authenticator: &[u8; 16], salt: [u8; 2]) -> [u8; 16] {
+pub(crate) fn md5_chain(
+    secret: &[u8],
+    request_authenticator: &[u8; 16],
+    salt: [u8; 2],
+) -> [u8; 16] {
     let mut data = Vec::with_capacity(secret.len() + 16 + SALT_LENGTH);
     data.extend_from_slice(secret);
     data.extend_from_slice(request_authenticator);
@@ -101,7 +105,7 @@ fn md5_chain(secret: &[u8], request_authenticator: &[u8; 16], salt: [u8; 2]) -> 
 
 /// b(i) = MD5(Secret || c(i-1)) — every subsequent keystream block is chained
 /// off the previous *ciphertext* block, for encryption and decryption alike.
-fn md5_next(secret: &[u8], prev_cipher: &[u8]) -> [u8; 16] {
+pub(crate) fn md5_next(secret: &[u8], prev_cipher: &[u8]) -> [u8; 16] {
     let mut data = Vec::with_capacity(secret.len() + BLOCK);
     data.extend_from_slice(secret);
     data.extend_from_slice(prev_cipher);
@@ -198,7 +202,8 @@ pub fn encrypt_key_attribute(
 }
 
 /// Produce `count` distinct salts with the most significant bit set: a random
-/// 15-bit base, incremented per attribute (RFC 2548 §2.4.2 uniqueness rule).
+/// 15-bit base, incremented per attribute (RFC 2548 §2.4.2 uniqueness rule;
+/// RFC 2868 §3.5 Tunnel-Password shares the same salt space).
 pub fn generate_salts(count: usize) -> Vec<[u8; 2]> {
     use rand::Rng;
     let base: u16 = rand::rng().random::<u16>() & 0x7FFF;

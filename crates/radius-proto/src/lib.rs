@@ -49,6 +49,7 @@ pub mod mppe;
 pub mod packet;
 #[cfg(feature = "revocation")]
 pub mod revocation;
+pub mod tunnel_password;
 pub mod validation;
 
 pub use accounting::{AccountingError, AcctAuthentic, AcctStatusType, AcctTerminateCause};
@@ -69,4 +70,5 @@ pub use eap::{
 pub use message_auth::{calculate_message_authenticator, verify_message_authenticator};
 pub use mppe::{MppeError, MppeKeys};
 pub use packet::{Code, Packet, PacketError};
+pub use tunnel_password::{TunnelPassword, TunnelPasswordError};
 pub use validation::{ValidationError, ValidationMode, validate_packet};

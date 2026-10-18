@@ -5,8 +5,8 @@ use crate::proxy::error::{ProxyError, ProxyResult};
 use crate::proxy::home_server::HomeServer;
 use radius_proto::attributes::{Attribute, AttributeType, VendorSpecific};
 use radius_proto::auth::{calculate_response_authenticator, verify_response_authenticator};
-use radius_proto::mppe::{MICROSOFT_VENDOR_ID, MS_MPPE_RECV_KEY, MS_MPPE_SEND_KEY};
-use radius_proto::{MppeKeys, Packet, calculate_message_authenticator};
+use radius_proto::mppe::{MICROSOFT_VENDOR_ID, MS_MPPE_RECV_KEY, MS_MPPE_SEND_KEY, generate_salts};
+use radius_proto::{MppeKeys, Packet, TunnelPassword, calculate_message_authenticator};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -128,8 +128,9 @@ impl ProxyHandler {
     /// 2. Look up original request in cache
     /// 3. Validate response authenticator (with home server secret)
     /// 4. Remove our Proxy-State attribute
-    /// 5. Re-encrypt MS-MPPE-Send-Key / MS-MPPE-Recv-Key (RFC 2548 §2.4) from
-    ///    the home server secret to the client secret
+    /// 5. Re-encrypt MS-MPPE-Send-Key / MS-MPPE-Recv-Key (RFC 2548 §2.4) and
+    ///    Tunnel-Password (RFC 2868 §3.5) from the home server secret to the
+    ///    client secret
     /// 6. Recalculate Message-Authenticator and Response-Authenticator (with
     ///    client secret)
     /// 7. Forward to original NAS
@@ -223,9 +224,13 @@ impl ProxyHandler {
 ///    NAS unless re-encrypted: decrypt under the home server secret, re-encrypt
 ///    under the client secret with fresh salts. Keys that do not decrypt are
 ///    dropped rather than forwarded as garbage.
-/// 4. Recompute Message-Authenticator (RFC 3579 §3.2) under the client secret
+/// 4. Tunnel-Password (RFC 2868 §3.5) uses the same salted chain with a Tag
+///    octet in front: each one is decrypted under the home server secret and
+///    re-encrypted under the client secret with a fresh salt, keeping its Tag
+///    and position. Passwords that do not decrypt are dropped.
+/// 5. Recompute Message-Authenticator (RFC 3579 §3.2) under the client secret
 ///    if present — or add one when the response carries EAP-Message.
-/// 5. Recompute the Response Authenticator under the client secret.
+/// 6. Recompute the Response Authenticator under the client secret.
 pub(crate) fn rewrite_response_for_nas(
     mut response: Packet,
     entry: &ProxyCacheEntry,
@@ -252,10 +257,13 @@ pub(crate) fn rewrite_response_for_nas(
     // 3. Re-key MS-MPPE attributes from the home server secret to the client secret.
     rekey_mppe_attributes(&mut response, entry);
 
-    // 4. Message-Authenticator under the client secret.
+    // 4. Re-key Tunnel-Password attributes the same way.
+    rekey_tunnel_passwords(&mut response, entry);
+
+    // 5. Message-Authenticator under the client secret.
     recompute_message_authenticator(&mut response, request_authenticator, &entry.client_secret)?;
 
-    // 5. Response Authenticator under the client secret.
+    // 6. Response Authenticator under the client secret.
     response.authenticator =
         calculate_response_authenticator(&response, request_authenticator, &entry.client_secret);
 
@@ -345,6 +353,90 @@ fn strip_mppe_attributes(response: &mut Packet) {
         }
     }
     response.attributes = rewritten;
+}
+
+/// Decrypt every RFC 2868 Tunnel-Password under the home server pair and
+/// re-encrypt it under the client pair with a fresh salt, in place and with its
+/// Tag preserved. A password that fails to decrypt (wrong secret, bad framing,
+/// invalid Tag or Salt) is removed and logged so the NAS never receives
+/// undecryptable material; every other attribute is left untouched.
+fn rekey_tunnel_passwords(response: &mut Packet, entry: &ProxyCacheEntry) {
+    let request_authenticator = &entry.original_request.authenticator;
+    let tunnel_password = AttributeType::TunnelPassword as u8;
+
+    let count = response
+        .attributes
+        .iter()
+        .filter(|a| a.attr_type == tunnel_password)
+        .count();
+    if count == 0 {
+        return;
+    }
+
+    // RFC 2868 §3.5: every Salt in the packet must be unique, including those
+    // the MS-MPPE keys (re-keyed just before us) already carry.
+    let in_use: Vec<[u8; 2]> = response
+        .find_vendor_attributes(MICROSOFT_VENDOR_ID, MS_MPPE_SEND_KEY)
+        .into_iter()
+        .chain(response.find_vendor_attributes(MICROSOFT_VENDOR_ID, MS_MPPE_RECV_KEY))
+        .filter_map(|v| v.value.get(..2).map(|s| [s[0], s[1]]))
+        .collect();
+    let mut salts = fresh_salts(count, &in_use).into_iter();
+
+    let mut rewritten = Vec::with_capacity(response.attributes.len());
+    for attr in response.attributes.drain(..) {
+        if attr.attr_type != tunnel_password {
+            rewritten.push(attr);
+            continue;
+        }
+        let password = match TunnelPassword::from_attribute(
+            &attr,
+            entry.home_server.secret(),
+            request_authenticator,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    home_server = %entry.home_server.name,
+                    identifier = response.identifier,
+                    error = %e,
+                    "Failed to decrypt Tunnel-Password from home server; dropping it"
+                );
+                continue;
+            }
+        };
+        let salt = salts.next().expect("one fresh salt per Tunnel-Password");
+        match password.to_attribute_with_salt(&entry.client_secret, request_authenticator, salt) {
+            Ok(a) => {
+                debug!(
+                    home_server = %entry.home_server.name,
+                    identifier = response.identifier,
+                    tag = password.tag,
+                    "Re-encrypted Tunnel-Password for NAS"
+                );
+                rewritten.push(a);
+            }
+            Err(e) => {
+                warn!(
+                    home_server = %entry.home_server.name,
+                    identifier = response.identifier,
+                    error = %e,
+                    "Failed to re-encrypt Tunnel-Password for NAS; dropping it"
+                );
+            }
+        }
+    }
+    response.attributes = rewritten;
+}
+
+/// `count` distinct salts (MSB set) none of which appears in `in_use`.
+/// [`generate_salts`] yields distinct values, so asking for `count + in_use.len()`
+/// and discarding the ones already taken always leaves at least `count`.
+fn fresh_salts(count: usize, in_use: &[[u8; 2]]) -> Vec<[u8; 2]> {
+    let mut salts = generate_salts(count + in_use.len());
+    salts.retain(|s| !in_use.contains(s));
+    salts.truncate(count);
+    salts
 }
 
 /// Recompute Message-Authenticator (RFC 3579 §3.2) over the rewritten response
@@ -630,6 +722,183 @@ mod tests {
         assert_eq!(
             MppeKeys::from_packet(&relayed, CLIENT_SECRET, &REQUEST_AUTH).unwrap(),
             None
+        );
+    }
+
+    fn test_tunnel_passwords() -> Vec<TunnelPassword> {
+        vec![
+            TunnelPassword {
+                tag: 0x01,
+                password: b"l2tp-primary-secret".to_vec(),
+            },
+            TunnelPassword {
+                tag: 0x02,
+                password: (0x30..=0x6f).collect(),
+            },
+        ]
+    }
+
+    fn tunnel_password_values(packet: &Packet) -> Vec<Vec<u8>> {
+        packet
+            .attributes
+            .iter()
+            .filter(|a| a.attr_type == AttributeType::TunnelPassword as u8)
+            .map(|a| a.value.clone())
+            .collect()
+    }
+
+    /// Access-Accept from a home server provisioning two tunnels: tagged
+    /// Tunnel-Type / Tunnel-Medium-Type around each Tunnel-Password (so order
+    /// matters), plus MPPE keys to share the salt space with.
+    fn home_access_accept_with_tunnel_passwords() -> Packet {
+        let mut response = Packet::new(Code::AccessAccept, 7, [0u8; 16]);
+        for (i, tp) in test_tunnel_passwords().iter().enumerate() {
+            // Tunnel-Type (64), tagged, L2TP (3).
+            response.add_attribute(Attribute::new(64, vec![tp.tag, 0, 0, 3]).unwrap());
+            response.add_attribute(
+                tp.to_attribute_with_salt(HOME_SECRET, &REQUEST_AUTH, [0x80, 0x10 + i as u8])
+                    .unwrap(),
+            );
+            // Tunnel-Medium-Type (65), tagged, IPv4 (1).
+            response.add_attribute(Attribute::new(65, vec![tp.tag, 0, 0, 1]).unwrap());
+        }
+        for attr in test_keys()
+            .to_attributes_with_salts(HOME_SECRET, &REQUEST_AUTH, [0x80, 0x01], [0x80, 0x02])
+            .unwrap()
+        {
+            response.add_attribute(attr);
+        }
+        finalize_home_response(response)
+    }
+
+    #[test]
+    fn rewrite_reencrypts_tunnel_password_from_home_secret_to_client_secret() {
+        let entry = create_test_entry("192.168.1.100:12345".parse().unwrap());
+        let home_response = home_access_accept_with_tunnel_passwords();
+        let home_values = tunnel_password_values(&home_response);
+        let home_types: Vec<u8> = home_response
+            .attributes
+            .iter()
+            .map(|a| a.attr_type)
+            .filter(|t| *t != AttributeType::ProxyState as u8)
+            .collect();
+
+        let relayed = rewrite_response_for_nas(home_response, &entry).unwrap();
+
+        // The NAS accepts the packet under its own secret ...
+        assert!(verify_response_authenticator(
+            &relayed,
+            &REQUEST_AUTH,
+            CLIENT_SECRET
+        ));
+        // ... attribute order is intact, so the tagged tunnel groups still line
+        // up (MPPE keys get re-appended, which keeps them last) ...
+        let relayed_types: Vec<u8> = relayed.attributes.iter().map(|a| a.attr_type).collect();
+        assert_eq!(relayed_types, home_types);
+
+        // ... each Tunnel-Password decrypts under the client pair to the home
+        // server's password with its Tag preserved ...
+        let decrypted: Vec<TunnelPassword> = relayed
+            .attributes
+            .iter()
+            .filter(|a| a.attr_type == AttributeType::TunnelPassword as u8)
+            .map(|a| TunnelPassword::from_attribute(a, CLIENT_SECRET, &REQUEST_AUTH).unwrap())
+            .collect();
+        assert_eq!(decrypted, test_tunnel_passwords());
+
+        // ... with ciphertext that differs from the home server's (different
+        // secret and fresh salts), tags in the clear and no longer decryptable
+        // as-is under the home pair.
+        let values = tunnel_password_values(&relayed);
+        assert_eq!(values.len(), 2);
+        assert_ne!(values, home_values);
+        assert_eq!(values[0][0], 0x01);
+        assert_eq!(values[1][0], 0x02);
+        for (a, h) in relayed
+            .attributes
+            .iter()
+            .filter(|a| a.attr_type == AttributeType::TunnelPassword as u8)
+            .zip(test_tunnel_passwords())
+        {
+            if let Ok(p) = TunnelPassword::from_attribute(a, HOME_SECRET, &REQUEST_AUTH) {
+                assert_ne!(p, h);
+            }
+        }
+
+        // Every salt in the packet is distinct: both Tunnel-Passwords and the
+        // two MPPE keys.
+        let (send, recv) = mppe_ciphertexts(&relayed);
+        let mut salts: Vec<[u8; 2]> = values
+            .iter()
+            .map(|v| [v[1], v[2]])
+            .chain(send.iter().chain(recv.iter()).map(|v| [v[0], v[1]]))
+            .collect();
+        assert!(salts.iter().all(|s| s[0] & 0x80 != 0));
+        salts.sort_unstable();
+        salts.dedup();
+        assert_eq!(salts.len(), 4, "salts must be unique within the packet");
+
+        // MPPE keys are still re-keyed alongside.
+        assert_eq!(
+            MppeKeys::from_packet(&relayed, CLIENT_SECRET, &REQUEST_AUTH).unwrap(),
+            Some(test_keys())
+        );
+    }
+
+    #[test]
+    fn rewrite_drops_undecryptable_tunnel_password_but_keeps_the_rest() {
+        let entry = create_test_entry("192.168.1.100:12345".parse().unwrap());
+        let good = test_tunnel_passwords().remove(0);
+        let mut response = Packet::new(Code::AccessAccept, 7, [0u8; 16]);
+        response.add_attribute(Attribute::new(64, vec![good.tag, 0, 0, 3]).unwrap());
+        response.add_attribute(
+            good.to_attribute_with_salt(HOME_SECRET, &REQUEST_AUTH, [0x80, 0x10])
+                .unwrap(),
+        );
+        // A Tunnel-Password encrypted under the wrong Request Authenticator (as a
+        // buggy or misconfigured home server might emit). With this salt the
+        // keystream mismatch deterministically yields a Data-Length octet larger
+        // than the single plaintext block, so decryption fails ...
+        response.add_attribute(
+            TunnelPassword {
+                tag: 0x02,
+                password: b"never-forwarded".to_vec(),
+            }
+            .to_attribute_with_salt(HOME_SECRET, &[0x11; 16], [0x80, 0x15])
+            .unwrap(),
+        );
+        // ... and one whose Tag is out of range.
+        let mut bad_tag = good
+            .to_attribute_with_salt(HOME_SECRET, &REQUEST_AUTH, [0x80, 0x12])
+            .unwrap();
+        bad_tag.value[0] = 0x20;
+        response.add_attribute(bad_tag);
+        response
+            .add_attribute(Attribute::integer(AttributeType::SessionTimeout as u8, 3600).unwrap());
+        let home_response = finalize_home_response(response);
+
+        let relayed = rewrite_response_for_nas(home_response, &entry).unwrap();
+
+        assert!(verify_response_authenticator(
+            &relayed,
+            &REQUEST_AUTH,
+            CLIENT_SECRET
+        ));
+        let relayed_types: Vec<u8> = relayed.attributes.iter().map(|a| a.attr_type).collect();
+        assert_eq!(
+            relayed_types,
+            vec![
+                64,
+                AttributeType::TunnelPassword as u8,
+                AttributeType::SessionTimeout as u8
+            ]
+        );
+        let forwarded = relayed
+            .find_attribute(AttributeType::TunnelPassword as u8)
+            .unwrap();
+        assert_eq!(
+            TunnelPassword::from_attribute(forwarded, CLIENT_SECRET, &REQUEST_AUTH).unwrap(),
+            good
         );
     }
 

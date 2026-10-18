@@ -421,12 +421,17 @@ eap_handler.configure_tls("", cert_config)?;
 
 #### Tunnel Attributes
 
-**RFC**: RFC 2869 Section 5.1-5.12
+**RFC**: RFC 2868 Section 3.1-3.11
 **Purpose**: VPN and tunnel configuration
 **Priority**: MEDIUM
 **Status**: Future enhancement
 
-**Missing**: All tunnel-related attributes (Types 64-69)
+**Implemented**: Tunnel-Password (Type 69, RFC 2868 §3.5) salt-encrypt /
+decrypt codec in [crates/radius-proto/src/tunnel_password.rs](../../crates/radius-proto/src/tunnel_password.rs),
+used by the proxy to re-encrypt home-server passwords for the NAS.
+
+**Missing**: Tagged tunnel attribute codecs (Types 64-68, 81-83, 90-91); the
+server does not originate tunnel attributes itself.
 
 ---
 
@@ -887,7 +892,7 @@ Total:         156+ tests
 ### Priority 4 (LOW) - ❌ NOT PLANNED
 
 1. ⚠️ **Vendor Attributes** - Type 26 codec and RFC 2548 MS-MPPE keys implemented; vendor dictionaries not prioritized
-2. ❌ **Tunnel Attributes** - Future enhancement
+2. ⚠️ **Tunnel Attributes** - Tunnel-Password (69) codec + proxy re-encryption only; the rest is a future enhancement
 3. ❌ **CoA/Disconnect over UDP** - Only the RadSec path shipped (v0.10.0)
 4. ❌ **DTLS (RFC 7360)** - Not planned; RadSec is TLS-only
 5. ❌ **Accounting on a dedicated 1813 socket** - Single UDP socket; 1813 advertised but not bound
@@ -973,10 +978,11 @@ The current implementation is **PRODUCTION-READY** for:
 1. **RADIUS Proxy**
    - Basic forwarding works
    - Response leg verifies the home server's Response Authenticator, re-encrypts
-     RFC 2548 MS-MPPE-Send/Recv-Key from the home server secret to the client
-     secret, and recomputes Message-Authenticator / Response Authenticator for
-     the NAS ([crates/radius-server/src/proxy/handler.rs](../../crates/radius-server/src/proxy/handler.rs))
-   - Tunnel-Password (RFC 2868 §3.5) is not re-encrypted on the response leg
+     RFC 2548 MS-MPPE-Send/Recv-Key and RFC 2868 §3.5 Tunnel-Password (Tag
+     preserved, fresh per-packet-unique salts) from the home server secret to
+     the client secret, dropping any that fail to decrypt, and recomputes
+     Message-Authenticator / Response Authenticator for the NAS
+     ([crates/radius-server/src/proxy/handler.rs](../../crates/radius-server/src/proxy/handler.rs))
    - Proxy-State echoed; multi-Proxy-State ordering regression tests pending
    - Hot reload not available
    - Upstream (proxy) leg is UDP only

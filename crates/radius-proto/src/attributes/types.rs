@@ -114,6 +114,11 @@ pub enum AttributeType {
     PortLimit = 62,
     /// Login-LAT-Port (63) - RFC 2865
     LoginLatPort = 63,
+    /// Tunnel-Password (69) - RFC 2868 §3.5
+    /// Salt-encrypted password for a tunnel endpoint; bound to the shared secret
+    /// and Request Authenticator of the hop that sent it, so a proxy must
+    /// re-encrypt it (see `radius_proto::tunnel_password`).
+    TunnelPassword = 69,
     /// EAP-Message (79) - RFC 3579
     /// Encapsulates EAP packets for transport over RADIUS
     EapMessage = 79,
@@ -195,6 +200,7 @@ impl AttributeType {
             61 => Some(AttributeType::NasPortType),
             62 => Some(AttributeType::PortLimit),
             63 => Some(AttributeType::LoginLatPort),
+            69 => Some(AttributeType::TunnelPassword),
             79 => Some(AttributeType::EapMessage),
             80 => Some(AttributeType::MessageAuthenticator),
             87 => Some(AttributeType::NasPortId),
