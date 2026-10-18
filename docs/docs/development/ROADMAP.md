@@ -2,16 +2,24 @@
 
 This document outlines the development roadmap for the USG RADIUS project, organized by release milestones.
 
-## Current Status: v0.7.0 (Performance & Documentation)
+## Current Status: v0.10.1 (RadSec + CoA/Disconnect)
 
-**Release Date**: January 2026
-**Status**: ✅ Complete - Production-ready with comprehensive documentation and benchmarking
+**Release Date**: June 2026
+**Status**: ✅ Complete - Production-ready with RadSec (RFC 6614) as the default transport, server-originated CoA/Disconnect (RFC 5176), management API mTLS + ABAC, and Kubernetes-only deployment
 
 ### Known Limitations
 
-See [RFC-COMPLIANCE.md](RFC-COMPLIANCE.md) for detailed gap analysis.
+See [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md) for detailed gap analysis. Headline gaps at v0.10.1:
 
-### Completed Features (v0.1.0 through v0.7.0)
+- ❌ MS-MPPE-Send-Key / MS-MPPE-Recv-Key not attached to Access-Accept (WPA-Enterprise key delivery)
+- ❌ No DTLS transport; RadSec is TLS 1.3 only
+- ❌ CoA/Disconnect only over RadSec (no UDP/3799 path)
+- ❌ No certificate hot-rotation for RadSec or EAP-TLS
+- ⚠️ CRL/OCSP module implemented in `radius-proto` but not integrated into the server
+- ⚠️ Status-Server does not verify Message-Authenticator and always replies Access-Accept
+- ⚠️ Only one UDP socket is bound; 1813/udp is advertised but not listened on
+
+### Completed Features (v0.1.0 through v0.10.1)
 
 
 
@@ -112,6 +120,25 @@ See [RFC-COMPLIANCE.md](RFC-COMPLIANCE.md) for detailed gap analysis.
 - ✅ Load test tool rewrite (manual packet construction)
 - ✅ Comprehensive release documentation
 
+#### Kubernetes & Management API Security (v0.9.x)
+
+- ✅ Kubernetes-only deployment (k3s/k8s + Cilium BGP anycast VIP, DSR source-IP preservation); systemd, Docker Compose and HAProxy removed
+- ✅ Health (`/health/*`) and Prometheus (`/metrics`) servers started by the binary (`observability` feature)
+- ✅ Management API authentication: mutual TLS + IAM-style ABAC policy (`mgmt` block), SIGHUP hot-reload of the access policy
+- ✅ Live accounting session index (`GET /api/v1/sessions`)
+- ✅ Dual-stack listener fix (IPv4-mapped source canonicalization)
+- ✅ Multi-arch container image on the Iron Bank Alpine base
+- ✅ Operator UI BFF hardening (no-proxy in-cluster calls, pure-Rust DNS resolver)
+
+#### RadSec & Dynamic Authorization (v0.10.x)
+
+- ✅ RadSec transport (RFC 6614): TLS 1.3, ML-KEM-1024-only key exchange, mutual TLS; `transport = "radsec"` default for config files, `udp-insecure` explicit fallback
+- ✅ Server-originated CoA / Disconnect (RFC 5176) over the established RadSec connection via `POST /api/v1/coa`
+- ✅ Message-Authenticator required on EAP Access-Requests (Blast-RADIUS mitigation)
+- ✅ `Termination-Action` reply attribute, `NAS-IPv6-Address` (95) parsing
+- ✅ Shared KAT wire-format vectors with the authenticator
+- ✅ v0.10.1: container image built with the `tls` feature
+
 ## v0.2.0 - Security & Production Hardening (Q4 2025)
 
 **Goal**: Make the server production-ready for basic deployments
@@ -158,9 +185,9 @@ See [RFC-COMPLIANCE.md](RFC-COMPLIANCE.md) for detailed gap analysis.
 - ✅ Configurable log levels via config file or environment variable
 - ✅ Security event logging (rate limits, unauthorized clients, auth failures)
 - ✅ Audit trail for authentication attempts (JSON format)
-- [ ] Log rotation support (handled by external tools)
+- ✅ Log rotation support (delegated to the platform: `audit_log_path: "stdout"` feeds the Kubernetes log pipeline)
 
-**Status**: ✅ Complete (log rotation delegated to system tools like logrotate)
+**Status**: ✅ Complete (no in-process rotation; the container runtime and log collector handle it)
 
 #### Rate Limiting & DoS Protection ✅ COMPLETED
 
@@ -1174,59 +1201,55 @@ let config = RevocationConfig::disabled();
 - [ ] Multi-backend fallback chains
 
 
-## v0.8.0 - RadSec (RADIUS over TLS) (Q1 2026)
+## v0.8.0 - RadSec (RADIUS over TLS) ✅ SHIPPED IN v0.10.0 (June 2026)
 
 **Goal**: Secure RADIUS transport
 **Priority**: MEDIUM
+**Status**: ✅ Core delivered in v0.10.0 (`crates/radius-server/src/radsec.rs`); the items below marked open did not ship
 
-### TLS Support (RFC 6614)
+### TLS Support (RFC 6614) ✅ COMPLETED
 
-- [ ] TLS 1.2+ support
-- [ ] Certificate-based authentication
-- [ ] RADIUS over TLS (RadSec)
-- [ ] DTLS support
-- [ ] Perfect Forward Secrecy
+- [x] TLS 1.3 support (TLS 1.2 intentionally excluded by the FIPS posture; ML-KEM-1024-only key exchange)
+- [x] Certificate-based authentication (NAS client certificate is the authenticated identity)
+- [x] RADIUS over TLS (RadSec) on 2083/tcp, default transport for config files
+- [ ] DTLS support (RFC 7360) - **not shipped**
+- [x] Perfect Forward Secrecy (ephemeral ML-KEM key exchange)
 
-**Estimated Effort**: 4 weeks
+### Certificate Management for RadSec ⚠️ PARTIAL
 
-### Certificate Management for RadSec
+- [ ] Dynamic certificate loading - **not shipped** (certificates load at startup)
+- [ ] Certificate rotation - **not shipped** (rotate by pod restart)
+- [x] Mutual TLS authentication (`radsec.client_ca_path` always required)
+- [ ] Certificate pinning - **not shipped**
 
-- [ ] Dynamic certificate loading
-- [ ] Certificate rotation
-- [ ] Mutual TLS authentication
-- [ ] Certificate pinning
-
-**Estimated Effort**: 2 weeks
-
-**Total v0.8.0 Estimated Effort**: 6 weeks
+**Deferred follow-ups**: DTLS, certificate hot-rotation/pinning, CRL/OCSP checks on NAS certificates (module exists under the `revocation` feature, not integrated)
 
 ---
 
-## v0.9.0 - Change of Authorization (Q1 2026)
+## v0.9.0 - Change of Authorization ✅ SHIPPED IN v0.10.0 (June 2026)
 
 **Goal**: Dynamic session control
 **Priority**: LOW-MEDIUM
+**Status**: ✅ Server-originated CoA/Disconnect delivered in v0.10.0 (`crates/radius-server/src/coa.rs`, `crates/radius-proto/src/dynauth.rs`) over RadSec only. The v0.9.0 release itself carried the Kubernetes/management-API work listed under Completed Features.
 
-### CoA Support (RFC 5176)
+### CoA Support (RFC 5176) ✅ COMPLETED (RadSec transport)
 
-- [ ] CoA-Request packet handling
-- [ ] CoA-ACK/NAK generation
-- [ ] Disconnect-Request handling
-- [ ] Disconnect-ACK/NAK generation
-- [ ] Session identification
+- [x] CoA-Request origination (Code 43) with RFC 5176 §3.4 Request Authenticator
+- [x] CoA-ACK/NAK (44/45) correlation by Identifier and Response Authenticator verification, `Error-Cause` (101) decoding
+- [x] Disconnect-Request origination (Code 40)
+- [x] Disconnect-ACK/NAK (41/42) handling
+- [x] Session identification by `Acct-Session-Id`, `Calling-Station-Id`, `NAS-Port-Id` (RFC 5176 §2.3), addressed to the NAS by its RadSec client-cert CN
+- [ ] CoA/Disconnect over UDP (port 3799) - **not shipped**; a NAS must be connected via RadSec
+- [ ] Inbound CoA/Disconnect handling (acting as a Dynamic Authorization Server) - **not shipped**
 
-**Estimated Effort**: 3 weeks
+### Dynamic Authorization ✅ COMPLETED
 
-### Dynamic Authorization
-
-- [ ] Session attribute updates
-- [ ] QoS changes
-- [ ] Bandwidth modification
-- [ ] Session termination
-
-**Estimated Effort**: 2 weeks
-
-**Total v0.9.0 Estimated Effort**: 5 weeks
+- [x] Session attribute updates (`changes` carries policy reply attributes such as `Filter-Id`, `Tunnel-Private-Group-ID`)
+- [x] QoS / VLAN changes via the same reply-attribute encoder
+- [x] Bandwidth modification where the NAS honors the corresponding reply attributes
+- [x] Session termination (`action = "disconnect"`)
+- [x] `Termination-Action` reply attribute for silent in-place re-auth on Session-Timeout
+- [x] Trigger: `POST /api/v1/coa`, gated by `mgmt` mTLS + ABAC (`radius:SendCoA`)
 
 ---
 
@@ -1309,10 +1332,19 @@ let config = RevocationConfig::disabled();
 
 ## Development Priorities
 
+### Remaining Work (post v0.10.1)
+
+1. MS-MPPE-Send-Key / MS-MPPE-Recv-Key (VSA 311) on Access-Accept
+2. Integrate CRL/OCSP (`revocation` feature) into EAP-TLS and RadSec verification
+3. EAP-TEAP inner methods with real keying material (EAP-MSCHAPv2)
+4. Status-Server Message-Authenticator verification (RFC 5997 §4.1)
+5. Dedicated accounting socket (1813/udp) or remove it from the manifests
+
 ### Nice to Have
 
-2. v0.8.0 - RadSec
-3. v0.9.0 - CoA
+1. DTLS transport (RFC 7360)
+2. CoA/Disconnect over UDP (port 3799)
+3. RadSec certificate hot-rotation and pinning
 
 ---
 
@@ -1342,13 +1374,14 @@ We welcome community contributions! Priority areas:
 | v0.3.0 | Q4 2025 | Auth Methods | ✅ Done |
 | v0.4.0 | Q4 2025 | Accounting | ✅ Done |
 | v0.5.0 | Q4 2025 | EAP Support | ✅ Done  |
-| v0.6.0 | Q1 2026 | Enterprise Features | 11 |
-| v0.7.0 | Q2 2026 | Proxy | ✅ Done  |
-| v0.8.0 | Q3 2026 | RadSec | 6 |
-| v0.9.0 | Q4 2026 | CoA | 5 |
+| v0.6.0 | Q4 2025 | Enterprise Features | ✅ Done |
+| v0.7.0 | Q1 2026 | Proxy, Performance & Documentation | ✅ Done |
+| v0.8.0 | Q2 2026 | RadSec (shipped as part of v0.10.0) | ✅ Done (DTLS, cert rotation deferred) |
+| v0.9.0 | Q2 2026 | Kubernetes-only deployment, mgmt API auth; CoA shipped in v0.10.0 | ✅ Done (UDP CoA deferred) |
+| v0.10.x | Q2 2026 | RadSec + CoA/Disconnect | ✅ Done (v0.10.1 current) |
 | v1.0.0 | 2027 | Production Release | 10 |
 
-**Total Estimated Development Time**: ~69 weeks (~16 months of full-time development)
+**Remaining Estimated Development Time**: ~10 weeks for v1.0.0 hardening, plus the deferred RadSec/CoA follow-ups above
 
 ---
 
@@ -1356,7 +1389,7 @@ We welcome community contributions! Priority areas:
 
 ### How to Contribute
 
-1. Check the [RFC-COMPLIANCE.md](RFC-COMPLIANCE.md) for known gaps
+1. Check the [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md) for known gaps
 2. Look for issues labeled "good first issue" or "help wanted"
 3. Read [CONTRIBUTING.md](CONTRIBUTING.md)
 4. Submit a pull request!

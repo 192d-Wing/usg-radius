@@ -10,7 +10,10 @@ A RADIUS (Remote Authentication Dial-In User Service) server implementation in R
 - **RFC 2866 Accounting**: Complete accounting protocol support with session tracking
 - **Authentication**: Support for Access-Request, Access-Accept, Access-Reject, and Access-Challenge
 - **Accounting**: Accounting-Request and Accounting-Response with full session lifecycle
-- **EAP Support**: EAP-Message attribute (Type 79) for 802.1X authentication (v0.5.0 in progress)
+- **EAP Support**: EAP-TLS (RFC 5216) and EAP-TEAP (RFC 7170) over EAP-Message (Type 79) for 802.1X, with fragmentation, MSK/EMSK derivation and Access-Challenge multi-round flows
+- **CHAP and PAP**: CHAP-Password (RFC 2865 §5.3) and User-Password authentication
+- **RadSec Transport**: RADIUS over mutually authenticated TLS 1.3 (RFC 6614) with ML-KEM-1024 key exchange; the default transport for config files, with `udp-insecure` as an explicit fallback
+- **CoA / Disconnect**: Server-originated Change-of-Authorization and Disconnect (RFC 5176) over RadSec, triggered from the management API
 - **Status Server**: RFC 5997 Status-Server support for monitoring
 - **Password Encryption**: MD5-based User-Password encryption per RFC 2865 Section 5.2
 - **Packet Authentication**: Request/Response Authenticator validation
@@ -33,8 +36,9 @@ A RADIUS (Remote Authentication Dial-In User Service) server implementation in R
 - **Client Authorization**: IP/CIDR-based client validation
 - **Request Deduplication**: Replay attack prevention with caching
 - **Rate Limiting**: Per-client and global rate limiting with token bucket algorithm
-- **Message-Authenticator**: HMAC-MD5 integrity protection (RFC 2869)
-- **Audit Logging**: JSON audit trail for compliance and forensics
+- **Message-Authenticator**: HMAC-MD5 integrity protection (RFC 2869), required on EAP requests (RFC 3579, Blast-RADIUS mitigation)
+- **Management API Auth**: Mutual TLS plus IAM-style attribute-based access policy for `/api/v1/*`
+- **Audit Logging**: JSON audit trail for compliance and forensics (file or stdout)
 - **Structured Logging**: Configurable log levels with tracing framework
 
 ### Configuration & Operations
@@ -47,12 +51,18 @@ A RADIUS (Remote Authentication Dial-In User Service) server implementation in R
 
 ## Supported RFCs
 
-- **RFC 2865**: Remote Authentication Dial In User Service (RADIUS) - Full compliance
+- **RFC 2865**: Remote Authentication Dial In User Service (RADIUS) - PAP, CHAP, Access-Challenge, strict attribute validation
 - **RFC 2866**: RADIUS Accounting - Full implementation with PostgreSQL backend
 - **RFC 2869**: RADIUS Extensions - Message-Authenticator, Gigaword counters
-- **RFC 3579**: RADIUS Support for EAP - EAP-Message attribute (v0.5.0 in progress)
-- **RFC 3748**: Extensible Authentication Protocol (EAP) - Core framework (v0.5.0 in progress)
+- **RFC 3579**: RADIUS Support for EAP - EAP-Message, Message-Authenticator required on EAP requests
+- **RFC 3748**: Extensible Authentication Protocol (EAP) - Core framework and state machine
+- **RFC 5176**: Dynamic Authorization Extensions - Server-originated CoA/Disconnect over RadSec
+- **RFC 5216**: EAP-TLS - Certificate-based authentication with RFC 5705 key export
 - **RFC 5997**: RADIUS Status-Server packets
+- **RFC 6614**: RADIUS over TLS (RadSec) - TLS 1.3 mutual authentication, default transport
+- **RFC 7170**: EAP-TEAP - TLS tunnel and TLV protocol with Crypto-Binding (inner methods with real keying material pending)
+
+See [RFC Compliance](docs/docs/protocol/RFC-COMPLIANCE.md) for the gap analysis, including what is not yet implemented (MS-MPPE key attributes, DTLS, CoA over UDP, CRL/OCSP integration).
 
 ## Installation
 
@@ -262,6 +272,11 @@ Per RFC 2865 Section 3:
 - **Status-Server (12)**: Server health check
 - **Status-Client (13)**: Client health check response
 
+**Dynamic Authorization (RFC 5176, server-originated over RadSec):**
+
+- **Disconnect-Request (40)** / **Disconnect-ACK (41)** / **Disconnect-NAK (42)**: Terminate a NAS session
+- **CoA-Request (43)** / **CoA-ACK (44)** / **CoA-NAK (45)**: Change a live session's authorization attributes
+
 ### Authentication Flow
 
 1. Client sends Access-Request with:
@@ -378,7 +393,13 @@ Contributions are welcome! Please feel free to submit issues or pull requests.
 - [RFC 2865 - RADIUS](https://tools.ietf.org/html/rfc2865)
 - [RFC 2866 - RADIUS Accounting](https://tools.ietf.org/html/rfc2866)
 - [RFC 2869 - RADIUS Extensions](https://tools.ietf.org/html/rfc2869)
+- [RFC 3579 - RADIUS Support for EAP](https://tools.ietf.org/html/rfc3579)
+- [RFC 3748 - Extensible Authentication Protocol](https://tools.ietf.org/html/rfc3748)
+- [RFC 5176 - Dynamic Authorization Extensions](https://tools.ietf.org/html/rfc5176)
+- [RFC 5216 - EAP-TLS](https://tools.ietf.org/html/rfc5216)
 - [RFC 5997 - RADIUS Status-Server](https://tools.ietf.org/html/rfc5997)
+- [RFC 6614 - RADIUS over TLS (RadSec)](https://tools.ietf.org/html/rfc6614)
+- [RFC 7170 - EAP-TEAP](https://tools.ietf.org/html/rfc7170)
 
 ## Author
 
