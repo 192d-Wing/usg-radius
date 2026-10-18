@@ -4,7 +4,10 @@ use crate::proxy::cache::{ProxyCache, ProxyCacheEntry, ProxyStateKey, generate_p
 use crate::proxy::error::{ProxyError, ProxyResult};
 use crate::proxy::home_server::HomeServer;
 use radius_proto::attributes::{Attribute, AttributeType, VendorSpecific};
-use radius_proto::auth::{calculate_response_authenticator, verify_response_authenticator};
+use radius_proto::auth::{
+    calculate_response_authenticator, decrypt_user_password, encrypt_user_password,
+    verify_response_authenticator,
+};
 use radius_proto::mppe::{MICROSOFT_VENDOR_ID, MS_MPPE_RECV_KEY, MS_MPPE_SEND_KEY, generate_salts};
 use radius_proto::{MppeKeys, Packet, TunnelPassword, calculate_message_authenticator};
 use std::net::SocketAddr;
@@ -46,14 +49,20 @@ impl ProxyHandler {
     /// 1. Check for proxy loops (count existing Proxy-State attributes)
     /// 2. Generate unique Proxy-State attribute
     /// 3. Add Proxy-State to request
-    /// 4. Store request in cache for correlation
-    /// 5. Send modified request to home server
+    /// 4. Re-encrypt User-Password (RFC 2865 §5.2) from the client secret to
+    ///    the home server secret
+    /// 5. Recompute Message-Authenticator (RFC 3579 §3.2) under the home
+    ///    server secret
+    /// 6. Store the forwarded request in cache for correlation and retries
+    /// 7. Send modified request to home server
+    ///
+    /// Steps 3–5 are [`rewrite_request_for_home_server`].
     ///
     /// # Returns
     /// The Proxy-State key used for correlation
     pub async fn forward_request(
         &self,
-        mut request: Packet,
+        request: Packet,
         source: SocketAddr,
         home_server: Arc<HomeServer>,
         client_secret: Vec<u8>,
@@ -80,12 +89,21 @@ impl ProxyHandler {
         // Generate unique Proxy-State
         let proxy_state = generate_proxy_state_key();
 
-        // Add Proxy-State attribute to request
-        request.add_attribute(
-            Attribute::new(AttributeType::ProxyState as u8, proxy_state.to_vec()).map_err(|e| {
-                ProxyError::Configuration(format!("Failed to create Proxy-State attribute: {}", e))
-            })?,
-        );
+        // Append Proxy-State and re-key the packet for the home server secret.
+        let request = rewrite_request_for_home_server(
+            request,
+            proxy_state,
+            &client_secret,
+            home_server.secret(),
+        )
+        .inspect_err(|e| {
+            warn!(
+                source = %source,
+                home_server = %home_server.name,
+                error = %e,
+                "Cannot rewrite request for home server; dropping it"
+            );
+        })?;
 
         // Create cache entry
         let entry = ProxyCacheEntry {
@@ -205,6 +223,61 @@ impl ProxyHandler {
     pub fn cache(&self) -> Arc<ProxyCache> {
         Arc::clone(&self.cache)
     }
+}
+
+/// Turn the NAS's Access-Request into the request the home server expects.
+///
+/// The NAS encrypted User-Password and signed Message-Authenticator with *its*
+/// shared secret; the home server checks both against *its own* secret, so a
+/// packet relayed verbatim is rejected upstream whenever the two differ. The
+/// Request Authenticator is forwarded unchanged (RFC 2865 §2.3 only requires
+/// the proxy to re-encrypt User-Password), so it keys both hops and only the
+/// secret changes; the response leg relies on this.
+///
+/// 1. Append our Proxy-State (RFC 2865 §5.33), so the Message-Authenticator
+///    computed below covers it.
+/// 2. User-Password (RFC 2865 §5.2) is `MD5(secret || Request-Authenticator)`
+///    chained over the padded password: decrypt under the client secret,
+///    re-encrypt under the home server secret. A password that does not
+///    decrypt (bad framing, non-UTF-8 plaintext from a wrong client secret)
+///    fails the forward rather than sending the home server garbage.
+///    CHAP-Password (RFC 2865 §5.3) is `MD5(ident || password || challenge)`
+///    with the challenge taken from CHAP-Challenge or the Request
+///    Authenticator; it involves no shared secret, so it is forwarded as is,
+///    which is also why the Request Authenticator must not change.
+/// 3. Recompute Message-Authenticator (RFC 3579 §3.2) under the home server
+///    secret, zeroing it first and hashing with Authenticator = Request
+///    Authenticator. One is added when absent but the request carries
+///    EAP-Message, as RFC 3579 requires of every hop.
+pub(crate) fn rewrite_request_for_home_server(
+    mut request: Packet,
+    proxy_state: ProxyStateKey,
+    client_secret: &[u8],
+    home_secret: &[u8],
+) -> ProxyResult<Packet> {
+    // 1. Proxy-State.
+    request.add_attribute(
+        Attribute::new(AttributeType::ProxyState as u8, proxy_state.to_vec()).map_err(|e| {
+            ProxyError::Configuration(format!("Failed to create Proxy-State attribute: {}", e))
+        })?,
+    );
+
+    // 2. User-Password from the client secret to the home server secret.
+    let request_authenticator = request.authenticator;
+    for attr in request
+        .attributes
+        .iter_mut()
+        .filter(|a| a.attr_type == AttributeType::UserPassword as u8)
+    {
+        let password = decrypt_user_password(&attr.value, client_secret, &request_authenticator)
+            .map_err(ProxyError::InvalidUserPassword)?;
+        attr.value = encrypt_user_password(&password, home_secret, &request_authenticator);
+    }
+
+    // 3. Message-Authenticator under the home server secret.
+    recompute_message_authenticator(&mut request, &request_authenticator, home_secret)?;
+
+    Ok(request)
 }
 
 /// Turn a home server's response into the response the NAS expects.
@@ -439,9 +512,10 @@ fn fresh_salts(count: usize, in_use: &[[u8; 2]]) -> Vec<[u8; 2]> {
     salts
 }
 
-/// Recompute Message-Authenticator (RFC 3579 §3.2) over the rewritten response
-/// with the client secret and the NAS's Request Authenticator. One is added when
-/// absent but the response carries EAP-Message, as RFC 3579 requires.
+/// Recompute Message-Authenticator (RFC 3579 §3.2) over the rewritten packet
+/// with the secret of the hop it is going to and the NAS's Request
+/// Authenticator. One is added when absent but the packet carries EAP-Message,
+/// as RFC 3579 requires.
 fn recompute_message_authenticator(
     response: &mut Packet,
     request_authenticator: &[u8; 16],
@@ -961,6 +1035,309 @@ mod tests {
             Some(test_keys())
         );
         assert!(cache.get(&PROXY_STATE).is_none(), "entry consumed");
+    }
+
+    // ---- Request leg -----------------------------------------------------
+
+    const PAP_PASSWORD: &str = "s3cret-p@ss";
+
+    /// Sign an Access-Request the way a NAS does: Message-Authenticator under
+    /// `secret` with the Request Authenticator as the Authenticator field.
+    fn sign_request(mut request: Packet, secret: &[u8]) -> Packet {
+        recompute_message_authenticator(&mut request, &REQUEST_AUTH, secret).unwrap();
+        request
+    }
+
+    /// PAP Access-Request from the NAS: User-Password under the client pair and
+    /// Message-Authenticator under the client secret (RFC 5080 §2.2.2 BlastRADIUS
+    /// mitigation makes NASes send one on every Access-Request).
+    fn nas_pap_request() -> Packet {
+        let mut request = Packet::new(Code::AccessRequest, 7, REQUEST_AUTH);
+        request.add_attribute(Attribute::string(AttributeType::UserName as u8, "alice").unwrap());
+        request.add_attribute(
+            Attribute::new(
+                AttributeType::UserPassword as u8,
+                encrypt_user_password(PAP_PASSWORD, CLIENT_SECRET, &REQUEST_AUTH),
+            )
+            .unwrap(),
+        );
+        request.add_attribute(Attribute::integer(AttributeType::NasPort as u8, 3).unwrap());
+        request.add_attribute(
+            Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]).unwrap(),
+        );
+        sign_request(request, CLIENT_SECRET)
+    }
+
+    /// EAP Access-Request from the NAS (an EAP-Response/Identity) with the
+    /// Message-Authenticator RFC 3579 §3.2 mandates.
+    fn nas_eap_request() -> Packet {
+        let mut request = Packet::new(Code::AccessRequest, 7, REQUEST_AUTH);
+        request.add_attribute(Attribute::string(AttributeType::UserName as u8, "alice").unwrap());
+        request.add_attribute(
+            Attribute::new(
+                AttributeType::EapMessage as u8,
+                vec![0x02, 0x01, 0x00, 0x0a, 0x01, b'a', b'l', b'i', b'c', b'e'],
+            )
+            .unwrap(),
+        );
+        request.add_attribute(Attribute::new(AttributeType::State as u8, vec![0x55; 8]).unwrap());
+        request.add_attribute(
+            Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]).unwrap(),
+        );
+        sign_request(request, CLIENT_SECRET)
+    }
+
+    fn attribute_types(packet: &Packet) -> Vec<u8> {
+        packet.attributes.iter().map(|a| a.attr_type).collect()
+    }
+
+    #[test]
+    fn rewrite_request_rekeys_user_password_and_message_authenticator() {
+        let nas_request = nas_pap_request();
+        assert!(message_authenticator_valid(
+            &nas_request,
+            &REQUEST_AUTH,
+            CLIENT_SECRET
+        ));
+        let nas_password = nas_request
+            .find_attribute(AttributeType::UserPassword as u8)
+            .unwrap()
+            .value
+            .clone();
+
+        let forwarded = rewrite_request_for_home_server(
+            nas_request.clone(),
+            PROXY_STATE,
+            CLIENT_SECRET,
+            HOME_SECRET,
+        )
+        .unwrap();
+
+        // Request Authenticator, identifier and attribute order are intact, with
+        // our Proxy-State appended last.
+        assert_eq!(forwarded.authenticator, REQUEST_AUTH);
+        assert_eq!(forwarded.identifier, nas_request.identifier);
+        let mut expected_types = attribute_types(&nas_request);
+        expected_types.push(AttributeType::ProxyState as u8);
+        assert_eq!(attribute_types(&forwarded), expected_types);
+        assert_eq!(
+            forwarded.attributes.last().unwrap().value,
+            PROXY_STATE.to_vec()
+        );
+
+        // The home server accepts the Message-Authenticator under its secret,
+        // and the NAS's HMAC no longer verifies.
+        assert!(message_authenticator_valid(
+            &forwarded,
+            &REQUEST_AUTH,
+            HOME_SECRET
+        ));
+        assert!(!message_authenticator_valid(
+            &forwarded,
+            &REQUEST_AUTH,
+            CLIENT_SECRET
+        ));
+
+        // User-Password decrypts under the home server pair to the NAS's
+        // password, with ciphertext that differs from what the NAS sent.
+        let home_password = &forwarded
+            .find_attribute(AttributeType::UserPassword as u8)
+            .unwrap()
+            .value;
+        assert_ne!(*home_password, nas_password);
+        assert_eq!(
+            decrypt_user_password(home_password, HOME_SECRET, &REQUEST_AUTH).unwrap(),
+            PAP_PASSWORD
+        );
+        assert_ne!(
+            decrypt_user_password(home_password, CLIENT_SECRET, &REQUEST_AUTH).ok(),
+            Some(PAP_PASSWORD.to_string())
+        );
+
+        // Everything else is byte-for-byte what the NAS sent.
+        assert_eq!(
+            forwarded.find_attribute(AttributeType::UserName as u8),
+            nas_request.find_attribute(AttributeType::UserName as u8)
+        );
+        assert_eq!(
+            forwarded.find_attribute(AttributeType::NasPort as u8),
+            nas_request.find_attribute(AttributeType::NasPort as u8)
+        );
+    }
+
+    #[test]
+    fn rewrite_request_resigns_eap_request_for_home_server() {
+        let nas_request = nas_eap_request();
+
+        let forwarded = rewrite_request_for_home_server(
+            nas_request.clone(),
+            PROXY_STATE,
+            CLIENT_SECRET,
+            HOME_SECRET,
+        )
+        .unwrap();
+
+        assert_eq!(forwarded.authenticator, REQUEST_AUTH);
+        assert!(message_authenticator_valid(
+            &forwarded,
+            &REQUEST_AUTH,
+            HOME_SECRET
+        ));
+        assert!(!message_authenticator_valid(
+            &forwarded,
+            &REQUEST_AUTH,
+            CLIENT_SECRET
+        ));
+        // Exactly one Message-Authenticator; EAP-Message and State untouched;
+        // no User-Password invented.
+        assert_eq!(
+            forwarded
+                .attributes
+                .iter()
+                .filter(|a| a.attr_type == AttributeType::MessageAuthenticator as u8)
+                .count(),
+            1
+        );
+        assert_eq!(
+            forwarded.find_attribute(AttributeType::EapMessage as u8),
+            nas_request.find_attribute(AttributeType::EapMessage as u8)
+        );
+        assert_eq!(
+            forwarded.find_attribute(AttributeType::State as u8),
+            nas_request.find_attribute(AttributeType::State as u8)
+        );
+        assert!(
+            forwarded
+                .find_attribute(AttributeType::UserPassword as u8)
+                .is_none()
+        );
+        let mut expected_types = attribute_types(&nas_request);
+        expected_types.push(AttributeType::ProxyState as u8);
+        assert_eq!(attribute_types(&forwarded), expected_types);
+    }
+
+    #[test]
+    fn rewrite_request_without_password_or_authenticator_only_adds_proxy_state() {
+        // CHAP: CHAP-Password is MD5(ident || password || challenge) and involves
+        // no shared secret, so the proxy must forward it (and the challenge it is
+        // bound to) untouched.
+        let mut nas_request = Packet::new(Code::AccessRequest, 9, REQUEST_AUTH);
+        nas_request.add_attribute(Attribute::string(AttributeType::UserName as u8, "bob").unwrap());
+        let mut chap = vec![0x01];
+        chap.extend_from_slice(&[0xc4; 16]);
+        nas_request.add_attribute(Attribute::new(AttributeType::ChapPassword as u8, chap).unwrap());
+        nas_request.add_attribute(
+            Attribute::new(AttributeType::ChapChallenge as u8, vec![0x7e; 16]).unwrap(),
+        );
+        // A Proxy-State from an upstream proxy, which must stay in front of ours.
+        nas_request
+            .add_attribute(Attribute::new(AttributeType::ProxyState as u8, vec![0x11; 4]).unwrap());
+
+        let forwarded = rewrite_request_for_home_server(
+            nas_request.clone(),
+            PROXY_STATE,
+            CLIENT_SECRET,
+            HOME_SECRET,
+        )
+        .unwrap();
+
+        let mut expected = nas_request.clone();
+        expected.add_attribute(
+            Attribute::new(AttributeType::ProxyState as u8, PROXY_STATE.to_vec()).unwrap(),
+        );
+        assert_eq!(forwarded.encode().unwrap(), expected.encode().unwrap());
+    }
+
+    #[test]
+    fn rewrite_request_rejects_malformed_user_password() {
+        let mut nas_request = Packet::new(Code::AccessRequest, 7, REQUEST_AUTH);
+        // RFC 2865 §5.2: the value is a whole number of 16-octet blocks.
+        nas_request.add_attribute(
+            Attribute::new(AttributeType::UserPassword as u8, vec![0xab; 20]).unwrap(),
+        );
+
+        match rewrite_request_for_home_server(nas_request, PROXY_STATE, CLIENT_SECRET, HOME_SECRET)
+        {
+            Err(ProxyError::InvalidUserPassword(_)) => {}
+            other => panic!("expected InvalidUserPassword, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_request_sends_rekeyed_request_and_caches_it() {
+        // A loopback socket stands in for the home server.
+        let home = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let home_server = home_server_at(home.local_addr().unwrap());
+
+        let cache = Arc::new(ProxyCache::new(Duration::from_secs(60), 1000));
+        let handler = ProxyHandler::new(cache.clone(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let source: SocketAddr = "192.168.1.100:12345".parse().unwrap();
+
+        let proxy_state = handler
+            .forward_request(
+                nas_pap_request(),
+                source,
+                home_server,
+                CLIENT_SECRET.to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 4096];
+        let (len, from) = tokio::time::timeout(Duration::from_secs(5), home.recv_from(&mut buf))
+            .await
+            .expect("forwarded request within 5s")
+            .unwrap();
+        assert_eq!(from, handler.socket().local_addr().unwrap());
+        let upstream = Packet::decode(&buf[..len]).unwrap();
+
+        // What the home server receives is valid under its own secret ...
+        assert_eq!(upstream.code, Code::AccessRequest);
+        assert_eq!(upstream.authenticator, REQUEST_AUTH);
+        assert!(message_authenticator_valid(
+            &upstream,
+            &REQUEST_AUTH,
+            HOME_SECRET
+        ));
+        assert_eq!(
+            decrypt_user_password(
+                &upstream
+                    .find_attribute(AttributeType::UserPassword as u8)
+                    .unwrap()
+                    .value,
+                HOME_SECRET,
+                &REQUEST_AUTH
+            )
+            .unwrap(),
+            PAP_PASSWORD
+        );
+        assert_eq!(
+            upstream.attributes.last().unwrap().value,
+            proxy_state.to_vec()
+        );
+
+        // ... and the cache holds that same packet, so retries resend it and the
+        // response leg keys off the NAS's Request Authenticator.
+        let entry = cache.get(&proxy_state).expect("entry cached");
+        assert_eq!(
+            entry.original_request.encode().unwrap(),
+            upstream.encode().unwrap()
+        );
+        assert_eq!(entry.client_secret, CLIENT_SECRET);
+        assert_eq!(entry.original_source, source);
+    }
+
+    fn home_server_at(address: SocketAddr) -> Arc<HomeServer> {
+        let config = HomeServerConfig {
+            address: address.to_string(),
+            secret: String::from_utf8(HOME_SECRET.to_vec()).unwrap(),
+            timeout: 30,
+            max_outstanding: 100,
+            name: Some("Test Server".to_string()),
+        };
+        Arc::new(HomeServer::new(config).unwrap())
     }
 
     fn create_test_home_server() -> Arc<HomeServer> {

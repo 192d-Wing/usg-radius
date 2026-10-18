@@ -50,6 +50,10 @@ pub enum ProxyError {
     #[error("Invalid response authenticator from home server")]
     InvalidResponseAuthenticator,
 
+    /// User-Password from the NAS could not be decrypted under the client secret
+    #[error("User-Password from NAS could not be decrypted under the client secret: {0}")]
+    InvalidUserPassword(String),
+
     /// Address parse error
     #[error("Address parse error: {0}")]
     AddressParse(#[from] AddrParseError),

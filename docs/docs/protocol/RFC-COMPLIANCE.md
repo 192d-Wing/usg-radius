@@ -977,6 +977,12 @@ The current implementation is **PRODUCTION-READY** for:
 
 1. **RADIUS Proxy**
    - Basic forwarding works
+   - Request leg re-encrypts User-Password (RFC 2865 §5.2) from the client
+     secret to the home server secret and recomputes Message-Authenticator
+     (RFC 3579 §3.2) under the home server secret over the packet including the
+     appended Proxy-State; the Request Authenticator is forwarded unchanged
+     (RFC 2865 §2.3) and CHAP-Password, bound to the challenge rather than the
+     secret, is relayed as is
    - Response leg verifies the home server's Response Authenticator, re-encrypts
      RFC 2548 MS-MPPE-Send/Recv-Key and RFC 2868 §3.5 Tunnel-Password (Tag
      preserved, fresh per-packet-unique salts) from the home server secret to
