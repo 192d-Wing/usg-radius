@@ -4,11 +4,11 @@ This document identifies gaps between the current USG RADIUS implementation and 
 
 ## Summary
 
-**Overall Status**: Production-ready for modern enterprise authentication with EAP-TLS, comprehensive rate limiting, accounting, and security features.
+**Overall Status**: Production-ready for modern enterprise authentication with EAP-TLS over RadSec, server-originated CoA/Disconnect, comprehensive rate limiting, accounting, and security features. Reflects the code at **v0.10.1**.
 
-**Implemented**: Core RADIUS authentication (RFC 2865), Accounting (RFC 2866), EAP-TLS (RFC 5216), Rate Limiting, DoS Protection
-**Partial**: Some advanced features present but incomplete
-**Missing**: Legacy authentication methods (CHAP), some advanced EAP methods
+**Implemented**: Core RADIUS authentication (RFC 2865, PAP + CHAP), Accounting (RFC 2866), Message-Authenticator (RFC 2869 / RFC 3579), EAP-TLS (RFC 5216), RadSec (RFC 6614), CoA/Disconnect (RFC 5176), Rate Limiting, DoS Protection
+**Partial**: EAP-TEAP (RFC 7170) inner methods, Status-Server (RFC 5997) edge cases, certificate revocation (implemented in `radius-proto`, not integrated into the server)
+**Missing**: MS-MPPE key attributes on Access-Accept, legacy tunneled EAP methods (TTLS/PEAP), DTLS transport, UDP-originated CoA
 
 **Major Milestones Completed**:
 
@@ -17,6 +17,11 @@ This document identifies gaps between the current USG RADIUS implementation and 
 - ✅ v0.3.0: RADIUS accounting with database backend
 - ✅ v0.4.0: Accounting exports and reporting
 - ✅ v0.5.0: EAP-TLS with production key extraction (RFC 5216)
+- ✅ v0.6.0: PostgreSQL and LDAP backends, health checks, Prometheus metrics
+- ✅ v0.7.x: RADIUS proxy, EAP-TEAP Phase 1+2, CRL/OCSP module (`revocation` feature)
+- ✅ v0.9.0: Kubernetes-only deployment, management API mTLS + ABAC, live session index
+- ✅ v0.10.0: RadSec transport (RFC 6614), server-originated CoA/Disconnect (RFC 5176), Message-Authenticator required on EAP requests
+- ✅ v0.10.1: Container image built with the `tls` feature (RadSec / EAP-TLS fix)
 
 ---
 
@@ -137,40 +142,52 @@ correct stripping of server-added Proxy-State on the response leg.
 
 ---
 
-### ❌ Not Implemented
+### ✅ Authentication Methods & Validation (v0.2.0 - v0.3.0)
 
-#### 1. CHAP Support
+#### 1. CHAP Support ✅ IMPLEMENTED (v0.3.0)
 
 **RFC**: RFC 2865 Section 5.3
-**Purpose**: More secure than PAP (no cleartext password)
-**Priority**: LOW (superseded by EAP-TLS)
-**Status**: Deferred - Modern deployments use EAP-TLS instead
+**Purpose**: Challenge/response password authentication (no cleartext password on the wire)
+**Status**: ✅ Complete
 
-**Missing**:
+**Features**:
 
-- CHAP-Password attribute (Type 3) validation
-- CHAP-Challenge attribute (Type 60) generation
-- CHAP authentication algorithm
+- ✅ CHAP-Password attribute (Type 3) parsing (CHAP Ident + 16-byte MD5 response)
+- ✅ CHAP-Challenge attribute (Type 60), falling back to the Request Authenticator as the challenge when absent (RFC 2865 §5.40)
+- ✅ CHAP response verification (`MD5(Ident + password + challenge)`)
+- ✅ Validation rejects a request carrying both User-Password and CHAP-Password
+- ✅ Integration tests (`test_chap_*` in `tests/integration_tests.rs`)
 
-**Rationale**: EAP-TLS provides superior security with certificate-based authentication. CHAP is considered legacy.
+**Files**:
+
+- [crates/radius-proto/src/chap.rs](../../crates/radius-proto/src/chap.rs) - CHAP challenge/response primitives
+- [crates/radius-server/src/server.rs](../../crates/radius-server/src/server.rs) - `ChapPassword` branch in Access-Request handling
 
 ---
 
-#### 2. NAS Identification Validation
+#### 2. NAS Identification Validation ✅ IMPLEMENTED
 
 **RFC**: RFC 2865 Section 5.32
 **Required**: Either NAS-IP-Address (Type 4) OR NAS-Identifier (Type 32) must be present
-**Current**: Not enforced (attributes accepted but not required)
-**Priority**: MEDIUM
+**Current**: ✅ Enforced in both strict and lenient mode; an Access-Request with neither is rejected as malformed
+**Also**: ✅ NAS-IPv6-Address (Type 95) parsing (v0.10.0)
+
+**Files**:
+
+- [crates/radius-proto/src/validation.rs](../../crates/radius-proto/src/validation.rs) - `validate_access_request`
+- [crates/radius-server/src/server.rs](../../crates/radius-server/src/server.rs) - `validate_packet` call before dispatch
 
 ---
 
-#### 3. Service-Type Enforcement
+#### 3. Service-Type Enforcement ✅ IMPLEMENTED (strict mode)
 
 **RFC**: RFC 2865 Section 5.6
-**Current**: Service-Type attribute (Type 6) accepted but not validated
-**Missing**: Enforcement of valid values (1-13)
-**Priority**: LOW
+**Current**: ✅ Enumerated values validated for Service-Type (Type 6), Framed-Protocol (7), Framed-Routing (10), Framed-Compression (13), Login-Service (15), and Termination-Action (29); Acct-Status-Type presence is required on Accounting-Request
+**Modes**: Invalid enumerations are rejected when `strict_rfc_compliance: true` (the default) and accepted for compatibility in lenient mode
+
+**Files**:
+
+- [crates/radius-proto/src/validation.rs](../../crates/radius-proto/src/validation.rs) - `validate_service_type` and related validators
 
 ---
 
@@ -208,8 +225,17 @@ correct stripping of server-added Proxy-State on the response leg.
 }
 ```
 
+### ⚠️ Transport Note
+
+**Status**: ⚠️ Only one UDP socket is bound
+**Current**: In `udp-insecure` mode the server binds a single UDP socket on `listen_port` (default 1812) and handles Accounting-Request (Code 4) on that same socket. The accounting port 1813/udp is advertised by the Dockerfile `EXPOSE` line and the Kubernetes Service/Deployment manifests, but **nothing listens on it**; a NAS configured to send accounting to 1813 gets no response.
+**RadSec**: Not affected. Authentication and accounting share the single TLS connection on 2083/tcp (RFC 6614 §2.5).
+**Workaround**: Point the NAS accounting destination at the authentication port, or run a second instance with `listen_port: 1813`.
+**Priority**: MEDIUM
+
 **Files**:
 
+- [crates/radius-server/src/server.rs](../../crates/radius-server/src/server.rs) - `RadiusServer::new` binds `config.bind_addr` only
 - [crates/radius-server/src/accounting/mod.rs](../../crates/radius-server/src/accounting/mod.rs) - Core accounting
 - [crates/radius-server/src/accounting/file.rs](../../crates/radius-server/src/accounting/file.rs) - File backend
 - [crates/radius-server/src/accounting/postgres.rs](../../crates/radius-server/src/accounting/postgres.rs) - PostgreSQL backend
@@ -221,6 +247,7 @@ correct stripping of server-added Proxy-State on the response leg.
 ### ✅ Implemented
 
 - ✅ Message-Authenticator attribute definition (Type 80)
+- ✅ Message-Authenticator verification and generation (Section 5.14, see below)
 - ✅ EAP-Message attribute (Type 79)
 - ✅ EAP Support (RFC 3748 + RFC 2869 Section 5.13)
 
@@ -263,13 +290,13 @@ correct stripping of server-added Proxy-State on the response leg.
 - ✅ Subject Alternative Name (SAN) verification
 - ✅ Common Name (CN) verification
 
-**Cryptography (100%)**:
+**Cryptography (⚠️ partial)**:
 
 - ✅ Production key extraction using RFC 5705 (export_keying_material)
 - ✅ MSK derivation (64 bytes) - RFC 5216 Section 2.3
 - ✅ EMSK derivation (64 bytes) - RFC 5295
 - ✅ Correct label usage: "client EAP encryption"
-- ✅ MS-MPPE key derivation for wireless encryption
+- ❌ MS-MPPE-Send-Key / MS-MPPE-Recv-Key (RFC 2548, Vendor-Specific 311) are **not** derived from the MSK or attached to the Access-Accept. `crates/radius-server/src/eap_auth.rs` carries a `TODO` at the Accept path and no VSA 311 encoder exists, so a NAS cannot obtain the PMK for 802.11 4-way handshake from this server yet. **Gap, priority HIGH for WPA-Enterprise.**
 - ✅ Cryptographically secure session binding
 
 **Session Management (100%)**:
@@ -286,7 +313,7 @@ correct stripping of server-added Proxy-State on the response leg.
 - ✅ EAP-Message attribute fragmentation
 - ✅ State attribute handling
 - ✅ Access-Challenge generation
-- ✅ Access-Accept with derived keys
+- ⚠️ Access-Accept on EAP-Success (MSK is derived but MS-MPPE keys are not attached, see Cryptography)
 - ✅ Integration with inner auth handlers
 
 **Certificate Management (100%)**:
@@ -360,26 +387,35 @@ eap_handler.configure_tls("", cert_config)?;
 
 ---
 
-### ❌ Not Implemented
+### ✅ Message-Authenticator Validation ✅ IMPLEMENTED (v0.3.0, hardened v0.10.0)
 
-#### 1. Message-Authenticator Validation
+**RFC**: RFC 2869 Section 5.14, RFC 3579 Section 3.2, RFC 5080
+**Purpose**: HMAC-MD5 integrity protection of the whole packet
+**Status**: ✅ Complete
 
-**RFC**: RFC 2869 Section 5.14
-**Purpose**: Stronger authentication using HMAC-MD5
-**Priority**: MEDIUM (less critical with EAP-TLS which has built-in integrity)
-**Status**: Deferred
+**Features**:
 
-**Missing**:
+- ✅ HMAC-MD5 calculation over the packet with the attribute value zeroed
+- ✅ Verified whenever present on an Access-Request; an invalid value rejects the request
+- ✅ **Required** when EAP-Message is present; an EAP Access-Request without Message-Authenticator is rejected (RFC 3579 §3.2, "Blast-RADIUS" CVE-2024-3596 mitigation, v0.10.0)
+- ✅ Added to every Access-Accept, Access-Reject, and Access-Challenge that carries EAP-Message
+- ✅ Inside RadSec the fixed secret `"radsec"` is used for the HMAC per RFC 6614 §2.3
 
-- HMAC-MD5 calculation
-- Message-Authenticator validation on request
-- Message-Authenticator generation in response
+**Gaps**:
 
-**Note**: EAP-TLS provides message integrity through TLS handshake. Message-Authenticator is primarily needed for password-based EAP methods.
+- ⚠️ Not verified on Status-Server (see RFC 5997 below)
+- ⚠️ Not required on non-EAP Access-Requests (RFC 5080 §2.2.2 recommends it; configurable enforcement is not available)
+
+**Files**:
+
+- [crates/radius-proto/src/message_auth.rs](../../crates/radius-proto/src/message_auth.rs) - `calculate_message_authenticator` / `verify_message_authenticator`
+- [crates/radius-server/src/server.rs](../../crates/radius-server/src/server.rs) - verification in Access-Request handling, `add_message_authenticator_if_eap` on replies
 
 ---
 
-#### 2. Tunnel Attributes
+### ❌ Not Implemented
+
+#### Tunnel Attributes
 
 **RFC**: RFC 2869 Section 5.1-5.12
 **Purpose**: VPN and tunnel configuration
@@ -432,14 +468,82 @@ See EAP-TLS section under RFC 2869 for complete details.
 
 ### ✅ Implemented
 
-- ✅ Status-Server (Code 12) handling
-- ✅ Response generation
+- ✅ Status-Server (Code 12) handling over UDP and RadSec
+- ✅ Response generation with a correct Response Authenticator (per-client secret, or `"radsec"` inside RadSec)
+- ✅ Reachable from authorized UDP clients and over RadSec
 
 ### ⚠️ Partial
 
-**Status**: Response always indicates healthy
-**Missing**: Proper response should be based on actual server health metrics
-**Priority**: LOW
+**Status**: Minimal liveness reply only
+
+**Gaps**:
+
+- ⚠️ **Message-Authenticator is not verified** on Status-Server. RFC 5997 §4.1 requires the attribute and requires the server to validate it and silently discard the packet on failure. The server replies to any Status-Server from an authorized client without checking it (`handle_status_server` in `server.rs` never calls `verify_message_authenticator`).
+- ⚠️ **Reply is always Access-Accept.** RFC 5997 §4.2 says a Status-Server received on the accounting port is answered with Accounting-Response. The server has no separate accounting socket (see RFC 2866 transport note) and always emits Access-Accept (Code 2).
+- ⚠️ Response always indicates healthy; it is not tied to backend (LDAP/PostgreSQL) health. Kubernetes probes use the HTTP `/health/*` endpoints instead.
+
+**Priority**: LOW-MEDIUM
+
+---
+
+## RFC 5176 - Dynamic Authorization Extensions (CoA / Disconnect)
+
+### ✅ Implemented (v0.10.0)
+
+**Status**: ✅ Server-originated CoA/Disconnect over RadSec
+**Trigger**: Management API `POST /api/v1/coa` (action `disconnect` | `coa`), gated by the `mgmt` mTLS + ABAC layer (`radius:SendCoA`)
+
+**Features**:
+
+- ✅ Packet codes Disconnect-Request/ACK/NAK (40-42) and CoA-Request/ACK/NAK (43-45)
+- ✅ Request Authenticator computed per RFC 5176 §3.4 (Accounting-Request style)
+- ✅ `Error-Cause` (Type 101) values for NAK handling
+- ✅ Requests written server→NAS over the NAS's established RadSec connection; ACK/NAK correlated by Identifier with Response Authenticator verification
+- ✅ `NasRegistry` maps the authenticated NAS identity (client-cert CN) to its live connection
+- ✅ `Termination-Action` reply attribute for silent in-place re-auth on Session-Timeout
+
+### ❌ Not Implemented
+
+- ❌ **CoA/Disconnect over UDP** (RFC 5176 default port 3799). Only the RadSec path exists; a NAS that is not connected via RadSec cannot be reached.
+- ❌ Inbound CoA/Disconnect handling (the server only originates requests; it is not a Dynamic Authorization Server for upstream systems)
+- ❌ Automatic retransmission / Event-Timestamp replay window on the server side
+
+**Files**:
+
+- [crates/radius-proto/src/dynauth.rs](../../crates/radius-proto/src/dynauth.rs) - Codes and `ErrorCause`
+- [crates/radius-server/src/coa.rs](../../crates/radius-server/src/coa.rs) - `NasRegistry` and request correlation
+- [crates/radius-server/src/radsec.rs](../../crates/radius-server/src/radsec.rs) - Bidirectional connection loop
+
+---
+
+## RFC 6614 - RADIUS over TLS (RadSec)
+
+### ✅ Implemented (v0.10.0)
+
+**Status**: ✅ Default transport for configuration files (`transport = "radsec"`); plain UDP is the explicit `transport = "udp-insecure"` fallback and logs a startup warning
+**Build**: Requires the `tls` cargo feature (default features; the container image builds it since v0.10.1)
+
+**Features**:
+
+- ✅ TLS 1.3 listener on 2083/tcp (default `::`, dual-stack) with ML-KEM-1024-only key exchange (FIPS 203) via `usg-fips-tls`; negotiated parameters re-checked after the handshake, fail closed
+- ✅ Mutual TLS: NAS client certificate verified against `radsec.client_ca_path`; the client-cert CN is the authenticated NAS identity
+- ✅ RADIUS framing inside the tunnel delimited by the RADIUS `Length` field (RFC 6614 §2.2)
+- ✅ Fixed shared secret `"radsec"` for Authenticator / Message-Authenticator math (RFC 6614 §2.3)
+- ✅ Authentication, accounting, and Status-Server on the single connection (§2.5)
+- ✅ Bidirectional connection used for server-originated CoA/Disconnect (RFC 5176)
+
+### ❌ Not Implemented
+
+- ❌ **DTLS** (RFC 7360)
+- ❌ TLS 1.2 or non-ML-KEM cipher suites (intentionally excluded by the FIPS posture)
+- ❌ Certificate hot-rotation (certificates are loaded at startup; rotate via pod restart)
+- ❌ Certificate pinning / dynamic trust store reload
+- ❌ Outbound RadSec (proxying to upstream servers over TLS; the proxy module is UDP-only)
+
+**Files**:
+
+- [crates/radius-server/src/radsec.rs](../../crates/radius-server/src/radsec.rs) - Listener and connection loop
+- [crates/radius-server/src/config.rs](../../crates/radius-server/src/config.rs) - `Transport` and `RadSecConfig`
 
 ---
 
@@ -506,6 +610,8 @@ See Request Deduplication section under RFC 2865 for details.
 }
 ```
 
+Set `"audit_log_path": "stdout"` (or `"-"`) to emit JSON Lines on stdout for the Kubernetes log pipeline instead of a file.
+
 ---
 
 #### 4. Authentication Backends ✅ COMPLETE
@@ -527,6 +633,33 @@ See Request Deduplication section under RFC 2865 for details.
 ---
 
 ### ⚠️ Partial Implementation
+
+#### Certificate Revocation (CRL/OCSP) ⚠️ IMPLEMENTED, NOT INTEGRATED
+
+**Status**: ⚠️ Module complete in `radius-proto`; not wired into the server
+**RFC**: RFC 5280 (CRL), RFC 6960 (OCSP), RFC 8954 (OCSP nonce)
+
+**Implemented** (behind the `revocation` cargo feature of `radius-proto`, v0.7.x):
+
+- ✅ CRL parsing (DER/PEM), HTTP fetching from distribution points, TTL cache, static CRL files
+- ✅ OCSP request building, HTTP POST, response parsing, nonce replay protection, response cache
+- ✅ Check modes: OcspOnly, CrlOnly, PreferOcsp, Both
+- ✅ rustls `ClientCertVerifier` integration
+
+**Not integrated**:
+
+- ❌ `radius-server` does not depend on the `revocation` feature and `EapConfig` exposes no revocation settings, so EAP-TLS client certificates are **not** checked against a CRL or OCSP responder at runtime
+- ❌ The container image is built with `--features observability,tls` only
+- ❌ RadSec NAS client certificates are likewise not revocation-checked
+
+**Priority**: HIGH for deployments that must revoke compromised client certificates before expiry
+
+**Files**:
+
+- [crates/radius-proto/src/revocation/](../../crates/radius-proto/src/revocation/) - CRL/OCSP module
+- [docs/docs/development/CRL-IMPLEMENTATION-PLAN.md](../development/CRL-IMPLEMENTATION-PLAN.md) - Design notes
+
+---
 
 #### Authenticator Validation
 
@@ -586,6 +719,7 @@ See Request Deduplication section under RFC 2865 for details.
 **Status**: Deferred to future release
 **Priority**: MEDIUM
 **Impact**: Requires server restart for configuration changes
+**Note**: Since v0.9.0 `SIGHUP` reloads only the management API access policy (`mgmt.access_policy_file`); clients, secrets, and transport settings still require a restart.
 
 ---
 
@@ -620,22 +754,31 @@ See Request Deduplication section under RFC 2865 for details.
 
 ---
 
-#### 2. Strict Attribute Validation
+#### 2. Strict Attribute Validation ⚠️ MOSTLY IMPLEMENTED
 
-**Priority**: MEDIUM
+**Priority**: LOW
+**Implemented** (`crates/radius-proto/src/validation.rs`):
+
+- ✅ Enumerated value validation (Service-Type, Framed-Protocol, Framed-Routing, Framed-Compression, Login-Service, Termination-Action) in strict mode; Acct-Status-Type presence required on Accounting-Request
+- ✅ Length checks for integer (4 bytes) and IPv4 address (4 bytes) attributes
+- ✅ String attribute validation
+
 **Missing**:
 
-- Integer range checks (partially implemented)
-- IP address format validation (basic validation present)
-- Enumerated value validation
+- ❌ Range checks on non-enumerated integers (e.g. Session-Timeout bounds)
+- ❌ Cross-attribute consistency beyond the password/EAP mutual-exclusion rules
 
 ---
 
-#### 3. Required Attributes Enforcement
+#### 3. Required Attributes Enforcement ✅ IMPLEMENTED
 
-**Priority**: MEDIUM
-**Missing**: Strict enforcement of required attributes per packet type
-**Example**: Access-Request MUST have User-Name (currently recommended, not enforced)
+**Priority**: -
+**Enforced** for Access-Request in both validation modes:
+
+- ✅ User-Name required
+- ✅ Exactly one of User-Password or CHAP-Password, or EAP-Message with neither (RFC 3579 §3.1)
+- ✅ NAS-IP-Address or NAS-Identifier required
+- ✅ Message-Authenticator required when EAP-Message is present (RFC 3579 §3.2)
 
 ---
 
@@ -714,8 +857,10 @@ Total:         156+ tests
 2. ✅ **Accounting** (v0.3.0-v0.4.0) - Full accounting with database backend
 3. ✅ **Access-Challenge** (v0.5.0) - Multi-round authentication for EAP
 4. ✅ **Authentication Backends** - LDAP, PostgreSQL, EAP-TLS
-5. ❌ **CHAP Support** - Deferred (superseded by EAP-TLS)
-6. ❌ **Message-Authenticator** - Deferred (less critical with EAP-TLS)
+5. ✅ **CHAP Support** (v0.3.0) - Challenge/response with CHAP-Challenge fallback to the Request Authenticator
+6. ✅ **Message-Authenticator** (v0.3.0, required on EAP since v0.10.0) - HMAC-MD5 verification and generation
+7. ✅ **RadSec** (v0.10.0) - TLS 1.3 / ML-KEM-1024 mutual-TLS transport, default for config files
+8. ✅ **CoA/Disconnect** (v0.10.0) - Server-originated over RadSec via the management API
 
 ### Priority 3 (MEDIUM) - ⚠️ PARTIAL
 
@@ -728,15 +873,18 @@ Total:         156+ tests
    zero-IMSK fallback per RFC 7170 §5.2.
 3. ⚠️ **Proxy-State** - Echoed in responses; ordering regression tests
    pending
-4. ❌ **Hot Configuration Reload** - Deferred
-5. ⚠️ **Health Monitoring** - Basic Status-Server implemented
+4. ❌ **Hot Configuration Reload** - Deferred (only the mgmt access policy reloads on SIGHUP)
+5. ⚠️ **Health Monitoring** - Basic Status-Server implemented; Message-Authenticator not verified, always Access-Accept
+6. ⚠️ **Certificate Revocation (CRL/OCSP)** - Module implemented under the `revocation` feature, not integrated into `radius-server`
+7. ❌ **MS-MPPE Keys** - MSK derived but MS-MPPE-Send/Recv-Key (VSA 311) not attached to Access-Accept
 
 ### Priority 4 (LOW) - ❌ NOT PLANNED
 
-1. ❌ **Vendor Attributes** - Structure defined, not prioritized
+1. ❌ **Vendor Attributes** - Structure defined, not prioritized (blocks MS-MPPE)
 2. ❌ **Tunnel Attributes** - Future enhancement
-3. ❌ **CoA/Disconnect (RFC 5176)** - Not planned
-4. ❌ **RadSec (RFC 6614)** - Not planned
+3. ❌ **CoA/Disconnect over UDP** - Only the RadSec path shipped (v0.10.0)
+4. ❌ **DTLS (RFC 7360)** - Not planned; RadSec is TLS-only
+5. ❌ **Accounting on a dedicated 1813 socket** - Single UDP socket; 1813 advertised but not bound
 
 ---
 
@@ -758,11 +906,18 @@ Total:         156+ tests
 | Audit Logging | - | ✅ Complete | v0.1.1+ | HIGH | Compliance |
 | LDAP Backend | - | ✅ Complete | - | MEDIUM | Enterprise auth |
 | PostgreSQL Backend | - | ✅ Complete | - | MEDIUM | Database auth |
-| Status-Server | 5997 | ⚠️ Partial | v0.1.0 | LOW | Basic support |
-| CHAP | 2865 | ❌ Deferred | - | LOW | Superseded by EAP-TLS |
-| Message-Authenticator | 2869 | ❌ Deferred | - | MEDIUM | Less critical with TLS |
+| Status-Server | 5997 | ⚠️ Partial | v0.1.0 | LOW | Message-Authenticator not verified; always Access-Accept |
+| CHAP | 2865 | ✅ Complete | v0.3.0 | LOW | CHAP-Challenge or Request Authenticator |
+| Message-Authenticator | 2869 / 3579 | ✅ Complete | v0.3.0 / v0.10.0 | HIGH | Required on EAP requests since v0.10.0 |
+| RadSec | 6614 | ✅ Complete | v0.10.0 | HIGH | TLS 1.3 + ML-KEM-1024 mTLS; no DTLS |
+| CoA/Disconnect | 5176 | ✅ RadSec only | v0.10.0 | MEDIUM | Server-originated via mgmt API; no UDP path |
+| NAS Identification | 2865 | ✅ Complete | v0.2.0 | MEDIUM | NAS-IP-Address or NAS-Identifier enforced |
+| Enumerated Values | 2865 | ✅ Strict mode | v0.2.0 | LOW | Lenient mode accepts unknown values |
+| MS-MPPE Keys | 2548 | ❌ Missing | - | HIGH | MSK derived, VSA 311 not encoded |
+| Certificate Revocation | 5280 / 6960 | ⚠️ Not integrated | v0.7.x | HIGH | `revocation` feature in radius-proto only |
+| Accounting Port 1813 | 2866 | ⚠️ Not bound | - | MEDIUM | Single UDP socket on listen_port |
 | Proxy-State | 2865 | ⚠️ Echoed | v0.x | MEDIUM | Ordering tests pending |
-| Hot Reload | - | ❌ Deferred | - | MEDIUM | Requires restart |
+| Hot Reload | - | ❌ Deferred | - | MEDIUM | Only mgmt access policy reloads on SIGHUP |
 | EAP-TEAP | 7170 | ⚠️ Phase 1+2 | v0.7.x | MEDIUM | Crypto-binding RFC-correct; inner methods with real IMSK pending |
 
 ---
@@ -777,7 +932,7 @@ The current implementation is **PRODUCTION-READY** for:
    - Certificate-based authentication
    - WPA2/WPA3 Enterprise
    - Mutual TLS authentication
-   - Full key derivation for wireless encryption
+   - ⚠️ MSK derived, but MS-MPPE keys are not yet delivered to the NAS (see RFC 2869 Cryptography)
 
 2. **VPN Authentication with EAP-TLS**
    - Certificate-based VPN access
@@ -786,7 +941,8 @@ The current implementation is **PRODUCTION-READY** for:
 
 3. **Modern Wireless Networks**
    - 802.1X port-based authentication
-   - Dynamic WEP/WPA key derivation
+   - RadSec (RFC 6614) transport between NAS and server
+   - Server-originated CoA/Disconnect (RFC 5176) over RadSec
    - RADIUS accounting for usage tracking
 
 4. **High-Security Environments**
@@ -808,12 +964,19 @@ The current implementation is **PRODUCTION-READY** for:
 
 1. **RADIUS Proxy**
    - Basic forwarding works
-   - Proxy-State attribute not preserved
+   - Proxy-State echoed; multi-Proxy-State ordering regression tests pending
    - Hot reload not available
+   - Upstream (proxy) leg is UDP only
 
 2. **Legacy Authentication**
-   - PAP supported
-   - CHAP not supported (use EAP-TLS instead)
+   - PAP and CHAP supported
+   - EAP-MD5 supported as an EAP-TEAP inner method only
+
+3. **Dynamic Authorization (CoA/Disconnect)**
+   - Server-originated over RadSec only; no UDP (port 3799) path
+
+4. **Certificate Revocation**
+   - CRL/OCSP module exists but is not wired into EAP-TLS or RadSec verification
 
 ---
 
@@ -821,13 +984,16 @@ The current implementation is **PRODUCTION-READY** for:
 
 1. **Legacy EAP Methods**
    - EAP-TTLS, PEAP, EAP-MSCHAPv2 not implemented
-   - Use EAP-TLS or wait for EAP-TEAP
+   - Use EAP-TLS or EAP-TEAP
 
-2. **Dynamic Authorization (CoA/Disconnect)**
-   - RFC 5176 not implemented
+2. **WPA-Enterprise key delivery**
+   - MS-MPPE-Send-Key / MS-MPPE-Recv-Key not attached to Access-Accept
 
-3. **RADIUS over TLS (RadSec)**
-   - RFC 6614 not implemented
+3. **RADIUS over DTLS (RFC 7360)**
+   - Not implemented; RadSec is TLS 1.3 only
+
+4. **Dedicated accounting port**
+   - 1813/udp is advertised but not bound; accounting is accepted on the authentication socket or over RadSec
 
 ---
 
@@ -840,6 +1006,8 @@ The current implementation is **PRODUCTION-READY** for:
    - ✅ Mutual TLS with client verification
    - ✅ Strong key derivation (RFC 5705)
    - ✅ Cryptographic session binding
+   - ✅ Message-Authenticator required on EAP requests (Blast-RADIUS mitigation)
+   - ✅ RadSec transport: TLS 1.3, ML-KEM-1024, mutually authenticated
 
 2. **DoS Protection**
    - ✅ Per-client rate limiting
@@ -869,9 +1037,14 @@ The current implementation is **PRODUCTION-READY** for:
    - ✅ Environment variable support for secrets
 
 2. **Protocol Validation**
-   - ⚠️ Attribute validation could be stricter
+   - ⚠️ Non-enumerated integer ranges not validated
    - ⚠️ Randomness quality not validated
-   - ✅ Basic packet validation implemented
+   - ⚠️ Status-Server Message-Authenticator not verified
+   - ✅ Required attributes and enumerations validated (strict mode)
+
+3. **Certificate Lifecycle**
+   - ⚠️ No CRL/OCSP checking at runtime (module exists, not integrated)
+   - ⚠️ No certificate hot-rotation for RadSec or EAP-TLS
 
 ---
 
@@ -883,12 +1056,13 @@ The USG RADIUS server is **production-ready** for modern enterprise deployments 
 
 **Strengths**:
 
-1. ✅ **Complete EAP-TLS implementation** - Industry-standard certificate authentication
-2. ✅ **Comprehensive DoS protection** - Rate limiting, connection limits, bandwidth throttling
-3. ✅ **Full accounting support** - Database backend with exports and reporting
-4. ✅ **Strong security posture** - Client validation, replay protection, audit logging
-5. ✅ **Excellent test coverage** - 156+ tests with high pass rate
-6. ✅ **Comprehensive documentation** - 2,000+ lines of guides and examples
+1. ✅ **Complete EAP-TLS implementation** - Industry-standard certificate authentication (MS-MPPE key delivery pending)
+2. ✅ **RadSec transport and CoA/Disconnect** - TLS 1.3 / ML-KEM-1024 mutual TLS with server-originated session control
+3. ✅ **Comprehensive DoS protection** - Rate limiting, connection limits, bandwidth throttling
+4. ✅ **Full accounting support** - Database backend with exports and reporting
+5. ✅ **Strong security posture** - Client validation, replay protection, Message-Authenticator, audit logging
+6. ✅ **Excellent test coverage** - 156+ tests with high pass rate
+7. ✅ **Comprehensive documentation** - 2,000+ lines of guides and examples
 
 **Suitable For**:
 
@@ -901,15 +1075,18 @@ The USG RADIUS server is **production-ready** for modern enterprise deployments 
 **Not Recommended For** (without additional work):
 
 - ❌ Deployments requiring legacy EAP methods (TTLS, PEAP, MSCHAPv2)
-- ❌ RADIUS proxy deployments (Proxy-State not preserved)
+- ❌ WPA-Enterprise deployments that need MS-MPPE keys from the Access-Accept
+- ❌ Deployments that must revoke client certificates before expiry (CRL/OCSP not integrated)
 - ❌ Environments requiring hot configuration reload
 
 **Next Development Priorities**:
 
-1. EAP-TEAP implementation (modern tunneled EAP method)
-2. Message-Authenticator validation
-3. Hot configuration reload
-4. Certificate revocation checking (CRL/OCSP) - v0.6.0 planned
+1. MS-MPPE-Send-Key / MS-MPPE-Recv-Key (VSA 311) encoding from the EAP MSK
+2. Integrate the `revocation` module (CRL/OCSP) into EAP-TLS and RadSec client-certificate verification
+3. EAP-TEAP inner methods with real keying material (EAP-MSCHAPv2)
+4. Status-Server Message-Authenticator verification and Accounting-Response reply (RFC 5997)
+5. Bind a dedicated accounting socket (1813/udp) or drop it from the deployment manifests
+6. Hot configuration reload
 
 ---
 
@@ -921,9 +1098,13 @@ The USG RADIUS server is **production-ready** for modern enterprise deployments 
 - **v0.3.0**: RADIUS accounting with file and PostgreSQL backends
 - **v0.4.0**: Accounting exports (CSV, JSON), usage reporting, retention policies
 - **v0.5.0**: **EAP-TLS 100% complete** - Certificate-based authentication, production key extraction, mutual TLS
-- **v0.6.0 (Planned)**: Certificate revocation (CRL/OCSP), EAP-TEAP foundation
+- **v0.6.0**: PostgreSQL and LDAP authentication backends, HTTP health checks, Prometheus metrics
+- **v0.7.x**: RADIUS proxy, EAP-TEAP Phase 1+2, CRL/OCSP module (`revocation` feature, not integrated)
+- **v0.9.0**: Kubernetes-only deployment (systemd/Compose removed), management API mTLS + ABAC, live session index, dual-stack IPv4 fix
+- **v0.10.0**: **RadSec (RFC 6614)** transport, **CoA/Disconnect (RFC 5176)** over RadSec, Message-Authenticator required on EAP requests, NAS-IPv6-Address, Termination-Action
+- **v0.10.1**: Container image built with the `tls` feature
 
 ---
 
-*Last Updated: 2025-12-31*
-*Document Version: 2.0 (Major update for v0.5.0 EAP-TLS completion)*
+*Last Updated: 2026-10-18*
+*Document Version: 3.0 (Reconciled with the v0.10.1 code: CHAP, Message-Authenticator, RadSec, CoA, validation, MS-MPPE and revocation gaps)*
