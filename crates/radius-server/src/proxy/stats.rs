@@ -224,7 +224,7 @@ mod tests {
         };
 
         let pool = Arc::new(HomeServerPool::new(pool_config).unwrap());
-        let stats = ProxyStats::collect(&vec![pool]);
+        let stats = ProxyStats::collect(&[pool]);
 
         let json = stats.to_json().unwrap();
         assert!(json.contains("test_pool"));
