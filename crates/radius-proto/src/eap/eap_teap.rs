@@ -611,45 +611,30 @@ impl CryptoBinding {
     ///                   IMSK[0], 60)
     ///
     /// Where session_key_seed is derived from TLS master secret.
+    ///
+    /// TLS-PRF is the TLS 1.2 PRF (RFC 5246 §5, `P_SHA256`), matching
+    /// hostapd's `eap_teap_derive_imck`.
     pub fn derive_imck(session_key_seed: &[u8], imsk: &[u8]) -> Vec<u8> {
-        // For MVP, use HMAC-SHA256 as TLS-PRF with expansion to 60 bytes
-        // In production, should use actual TLS PRF from the TLS version negotiated
-
-        let label = b"Inner Methods Compound Keys";
-
-        // HMAC-SHA256 produces 32 bytes, we need 60 bytes
-        // Use iterative HMAC to expand the output
-        let mut output = Vec::with_capacity(60);
-
-        // First iteration: HMAC(seed, label || imsk || 0x01)
-        let mut mac = Hmac::<Sha256>::new_from_slice(session_key_seed)
-            .expect("HMAC can take key of any size");
-        mac.update(label);
-        mac.update(imsk);
-        mac.update(&[0x01]);
-        let a1 = mac.finalize().into_bytes();
-        output.extend_from_slice(&a1);
-
-        // Second iteration: HMAC(seed, A1 || label || imsk || 0x02)
-        let mut mac = Hmac::<Sha256>::new_from_slice(session_key_seed)
-            .expect("HMAC can take key of any size");
-        mac.update(&a1);
-        mac.update(label);
-        mac.update(imsk);
-        mac.update(&[0x02]);
-        let a2 = mac.finalize().into_bytes();
-        output.extend_from_slice(&a2);
-
-        // Truncate to 60 bytes
-        output.truncate(60);
-        output
+        Self::tls_prf_sha256(
+            session_key_seed,
+            b"Inner Methods Compound Keys",
+            imsk,
+            Self::IMCK_LENGTH,
+        )
     }
 
-    /// Derive CMK (Compound MAC Key) from IMCK - RFC 7170 Section 5.3
+    /// Length of IMCK[j] (RFC 7170 §5.2: 60 octets).
+    pub const IMCK_LENGTH: usize = 60;
+
+    /// Length of CMK[j] (RFC 7170 §5.2: the last 20 octets of IMCK[j]).
+    pub const CMK_LENGTH: usize = 20;
+
+    /// Derive CMK (Compound MAC Key) from IMCK - RFC 7170 Section 5.2
     ///
-    /// CMK = First 20 bytes of IMCK
+    /// CMK[j] = last 20 octets of IMCK[j] (octets 40..60); S-IMCK[j] is the
+    /// first 40, so the two never overlap.
     pub fn derive_cmk(imck: &[u8]) -> Vec<u8> {
-        imck[..20].to_vec()
+        imck[Self::S_IMCK_LENGTH..Self::S_IMCK_LENGTH + Self::CMK_LENGTH].to_vec()
     }
 
     /// Length of S-IMCK[j] (RFC 7170 §5.2: the first 40 octets of IMCK[j]).
@@ -900,8 +885,7 @@ impl EapTeapServer {
     /// `Some` only after the inner method succeeded and the peer's
     /// Crypto-Binding response verified; a failed or unbound conversation
     /// yields no keying material. Derived from S-IMCK[j] with the TLS 1.2 PRF
-    /// (`P_SHA256`); note the IMCK chain itself still uses the simplified
-    /// HMAC expansion in `CryptoBinding::derive_imck`.
+    /// (`P_SHA256`).
     pub fn get_msk(&self) -> Option<Vec<u8>> {
         if !self.crypto_binding_verified {
             return None;
@@ -2612,11 +2596,44 @@ mod tests {
         let imck = CryptoBinding::derive_imck(&session_key_seed, &imsk);
         let cmk = CryptoBinding::derive_cmk(&imck);
 
-        // CMK should be 20 bytes (first 20 bytes of IMCK)
+        // RFC 7170 §5.2: CMK[j] is the last 20 octets of the 60-octet IMCK[j]
+        assert_eq!(imck.len(), 60);
         assert_eq!(cmk.len(), 20);
+        assert_eq!(&cmk[..], &imck[40..60]);
 
-        // Should match first 20 bytes of IMCK
-        assert_eq!(&cmk[..], &imck[..20]);
+        // S-IMCK[j] is the first 40 octets; CMK must not overlap it
+        let cb = CryptoBinding::new(&session_key_seed, &imsk);
+        assert_eq!(cb.s_imck(), &cb.imck[..40]);
+        assert_eq!(&cb.cmk[..], &cb.imck[40..]);
+        assert_ne!(&cb.cmk[..], &cb.s_imck()[..20]);
+    }
+
+    #[test]
+    fn test_crypto_binding_imck_is_tls12_prf() {
+        // IMCK[0] = TLS-PRF(session_key_seed, "Inner Methods Compound Keys", IMSK[0], 60)
+        // Reference value computed with an independent P_SHA256 (RFC 5246 §5)
+        // implementation for session_key_seed = 0x01*32, IMSK = 0x02*32.
+        let session_key_seed = vec![0x01; 32];
+        let imsk = vec![0x02; 32];
+
+        let imck = CryptoBinding::derive_imck(&session_key_seed, &imsk);
+        assert_eq!(
+            imck,
+            CryptoBinding::tls_prf_sha256(
+                &session_key_seed,
+                b"Inner Methods Compound Keys",
+                &imsk,
+                60
+            )
+        );
+
+        let expected = "b28ef7509fc65d482b822c35a530a1dfd22b798ba367e7d5ea8136bd4acc6b17\
+                        bbabbe9d422de41cfdb162f6daae8252fde8ee0a0eeec93d85c45c8c";
+        let expected: Vec<u8> = (0..expected.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&expected[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(imck, expected);
     }
 
     #[test]
