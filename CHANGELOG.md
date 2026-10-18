@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Updated transitive dependencies to clear `cargo audit` findings published since
+  v0.10.1: `rustls` 0.23.40→0.23.46 (RUSTSEC-2026-0285, -0346, -0348, -0349 —
+  including an unauthenticated ServerHello key-exchange downgrade that matters for
+  RadSec), `quinn-proto` 0.11.14→0.11.19 (RUSTSEC-2026-0185, -0338, -0339, -0340,
+  -0342), `h2` 0.4.14→0.4.20 (RUSTSEC-2026-0258), `crossbeam-epoch` 0.9.18→0.9.21
+  (RUSTSEC-2026-0204), plus `event-listener` 5.4.2 (RUSTSEC-2026-0221) and the
+  yanked `spin` 0.9.8→0.9.9. `aws-lc-rs`/`aws-lc-sys` and `rustls-webpki` moved
+  with `rustls`. `cargo audit` is now clean with no warnings.
+
+### Fixed
+
+- `cargo clippy -D warnings` on current stable (1.99) failed with
+  `double_must_use` inside the `#[async_trait]` expansion of `StateBackend`;
+  bumped `async-trait` 0.1.89→0.1.92, whose release resolves that lint in the
+  generated code. No source changes.
+
 ## [0.10.1] - 2026-06-17
 
 ### Fixed
