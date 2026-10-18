@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MS-MPPE-Send-Key / MS-MPPE-Recv-Key (RFC 2548 §2.4)** on the Access-Accept
+  that concludes an EAP-TLS or EAP-TEAP exchange, so the NAS receives the PMK
+  for the 802.11i 4-way handshake. The keys are salt-encrypted under the
+  client's shared secret (`"radsec"` under RadSec) and the Request
+  Authenticator in the Access-Accept builder; EAP handlers now return the MSK
+  on `AuthResult::Accept { msk }` instead of attaching raw attributes.
+- **Vendor-Specific (26) sub-attribute codec** (`radius_proto::VendorSpecific`,
+  `Packet::find_vendor_attributes`) and `radius_proto::mppe` with known-answer
+  and round-trip tests.
+- **EAP-Key-Name (102)** carrying the RFC 9190 §2.5 EAP Session-Id on TLS 1.3
+  EAP-TLS Access-Accepts.
+- **EAP-TEAP MSK derivation** (RFC 7170 §5.4) from S-IMCK, gated on a verified
+  Crypto-Binding response.
+
 ### Security
 
 - Updated transitive dependencies to clear `cargo audit` findings published since
@@ -20,10 +36,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **EAP-TLS over TLS 1.3 derived the MSK with the TLS 1.2 exporter label.**
+  RFC 9190 §2.3 requires `"EXPORTER_EAP_TLS_Key_Material"` with the `0x0D`
+  Type-Code context; using `"client EAP encryption"` produced an MSK no
+  RFC 9190 supplicant shares. Derivation is now selected by the negotiated
+  TLS version.
+- An EAP-TEAP conversation that reached `Complete` without a verified
+  Crypto-Binding is now rejected instead of accepted.
+
 - `cargo clippy -D warnings` on current stable (1.99) failed with
   `double_must_use` inside the `#[async_trait]` expansion of `StateBackend`;
   bumped `async-trait` 0.1.89→0.1.92, whose release resolves that lint in the
   generated code. No source changes.
+
+### Changed
+
+- `AuthResult::Accept` gained an `msk: Option<Vec<u8>>` field (breaking for
+  direct constructors; use `AuthResult::accept()` for key-less success).
 
 ## [0.10.1] - 2026-06-17
 

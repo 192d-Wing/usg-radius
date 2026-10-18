@@ -293,10 +293,14 @@ correct stripping of server-added Proxy-State on the response leg.
 **Cryptography (⚠️ partial)**:
 
 - ✅ Production key extraction using RFC 5705 (export_keying_material)
-- ✅ MSK derivation (64 bytes) - RFC 5216 Section 2.3
+- ✅ MSK derivation (64 bytes) - RFC 5216 Section 2.3 (TLS 1.2) / RFC 9190 Section 2.3 (TLS 1.3)
 - ✅ EMSK derivation (64 bytes) - RFC 5295
-- ✅ Correct label usage: "client EAP encryption"
-- ❌ MS-MPPE-Send-Key / MS-MPPE-Recv-Key (RFC 2548, Vendor-Specific 311) are **not** derived from the MSK or attached to the Access-Accept. `crates/radius-server/src/eap_auth.rs` carries a `TODO` at the Accept path and no VSA 311 encoder exists, so a NAS cannot obtain the PMK for 802.11 4-way handshake from this server yet. **Gap, priority HIGH for WPA-Enterprise.**
+- ✅ Version-correct exporter labels: `"client EAP encryption"` (TLS 1.2),
+  `"EXPORTER_EAP_TLS_Key_Material"` with the `0x0D` Type-Code context (TLS 1.3)
+- ✅ MS-MPPE-Recv-Key (MSK[0..32]) / MS-MPPE-Send-Key (MSK[32..64]) on the
+  Access-Accept, salt-encrypted per RFC 2548 §2.4 under the client secret and
+  Request Authenticator (`"radsec"` under RadSec)
+- ✅ EAP-Key-Name (RFC 9190 §2.5 Session-Id) on TLS 1.3 Access-Accepts
 - ✅ Cryptographically secure session binding
 
 **Session Management (100%)**:
@@ -748,9 +752,11 @@ Set `"audit_log_path": "stdout"` (or `"-"`) to emit JSON Lines on stdout for the
 
 #### 1. Vendor-Specific Attributes (Type 26)
 
-**Status**: Structure defined, not fully parsed
+**Status**: Sub-attribute codec implemented (`radius_proto::attributes::VendorSpecific`:
+Vendor-Id + vendor-type/vendor-length TLVs, RFC 2865 §5.26), used for the RFC 2548
+MS-MPPE keys
 **Priority**: MEDIUM
-**Missing**: Vendor-ID parsing, vendor attribute handling
+**Missing**: Vendor dictionaries / named vendor attributes in policy reply attributes
 
 ---
 
@@ -880,7 +886,7 @@ Total:         156+ tests
 
 ### Priority 4 (LOW) - ❌ NOT PLANNED
 
-1. ❌ **Vendor Attributes** - Structure defined, not prioritized (blocks MS-MPPE)
+1. ⚠️ **Vendor Attributes** - Type 26 codec and RFC 2548 MS-MPPE keys implemented; vendor dictionaries not prioritized
 2. ❌ **Tunnel Attributes** - Future enhancement
 3. ❌ **CoA/Disconnect over UDP** - Only the RadSec path shipped (v0.10.0)
 4. ❌ **DTLS (RFC 7360)** - Not planned; RadSec is TLS-only
@@ -902,6 +908,9 @@ Total:         156+ tests
 | Bandwidth Throttling | - | ✅ Complete | v0.2.0 | CRITICAL | Bandwidth protection |
 | Accounting | 2866 | ✅ Complete | v0.3.0 | HIGH | Session tracking |
 | EAP-TLS | 5216 | ✅ Complete | v0.5.0 | HIGH | Modern auth |
+| EAP-TLS over TLS 1.3 keys | 9190 | ✅ Complete | unreleased | HIGH | Exporter labels + EAP-Key-Name |
+| MS-MPPE-Send/Recv-Key | 2548 | ✅ Complete | unreleased | HIGH | Required for the 802.11i 4-way handshake |
+| Vendor-Specific codec | 2865 §5.26 | ✅ Complete | unreleased | MEDIUM | Sub-attribute encode/decode; no dictionaries |
 | EAP Framework | 3748 | ✅ Complete | v0.5.0 | HIGH | Infrastructure |
 | Audit Logging | - | ✅ Complete | v0.1.1+ | HIGH | Compliance |
 | LDAP Backend | - | ✅ Complete | - | MEDIUM | Enterprise auth |
@@ -918,7 +927,7 @@ Total:         156+ tests
 | Accounting Port 1813 | 2866 | ⚠️ Not bound | - | MEDIUM | Single UDP socket on listen_port |
 | Proxy-State | 2865 | ⚠️ Echoed | v0.x | MEDIUM | Ordering tests pending |
 | Hot Reload | - | ❌ Deferred | - | MEDIUM | Only mgmt access policy reloads on SIGHUP |
-| EAP-TEAP | 7170 | ⚠️ Phase 1+2 | v0.7.x | MEDIUM | Crypto-binding RFC-correct; inner methods with real IMSK pending |
+| EAP-TEAP | 7170 | ⚠️ Phase 1+2 | v0.7.x | MEDIUM | Crypto-binding RFC-correct; MSK (§5.4) emitted as MS-MPPE keys; inner methods with real IMSK pending |
 
 ---
 

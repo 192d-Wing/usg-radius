@@ -1313,6 +1313,11 @@ pub mod eap_tls {
         Ok(server_config)
     }
 
+    /// EAP Type-Code of EAP-TLS (RFC 5216): the exporter context octet
+    /// RFC 9190 §2.3 / §2.5 prescribe for TLS 1.3 key and Session-Id derivation.
+    pub const EAP_TLS_TYPE_CODE: u8 = 13;
+    const EAP_TLS_TYPE_CODE_CONTEXT: &[u8] = &[EAP_TLS_TYPE_CODE];
+
     /// EAP-TLS Server Handler
     ///
     /// Manages TLS handshake for a single EAP-TLS authentication session.
@@ -1438,10 +1443,17 @@ pub mod eap_tls {
         ///
         /// # RFC 5216 Compliance
         ///
-        /// Per RFC 5216 Section 2.3, EAP-TLS derives the MSK and EMSK using:
-        /// - **Label**: "client EAP encryption" (22 bytes, ASCII)
-        /// - **Context**: None (empty context value)
-        /// - **Length**: 128 bytes (64 MSK + 64 EMSK)
+        /// The exporter parameters depend on the negotiated TLS version, and a
+        /// peer uses the same rule, so both ends agree on the MSK:
+        ///
+        /// - **TLS 1.2** (RFC 5216 §2.3): label `"client EAP encryption"`,
+        ///   no context, 128 octets.
+        /// - **TLS 1.3** (RFC 9190 §2.3): label
+        ///   `"EXPORTER_EAP_TLS_Key_Material"`, context = the one-octet EAP
+        ///   Type-Code `0x0D`, 128 octets.
+        ///
+        /// In both cases the first 64 octets are the MSK and the last 64 the
+        /// EMSK.
         ///
         /// The RFC 5705 exporter provides cryptographically secure key derivation
         /// that binds the keys to the specific TLS session, preventing key reuse
@@ -1480,21 +1492,25 @@ pub mod eap_tls {
 
             let conn = self.connection.as_ref().ok_or(EapError::InvalidState)?;
 
-            // RFC 5216 Section 2.3: Use RFC 5705 keying material exporter
-            // Label: "client EAP encryption"
-            // Context: None (empty)
-            // Output: 128 bytes (64 MSK + 64 EMSK)
-            let label = b"client EAP encryption";
+            // RFC 5705 keying material exporter, parameterised per TLS version:
+            // RFC 9190 §2.3 for TLS 1.3, RFC 5216 §2.3 for TLS 1.2. Using the
+            // TLS 1.2 label on a TLS 1.3 session would produce an MSK the
+            // supplicant does not share, and the 4-way handshake would fail.
+            let (label, context): (&[u8], Option<&[u8]>) =
+                if conn.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3) {
+                    (
+                        b"EXPORTER_EAP_TLS_Key_Material",
+                        Some(EAP_TLS_TYPE_CODE_CONTEXT),
+                    )
+                } else {
+                    (b"client EAP encryption", None)
+                };
             let mut keying_material = vec![0u8; 128];
 
-            conn.export_keying_material(
-                keying_material.as_mut_slice(),
-                label,
-                None, // No context value per RFC 5216
-            )
-            .map_err(|e| {
-                EapError::TlsError(format!("Failed to export keying material: {:?}", e))
-            })?;
+            conn.export_keying_material(keying_material.as_mut_slice(), label, context)
+                .map_err(|e| {
+                    EapError::TlsError(format!("Failed to export keying material: {:?}", e))
+                })?;
 
             // Split into MSK (first 64 bytes) and EMSK (last 64 bytes)
             let msk: [u8; 64] = keying_material[0..64]
@@ -1518,6 +1534,39 @@ pub mod eap_tls {
         /// Get the derived EMSK (Extended Master Session Key)
         pub fn get_emsk(&self) -> Option<&[u8; 64]> {
             self.context.get_emsk()
+        }
+
+        /// Negotiated TLS protocol version, once the handshake has chosen one.
+        pub fn protocol_version(&self) -> Option<rustls::ProtocolVersion> {
+            self.connection.as_ref().and_then(|c| c.protocol_version())
+        }
+
+        /// EAP Session-Id (RFC 5247 §5) for the EAP-Key-Name RADIUS attribute.
+        ///
+        /// Defined by RFC 9190 §2.5 for TLS 1.3 as
+        /// `0x0D || TLS-Exporter("EXPORTER_EAP_TLS_Method-Id", 0x0D, 64)`.
+        /// The TLS 1.2 form (RFC 5216 §2.3, `0x0D || client.random ||
+        /// server.random`) needs the handshake randoms, which rustls does not
+        /// expose, so this returns `None` for TLS 1.2 sessions and before the
+        /// handshake completes.
+        pub fn session_id(&self) -> Option<Vec<u8>> {
+            let conn = self.connection.as_ref()?;
+            if conn.is_handshaking()
+                || conn.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3)
+            {
+                return None;
+            }
+            let mut method_id = vec![0u8; 64];
+            conn.export_keying_material(
+                method_id.as_mut_slice(),
+                b"EXPORTER_EAP_TLS_Method-Id",
+                Some(EAP_TLS_TYPE_CODE_CONTEXT),
+            )
+            .ok()?;
+            let mut session_id = Vec::with_capacity(1 + method_id.len());
+            session_id.push(EAP_TLS_TYPE_CODE);
+            session_id.extend_from_slice(&method_id);
+            Some(session_id)
         }
 
         /// Export keying material from the TLS connection (RFC 5705)

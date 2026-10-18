@@ -131,6 +131,10 @@ pub enum AttributeType {
     /// Carried in a CoA-NAK / Disconnect-NAK to explain why the request failed
     /// (e.g. Session-Context-Not-Found = 503).
     ErrorCause = 101,
+    /// EAP-Key-Name (102) - RFC 4072 §3.2 / RFC 7268
+    /// Carries the EAP Session-Id on an Access-Accept so the NAS can name the
+    /// PMK for 802.11r key hierarchies and 802.1X key caching.
+    EapKeyName = 102,
 }
 
 impl AttributeType {
@@ -196,6 +200,7 @@ impl AttributeType {
             87 => Some(AttributeType::NasPortId),
             95 => Some(AttributeType::NasIpv6Address),
             101 => Some(AttributeType::ErrorCause),
+            102 => Some(AttributeType::EapKeyName),
             _ => None,
         }
     }

@@ -7,7 +7,7 @@
 //! multi-round EAP authentication sessions.
 
 use radius_proto::eap::{EapPacket, EapSessionManager, EapState, EapType};
-use radius_proto::{Attribute, Packet};
+use radius_proto::{Attribute, AttributeType, Packet};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, error, warn};
@@ -550,19 +550,42 @@ impl EapAuthHandler {
                     }
                 };
                 let success = EapPacket::success(success_id);
-                let attrs = match radius_proto::eap::eap_to_radius_attributes(&success) {
+                let mut attrs = match radius_proto::eap::eap_to_radius_attributes(&success) {
                     Ok(a) => a,
                     Err(e) => {
                         error!(session_id, error = ?e, "continue_eap_tls: failed to wrap EAP-Success");
                         return AuthResult::Reject;
                     }
                 };
+
+                // RFC 5216 §2.3 / RFC 9190 §2.3: the MSK extracted above goes
+                // to the Access-Accept builder, which encrypts it into the
+                // RFC 2548 MS-MPPE-Recv/Send-Key attributes with the client's
+                // shared secret and this request's authenticator.
+                let Some(msk) = tls_server.get_msk().map(|k| k.to_vec()) else {
+                    error!(
+                        session_id,
+                        "continue_eap_tls: MSK missing after extract_keys"
+                    );
+                    return AuthResult::Reject;
+                };
+
+                // RFC 9190 §2.5 / RFC 4072 §3.2: EAP-Key-Name carries the EAP
+                // Session-Id (TLS 1.3 only; rustls cannot build the TLS 1.2 form).
+                if let Some(session_id_bytes) = tls_server.session_id()
+                    && let Ok(a) = Attribute::new(AttributeType::EapKeyName as u8, session_id_bytes)
+                {
+                    attrs.push(a);
+                }
+
                 debug!(
                     session_id,
                     username, "continue_eap_tls: handshake complete, EAP-Success"
                 );
-                // TODO: derive MS-MPPE keys from the MSK and attach to the Accept.
-                AuthResult::Accept { attributes: attrs }
+                AuthResult::Accept {
+                    attributes: attrs,
+                    msk: Some(msk),
+                }
             }
 
             Err(e) => {
@@ -638,13 +661,26 @@ impl EapAuthHandler {
                                 }
                             };
 
+                            // RFC 7170 §5.4 MSK, present only when the inner
+                            // method succeeded and the Crypto-Binding verified.
+                            // A "complete" TEAP conversation without key
+                            // material did not authenticate the peer.
+                            let Some(msk) = teap_server.get_msk() else {
+                                warn!(
+                                    session_id,
+                                    username,
+                                    "continue_eap_teap: conversation complete without a verified crypto-binding"
+                                );
+                                return AuthResult::Reject;
+                            };
+
                             let success_packet = EapPacket::success(identifier);
 
                             match radius_proto::eap::eap_to_radius_attributes(&success_packet) {
                                 Ok(eap_attrs) => {
-                                    // Could add MS-MPPE keys here from MSK
                                     return AuthResult::Accept {
                                         attributes: eap_attrs,
+                                        msk: Some(msk),
                                     };
                                 }
                                 Err(e) => {
@@ -777,7 +813,8 @@ impl AuthHandler for EapAuthHandler {
     }
 
     fn get_accept_attributes(&self, username: &str) -> Vec<Attribute> {
-        // Could add MS-MPPE keys here from EAP-TLS MSK
+        // MS-MPPE keys are not added here: they are per-request (bound to the
+        // Request Authenticator) and travel on `AuthResult::Accept::msk`.
         self.inner_handler.get_accept_attributes(username)
     }
 }
@@ -835,5 +872,368 @@ mod tests {
 
         // Expected to fail since files don't exist
         assert!(result.is_err());
+    }
+}
+
+/// End-to-end EAP-TLS conversations against an in-memory rustls supplicant,
+/// checking that the concluding Access-Accept carries the RFC 2548 MS-MPPE
+/// keys (and EAP-Key-Name) derived from the MSK both sides agree on.
+#[cfg(all(test, feature = "tls"))]
+mod eap_tls_mppe_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::server::{RadiusServer, ServerConfig, SimpleAuthHandler};
+    use radius_proto::eap::eap_tls::{EAP_TLS_TYPE_CODE, TlsFlags};
+    use radius_proto::eap::{EapCode, eap_from_radius_packet};
+    use radius_proto::mppe::{MICROSOFT_VENDOR_ID, MS_MPPE_RECV_KEY, MS_MPPE_SEND_KEY};
+    use radius_proto::{
+        Code, MppeKeys, calculate_message_authenticator, generate_request_authenticator,
+        verify_response_authenticator,
+    };
+    use rustls::pki_types::{CertificateDer, ServerName};
+    use rustls::{ClientConfig, ClientConnection, RootCertStore};
+    use std::io::Write as _;
+
+    const SECRET: &[u8] = b"s3cret";
+    const SERVER_NAME: &str = "radius.test";
+
+    struct TestPki {
+        _dir: tempfile::TempDir,
+        cert_path: String,
+        key_path: String,
+        ca_der: CertificateDer<'static>,
+    }
+
+    /// Throwaway CA + CA-signed server certificate, written to PEM files the
+    /// way `configure_tls` expects them.
+    fn gen_pki() -> TestPki {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "USG Test EAP CA");
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = KeyPair::generate().unwrap();
+        let server = CertificateParams::new(vec![SERVER_NAME.to_string()])
+            .unwrap()
+            .signed_by(&server_key, &ca, &ca_key)
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, data: &str| {
+            let path = dir.path().join(name);
+            std::fs::File::create(&path)
+                .unwrap()
+                .write_all(data.as_bytes())
+                .unwrap();
+            path.to_str().unwrap().to_string()
+        };
+        TestPki {
+            cert_path: write("server.pem", &server.pem()),
+            key_path: write("server.key", &server_key.serialize_pem()),
+            ca_der: ca.der().clone(),
+            _dir: dir,
+        }
+    }
+
+    fn eap_handler(pki: &TestPki) -> EapAuthHandler {
+        // `build_server_config` uses `ServerConfig::builder()`, which needs a
+        // process-level default provider when several are compiled in.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut handler = EapAuthHandler::new(Arc::new(SimpleAuthHandler::new()));
+        handler
+            .configure_tls(
+                "",
+                TlsCertificateConfig::simple(pki.cert_path.clone(), pki.key_path.clone()),
+            )
+            .unwrap();
+        handler
+    }
+
+    /// Minimal in-memory EAP-TLS peer (RFC 5216 §2.1.1 flow, server-only
+    /// authentication).
+    struct Supplicant {
+        conn: ClientConnection,
+        reassembly: Vec<u8>,
+    }
+
+    impl Supplicant {
+        fn new(pki: &TestPki) -> Self {
+            let mut roots = RootCertStore::empty();
+            roots.add(pki.ca_der.clone()).unwrap();
+            // X25519 only: keeps the ClientHello within a single EAP-TLS
+            // fragment (no hybrid ML-KEM key share).
+            let provider = rustls::crypto::CryptoProvider {
+                kx_groups: vec![rustls::crypto::aws_lc_rs::kx_group::X25519],
+                ..rustls::crypto::aws_lc_rs::default_provider()
+            };
+            let config = ClientConfig::builder_with_provider(Arc::new(provider))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let conn =
+                ClientConnection::new(Arc::new(config), ServerName::try_from(SERVER_NAME).unwrap())
+                    .unwrap();
+            Supplicant {
+                conn,
+                reassembly: Vec::new(),
+            }
+        }
+
+        fn pending_tls(&mut self) -> Vec<u8> {
+            let mut out = Vec::new();
+            self.conn.write_tls(&mut out).unwrap();
+            out
+        }
+
+        /// Answer one EAP-Request/TLS with the peer's EAP-Response/TLS.
+        fn respond(&mut self, request: &EapPacket) -> EapPacket {
+            assert_eq!(request.code, EapCode::Request);
+            assert_eq!(request.eap_type, Some(EapType::Tls), "unexpected EAP type");
+            let pkt = EapTlsPacket::from_eap_data(&request.data).unwrap();
+
+            if pkt.flags.start() {
+                let client_hello = self.pending_tls();
+                assert!(!client_hello.is_empty());
+                return Self::tls_response(request.identifier, client_hello);
+            }
+
+            self.reassembly.extend_from_slice(&pkt.tls_data);
+            if pkt.flags.more_fragments() {
+                return Self::ack(request.identifier);
+            }
+            let data = std::mem::take(&mut self.reassembly);
+            self.conn.read_tls(&mut &data[..]).unwrap();
+            self.conn.process_new_packets().unwrap();
+            let out = self.pending_tls();
+            if out.is_empty() {
+                Self::ack(request.identifier)
+            } else {
+                Self::tls_response(request.identifier, out)
+            }
+        }
+
+        fn tls_response(identifier: u8, data: Vec<u8>) -> EapPacket {
+            let len = data.len() as u32;
+            EapTlsPacket::new(TlsFlags::new(true, false, false), Some(len), data)
+                .to_eap_response(identifier)
+        }
+
+        fn ack(identifier: u8) -> EapPacket {
+            EapTlsPacket::new(TlsFlags::new(false, false, false), None, Vec::new())
+                .to_eap_response(identifier)
+        }
+
+        fn export(&self, label: &[u8], len: usize) -> Vec<u8> {
+            let mut out = vec![0u8; len];
+            self.conn
+                .export_keying_material(out.as_mut_slice(), label, Some(&[EAP_TLS_TYPE_CODE]))
+                .unwrap();
+            out
+        }
+
+        /// The peer's own MSK (RFC 9190 §2.3; the handshake is TLS 1.3).
+        fn msk(&self) -> Vec<u8> {
+            assert_eq!(
+                self.conn.protocol_version(),
+                Some(rustls::ProtocolVersion::TLSv1_3)
+            );
+            self.export(b"EXPORTER_EAP_TLS_Key_Material", 128)[..64].to_vec()
+        }
+
+        /// The peer's own EAP Session-Id (RFC 9190 §2.5).
+        fn session_id(&self) -> Vec<u8> {
+            let mut id = vec![EAP_TLS_TYPE_CODE];
+            id.extend(self.export(b"EXPORTER_EAP_TLS_Method-Id", 64));
+            id
+        }
+    }
+
+    /// An Access-Request carrying `eap`, the optional State, and a valid
+    /// Message-Authenticator (RFC 3579 §3.2).
+    fn access_request(identifier: u8, eap: &EapPacket, state: Option<&[u8]>) -> Packet {
+        let mut p = Packet::new(
+            Code::AccessRequest,
+            identifier,
+            generate_request_authenticator(),
+        );
+        p.add_attribute(Attribute::string(AttributeType::UserName as u8, "alice").unwrap());
+        p.add_attribute(Attribute::string(AttributeType::NasIdentifier as u8, "test-nas").unwrap());
+        if let Some(s) = state {
+            p.add_attribute(Attribute::new(AttributeType::State as u8, s.to_vec()).unwrap());
+        }
+        radius_proto::eap::add_eap_to_radius_packet(&mut p, eap).unwrap();
+        // Zeroed placeholder last, so the encoded bytes are exactly the HMAC input.
+        p.add_attribute(
+            Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]).unwrap(),
+        );
+        let mac = calculate_message_authenticator(&p.encode().unwrap(), SECRET);
+        p.attributes.last_mut().unwrap().value = mac.to_vec();
+        p
+    }
+
+    fn identity_request() -> Packet {
+        access_request(1, &EapPacket::identity_response(1, "alice"), None)
+    }
+
+    /// Given the server's Access-Challenge, build the peer's next Access-Request.
+    fn answer_challenge(peer: &mut Supplicant, challenge: &Packet) -> Packet {
+        assert_eq!(challenge.code, Code::AccessChallenge);
+        let state = challenge
+            .find_attribute(AttributeType::State as u8)
+            .expect("Access-Challenge must carry State")
+            .value
+            .clone();
+        let eap_request = eap_from_radius_packet(challenge)
+            .unwrap()
+            .expect("Access-Challenge must carry EAP-Message");
+        let eap_response = peer.respond(&eap_request);
+        access_request(
+            challenge.identifier.wrapping_add(1),
+            &eap_response,
+            Some(&state),
+        )
+    }
+
+    fn packet_with(code: Code, identifier: u8, attributes: Vec<Attribute>) -> Packet {
+        let mut p = Packet::new(code, identifier, [0u8; 16]);
+        for a in attributes {
+            p.add_attribute(a);
+        }
+        p
+    }
+
+    #[test]
+    fn eap_tls_accept_carries_msk_and_eap_key_name() {
+        let pki = gen_pki();
+        let handler = eap_handler(&pki);
+        let mut peer = Supplicant::new(&pki);
+
+        let mut request = identity_request();
+        let (attributes, msk) = loop {
+            assert!(
+                request.identifier < 64,
+                "EAP-TLS conversation did not converge"
+            );
+            match handler.authenticate_request(&request, SECRET) {
+                AuthResult::Challenge {
+                    state, attributes, ..
+                } => {
+                    let mut challenge =
+                        packet_with(Code::AccessChallenge, request.identifier, attributes);
+                    challenge
+                        .add_attribute(Attribute::new(AttributeType::State as u8, state).unwrap());
+                    request = answer_challenge(&mut peer, &challenge);
+                }
+                AuthResult::Accept { attributes, msk } => break (attributes, msk),
+                AuthResult::Reject => panic!("EAP-TLS rejected at id {}", request.identifier),
+            }
+        };
+
+        let msk = msk.expect("EAP-TLS Accept must carry the MSK");
+        assert_eq!(msk.len(), 64);
+        assert_eq!(
+            msk,
+            peer.msk(),
+            "server MSK must match the peer's exporter output"
+        );
+
+        let accept = packet_with(Code::AccessAccept, 0, attributes);
+        let success = eap_from_radius_packet(&accept).unwrap().unwrap();
+        assert_eq!(success.code, EapCode::Success);
+
+        let key_name = accept
+            .find_attribute(AttributeType::EapKeyName as u8)
+            .expect("EAP-Key-Name on a TLS 1.3 Access-Accept");
+        assert_eq!(key_name.value, peer.session_id());
+
+        // The handler never emits MPPE attributes itself: they need the
+        // request authenticator and transport secret, which server.rs owns.
+        assert!(
+            accept
+                .find_vendor_attributes(MICROSOFT_VENDOR_ID, MS_MPPE_SEND_KEY)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn access_accept_carries_encrypted_ms_mppe_keys() {
+        let pki = gen_pki();
+        let handler = eap_handler(&pki);
+        let mut peer = Supplicant::new(&pki);
+        let config = Config {
+            strict_rfc_compliance: false,
+            ..Config::default()
+        };
+        let cfg = Arc::new(ServerConfig::from_config(config, Arc::new(handler)).unwrap());
+        let nas_ip = "10.0.0.1".parse().unwrap();
+
+        let mut request = identity_request();
+        let accept = loop {
+            assert!(
+                request.identifier < 64,
+                "EAP-TLS conversation did not converge"
+            );
+            let bytes =
+                RadiusServer::process_request(&request.encode().unwrap(), nas_ip, SECRET, &cfg)
+                    .await
+                    .unwrap()
+                    .expect("Access-Request warrants a reply");
+            let response = Packet::decode(&bytes).unwrap();
+            // No reply before the Accept may leak key material.
+            assert!(
+                response
+                    .find_vendor_attributes(MICROSOFT_VENDOR_ID, MS_MPPE_RECV_KEY)
+                    .is_empty()
+                    || response.code == Code::AccessAccept
+            );
+            match response.code {
+                Code::AccessChallenge => request = answer_challenge(&mut peer, &response),
+                Code::AccessAccept => break response,
+                other => panic!("unexpected {other:?} at id {}", request.identifier),
+            }
+        };
+
+        assert!(verify_response_authenticator(
+            &accept,
+            &request.authenticator,
+            SECRET
+        ));
+        assert!(
+            accept
+                .find_attribute(AttributeType::MessageAuthenticator as u8)
+                .is_some()
+        );
+
+        // One Send-Key and one Recv-Key, encrypted with the client secret and
+        // the authenticator of the request this Accept answers.
+        assert_eq!(
+            accept
+                .find_vendor_attributes(MICROSOFT_VENDOR_ID, MS_MPPE_SEND_KEY)
+                .len(),
+            1
+        );
+        assert_eq!(
+            accept
+                .find_vendor_attributes(MICROSOFT_VENDOR_ID, MS_MPPE_RECV_KEY)
+                .len(),
+            1
+        );
+        let keys = MppeKeys::from_packet(&accept, SECRET, &request.authenticator)
+            .unwrap()
+            .expect("Access-Accept must carry MS-MPPE keys");
+        let msk = peer.msk();
+        assert_eq!(keys.recv_key, msk[..32], "Recv-Key = MSK[0..32]");
+        assert_eq!(keys.send_key, msk[32..64], "Send-Key = MSK[32..64]");
+
+        // Wrong secret must not recover the keys.
+        if let Ok(Some(bogus)) = MppeKeys::from_packet(&accept, b"wrong", &request.authenticator) {
+            assert_ne!(bogus, keys);
+        }
     }
 }
