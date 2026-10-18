@@ -2478,7 +2478,7 @@ mod tests {
             - 100;
 
         let age = session.age();
-        assert!(age >= 100 && age <= 102); // Allow small timing variations
+        assert!((100..=102).contains(&age)); // Allow small timing variations
     }
 
     #[test]
@@ -2873,7 +2873,7 @@ mod tests {
         add_eap_to_radius_packet(&mut radius, &eap).unwrap();
 
         // Should have EAP-Message attribute(s)
-        assert!(radius.attributes.len() > 0);
+        assert!(!radius.attributes.is_empty());
 
         // All added attributes should be EAP-Message
         for attr in &radius.attributes {
@@ -3215,10 +3215,10 @@ mod tests {
             assert_eq!(fragments[0].tls_message_length, Some(2000));
 
             // Middle fragments should have M flag
-            for i in 1..fragments.len() - 1 {
-                assert!(!fragments[i].flags.length_included());
-                assert!(fragments[i].flags.more_fragments());
-                assert!(fragments[i].tls_message_length.is_none());
+            for fragment in &fragments[1..fragments.len() - 1] {
+                assert!(!fragment.flags.length_included());
+                assert!(fragment.flags.more_fragments());
+                assert!(fragment.tls_message_length.is_none());
             }
 
             // Last fragment should have no M flag
@@ -3567,7 +3567,7 @@ mod tests {
             assert_eq!(config.server_cert_path, "test_certs/server.pem");
             assert_eq!(config.server_key_path, "test_certs/server-key.pem");
             assert_eq!(config.ca_cert_path, None);
-            assert_eq!(config.require_client_cert, false);
+            assert!(!config.require_client_cert);
         }
 
         #[test]
@@ -3582,7 +3582,7 @@ mod tests {
             assert_eq!(config.server_cert_path, "test_certs/server.pem");
             assert_eq!(config.server_key_path, "test_certs/server-key.pem");
             assert_eq!(config.ca_cert_path, Some("test_certs/ca.pem".to_string()));
-            assert_eq!(config.require_client_cert, true);
+            assert!(config.require_client_cert);
         }
 
         #[test]
@@ -3597,7 +3597,7 @@ mod tests {
 
             // build_server_config should fail with this configuration
             // (can't test actual call without cert files, but structure is validated)
-            assert_eq!(config.require_client_cert, true);
+            assert!(config.require_client_cert);
             assert_eq!(config.ca_cert_path, None);
         }
 
@@ -3630,7 +3630,7 @@ mod tests {
             // Should return Ok(false) when no peer certificate
             let result = server.verify_peer_identity("test@example.com");
             assert!(result.is_ok());
-            assert_eq!(result.unwrap(), false);
+            assert!(!result.unwrap());
         }
     }
 }

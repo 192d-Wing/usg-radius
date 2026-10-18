@@ -306,6 +306,21 @@ pub use verifier::RevocationCheckingVerifier;
 /// Module version for tracking implementation progress
 pub const VERSION: &str = "0.6.0 (Phase 1: CRL Support Complete)";
 
+/// Ensure a process-level rustls [`CryptoProvider`](rustls::crypto::CryptoProvider)
+/// is installed before `reqwest` builds a TLS client.
+///
+/// `reqwest` is built with `rustls-tls-webpki-roots-no-provider`, so it uses
+/// whatever default provider the process has and panics if there is none. The
+/// EAP-TLS code installs `aws-lc-rs` implicitly through `ServerConfig::builder()`,
+/// but the revocation fetchers may run before any TLS server config is built,
+/// so install the same provider explicitly here. A concurrent install by another
+/// thread is not an error.
+pub(crate) fn ensure_default_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

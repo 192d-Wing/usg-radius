@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn test_health_check_config_defaults() {
         let config = HealthCheckConfig::default();
-        assert_eq!(config.enabled, true);
+        assert!(config.enabled);
         assert_eq!(config.interval, 30);
         assert_eq!(config.timeout, 10);
         assert_eq!(config.failures_before_down, 3);

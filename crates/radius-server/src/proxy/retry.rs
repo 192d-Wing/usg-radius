@@ -288,7 +288,7 @@ mod tests {
         let config = RetryConfig::default();
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.retry_interval, 5);
-        assert_eq!(config.failover_on_timeout, true);
+        assert!(config.failover_on_timeout);
     }
 
     #[test]

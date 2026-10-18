@@ -563,21 +563,8 @@ impl ClientCertVerifier for RevocationCheckingVerifier {
 mod tests {
     use super::*;
 
-    // Helper to create a test verifier without WebPki validation
-    // (WebPki requires root certs which we don't have in unit tests)
-    fn create_test_verifier(config: RevocationConfig) -> RevocationCheckingVerifier {
-        // Create a mock verifier that just wraps an empty WebPki verifier
-        // For unit tests, we'll use with_webpki_verifier to avoid the root cert requirement
-        let mock_verifier = WebPkiClientVerifier::builder(Arc::new(rustls::RootCertStore::empty()))
-            .build()
-            .unwrap(); // This will fail but we catch it below
-
-        RevocationCheckingVerifier::with_webpki_verifier(config, mock_verifier).unwrap()
-    }
-
     #[test]
     fn test_verifier_creation_with_mock() {
-        let config = RevocationConfig::default();
         // Note: Using with_webpki_verifier for testing since new() requires roots
         let mock_verifier =
             WebPkiClientVerifier::builder(Arc::new(rustls::RootCertStore::empty())).build();
@@ -588,8 +575,10 @@ mod tests {
 
     #[test]
     fn test_verifier_disabled_mode() {
-        let mut config = RevocationConfig::default();
-        config.check_mode = RevocationCheckMode::Disabled;
+        let config = RevocationConfig {
+            check_mode: RevocationCheckMode::Disabled,
+            ..Default::default()
+        };
 
         // Create verifier with mock
         let mock_verifier =
@@ -611,8 +600,10 @@ mod tests {
 
     #[test]
     fn test_handle_error_fail_open() {
-        let mut config = RevocationConfig::default();
-        config.fallback_behavior = FallbackBehavior::FailOpen;
+        let config = RevocationConfig {
+            fallback_behavior: FallbackBehavior::FailOpen,
+            ..Default::default()
+        };
 
         // Test handle_error directly without needing a full verifier
         let mock_verifier =
@@ -630,8 +621,10 @@ mod tests {
 
     #[test]
     fn test_handle_error_fail_closed() {
-        let mut config = RevocationConfig::default();
-        config.fallback_behavior = FallbackBehavior::FailClosed;
+        let config = RevocationConfig {
+            fallback_behavior: FallbackBehavior::FailClosed,
+            ..Default::default()
+        };
 
         let mock_verifier =
             WebPkiClientVerifier::builder(Arc::new(rustls::RootCertStore::empty())).build();

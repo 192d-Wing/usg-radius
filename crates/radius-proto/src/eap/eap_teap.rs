@@ -1780,7 +1780,7 @@ mod tests {
     fn test_tlv_new() {
         let tlv = TeapTlv::new(TlvType::Result, true, vec![0x00, 0x01]);
         assert_eq!(tlv.tlv_type, 3);
-        assert_eq!(tlv.mandatory, true);
+        assert!(tlv.mandatory);
         assert_eq!(tlv.value, vec![0x00, 0x01]);
     }
 
@@ -1817,7 +1817,7 @@ mod tests {
         let (tlv, consumed) = TeapTlv::from_bytes(&data).unwrap();
         assert_eq!(consumed, 6);
         assert_eq!(tlv.tlv_type, 3);
-        assert_eq!(tlv.mandatory, true);
+        assert!(tlv.mandatory);
         assert_eq!(tlv.value, vec![0x00, 0x01]);
     }
 
@@ -1876,7 +1876,7 @@ mod tests {
         let tlv = result.to_result_tlv();
 
         assert_eq!(tlv.tlv_type, 3);
-        assert_eq!(tlv.mandatory, true);
+        assert!(tlv.mandatory);
         assert_eq!(tlv.value, vec![0x00, 0x01]);
 
         let parsed = TeapResult::from_result_tlv(&tlv).unwrap();
@@ -1900,7 +1900,7 @@ mod tests {
         let tlv = result.to_intermediate_result_tlv();
 
         assert_eq!(tlv.tlv_type, 10); // Intermediate-Result
-        assert_eq!(tlv.mandatory, true);
+        assert!(tlv.mandatory);
     }
 
     #[test]
@@ -1909,7 +1909,7 @@ mod tests {
         let tlv = identity.to_tlv();
 
         assert_eq!(tlv.tlv_type, 2); // Identity-Type
-        assert_eq!(tlv.mandatory, true);
+        assert!(tlv.mandatory);
         assert_eq!(tlv.value, vec![0x00, 0x01]);
 
         let parsed = IdentityType::from_tlv(&tlv).unwrap();
@@ -2501,7 +2501,7 @@ mod tests {
         // Note: Can't test actual encryption without completing handshake
         // This test now validates that the function signature is correct
         // Full encryption testing requires integration test with real TLS handshake
-        let result = server.encrypt_and_send_tlvs(&[tlv.clone()]);
+        let result = server.encrypt_and_send_tlvs(std::slice::from_ref(&tlv));
 
         // Should succeed (will encrypt once handshake is complete in real usage)
         assert!(result.is_ok());

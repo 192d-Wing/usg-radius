@@ -55,9 +55,14 @@ regex = "1.12"
 chrono = "0.4"
 
 # HTTP client (for CRL/OCSP fetching)
+# `rustls-tls` would enable rustls's `ring` provider alongside the `aws-lc-rs`
+# provider the workspace already uses, and rustls refuses to auto-select when
+# both are compiled in. The `-no-provider` variant keeps webpki roots but relies
+# on the process-level default provider, which `radius_proto::revocation`
+# installs (aws-lc-rs) before building a client.
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
-    "rustls-tls",
+    "rustls-tls-webpki-roots-no-provider",
 ] }
 url = "2.5"
 

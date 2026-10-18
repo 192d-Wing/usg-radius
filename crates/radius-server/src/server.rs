@@ -1837,14 +1837,12 @@ mod tests {
             Attribute::new(AttributeType::UserPassword as u8, vec![0u8; 16]).unwrap(),
         ]);
         // Unknown user → AuthFailed, but never the EAP/Message-Authenticator error.
-        match process(&data).await {
-            Err(ServerError::Validation(m)) => {
-                assert!(
-                    !m.contains("Message-Authenticator"),
-                    "non-EAP request wrongly rejected for Message-Authenticator: {m}"
-                );
-            }
-            _ => {} // any non-Validation outcome is fine for this scoping check
+        // Any non-Validation outcome is fine for this scoping check.
+        if let Err(ServerError::Validation(m)) = process(&data).await {
+            assert!(
+                !m.contains("Message-Authenticator"),
+                "non-EAP request wrongly rejected for Message-Authenticator: {m}"
+            );
         }
     }
 }

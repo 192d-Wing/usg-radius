@@ -680,23 +680,25 @@ mod tests {
 
     #[test]
     fn test_config_find_client() {
-        let mut config = Config::default();
-        config.clients = vec![
-            Client {
-                address: "192.168.1.0/24".to_string(),
-                secret: "secret1".to_string(),
-                name: Some("Network 1".to_string()),
-                enabled: true,
-                nas_identifier: None,
-            },
-            Client {
-                address: "10.0.0.1".to_string(),
-                secret: "secret2".to_string(),
-                name: Some("Single IP".to_string()),
-                enabled: true,
-                nas_identifier: None,
-            },
-        ];
+        let config = Config {
+            clients: vec![
+                Client {
+                    address: "192.168.1.0/24".to_string(),
+                    secret: "secret1".to_string(),
+                    name: Some("Network 1".to_string()),
+                    enabled: true,
+                    nas_identifier: None,
+                },
+                Client {
+                    address: "10.0.0.1".to_string(),
+                    secret: "secret2".to_string(),
+                    name: Some("Single IP".to_string()),
+                    enabled: true,
+                    nas_identifier: None,
+                },
+            ],
+            ..Default::default()
+        };
 
         // Should find matching client
         let client = config.find_client("192.168.1.50".parse().unwrap());
@@ -718,14 +720,16 @@ mod tests {
         // Regression: when the server binds dual-stack `[::]`, IPv4 datagrams arrive
         // with a v4-mapped source (`::ffff:a.b.c.d`). It must still match a v4 client
         // CIDR — otherwise every IPv4 NAS is rejected as unauthorized.
-        let mut config = Config::default();
-        config.clients = vec![Client {
-            address: "10.0.0.0/8".to_string(),
-            secret: "secret".to_string(),
-            name: Some("v4 net".to_string()),
-            enabled: true,
-            nas_identifier: None,
-        }];
+        let config = Config {
+            clients: vec![Client {
+                address: "10.0.0.0/8".to_string(),
+                secret: "secret".to_string(),
+                name: Some("v4 net".to_string()),
+                enabled: true,
+                nas_identifier: None,
+            }],
+            ..Default::default()
+        };
 
         let mapped: IpAddr = "::ffff:10.0.100.34".parse().unwrap();
         assert!(mapped.is_ipv6(), "test input must be the v4-mapped form");
@@ -739,14 +743,16 @@ mod tests {
 
     #[test]
     fn test_config_find_client_disabled() {
-        let mut config = Config::default();
-        config.clients = vec![Client {
-            address: "192.168.1.0/24".to_string(),
-            secret: "secret1".to_string(),
-            name: Some("Network 1".to_string()),
-            enabled: false, // Disabled
-            nas_identifier: None,
-        }];
+        let config = Config {
+            clients: vec![Client {
+                address: "192.168.1.0/24".to_string(),
+                secret: "secret1".to_string(),
+                name: Some("Network 1".to_string()),
+                enabled: false, // Disabled
+                nas_identifier: None,
+            }],
+            ..Default::default()
+        };
 
         // Should not find disabled client
         let client = config.find_client("192.168.1.50".parse().unwrap());
@@ -755,15 +761,17 @@ mod tests {
 
     #[test]
     fn test_config_get_secret_for_client() {
-        let mut config = Config::default();
-        config.secret = "default_secret".to_string();
-        config.clients = vec![Client {
-            address: "192.168.1.0/24".to_string(),
-            secret: "client_secret".to_string(),
-            name: Some("Network 1".to_string()),
-            enabled: true,
-            nas_identifier: None,
-        }];
+        let config = Config {
+            secret: "default_secret".to_string(),
+            clients: vec![Client {
+                address: "192.168.1.0/24".to_string(),
+                secret: "client_secret".to_string(),
+                name: Some("Network 1".to_string()),
+                enabled: true,
+                nas_identifier: None,
+            }],
+            ..Default::default()
+        };
 
         // Should return client-specific secret
         let secret = config.get_secret_for_client("192.168.1.50".parse().unwrap());
@@ -776,14 +784,16 @@ mod tests {
 
     #[test]
     fn test_config_validation_with_invalid_client_address() {
-        let mut config = Config::default();
-        config.clients = vec![Client {
-            address: "invalid_ip".to_string(),
-            secret: "secret".to_string(),
-            name: Some("Test".to_string()),
-            enabled: true,
-            nas_identifier: None,
-        }];
+        let config = Config {
+            clients: vec![Client {
+                address: "invalid_ip".to_string(),
+                secret: "secret".to_string(),
+                name: Some("Test".to_string()),
+                enabled: true,
+                nas_identifier: None,
+            }],
+            ..Default::default()
+        };
 
         // Should fail validation due to invalid address
         assert!(config.validate().is_err());
@@ -837,23 +847,25 @@ mod tests {
 
     #[test]
     fn test_config_find_client_ipv6() {
-        let mut config = Config::default();
-        config.clients = vec![
-            Client {
-                address: "2001:db8::/32".to_string(),
-                secret: "secret1".to_string(),
-                name: Some("IPv6 Network".to_string()),
-                enabled: true,
-                nas_identifier: None,
-            },
-            Client {
-                address: "::1".to_string(),
-                secret: "secret2".to_string(),
-                name: Some("IPv6 Localhost".to_string()),
-                enabled: true,
-                nas_identifier: None,
-            },
-        ];
+        let config = Config {
+            clients: vec![
+                Client {
+                    address: "2001:db8::/32".to_string(),
+                    secret: "secret1".to_string(),
+                    name: Some("IPv6 Network".to_string()),
+                    enabled: true,
+                    nas_identifier: None,
+                },
+                Client {
+                    address: "::1".to_string(),
+                    secret: "secret2".to_string(),
+                    name: Some("IPv6 Localhost".to_string()),
+                    enabled: true,
+                    nas_identifier: None,
+                },
+            ],
+            ..Default::default()
+        };
 
         // Should find matching IPv6 client
         let client = config.find_client("2001:db8::50".parse().unwrap());
@@ -872,9 +884,11 @@ mod tests {
 
     #[test]
     fn test_config_socket_addr_ipv6() {
-        let mut config = Config::default();
-        config.listen_address = "::1".to_string();
-        config.listen_port = 1812;
+        let config = Config {
+            listen_address: "::1".to_string(),
+            listen_port: 1812,
+            ..Default::default()
+        };
 
         let addr = config.socket_addr().unwrap();
         assert_eq!(addr.port(), 1812);

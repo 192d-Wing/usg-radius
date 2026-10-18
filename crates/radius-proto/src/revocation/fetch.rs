@@ -98,6 +98,7 @@ impl CrlFetcher {
     /// * `Ok(CrlFetcher)` - Successfully created fetcher
     /// * `Err(RevocationError)` - Failed to create HTTP client
     pub fn with_max_size(timeout_secs: u64, max_size: usize) -> Result<Self, RevocationError> {
+        super::ensure_default_crypto_provider();
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .build()
