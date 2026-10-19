@@ -43,12 +43,14 @@ jobs:
     name: FreeRADIUS + eapol_test
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    env:
-      # Outside the checkout so nothing here lands in a build context.
-      CACHE_DIR: ${{ runner.temp }}/interop-cache
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # Outside the checkout so nothing here lands in a build context. (The
+      # runner context is not available in a job-level env, hence GITHUB_ENV.)
+      - name: Pick the cache directory
+        run: echo "CACHE_DIR=$RUNNER_TEMP/interop-cache" >> "$GITHUB_ENV"
 
       # docker-container driver: needed for the type=gha layer cache below, and
       # it is the builder both the bake step and run.sh's `compose build` use,
