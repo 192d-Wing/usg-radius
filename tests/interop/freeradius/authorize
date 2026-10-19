@@ -1,0 +1,6 @@
+# mods-config/files/authorize for the interop home server.
+# The PAP user proves the request leg: the proxy must have re-encrypted
+# User-Password from the NAS secret to proxy-freeradius-secret-2, or this
+# comparison fails and FreeRADIUS sends Access-Reject.
+papuser@freeradius.test    Cleartext-Password := "pap-password-123"
+    Reply-Message = "PAP via usg-radius proxy OK"

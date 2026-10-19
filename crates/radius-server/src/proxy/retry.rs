@@ -155,7 +155,7 @@ impl RetryManager {
     /// Handle a timed-out request
     async fn handle_timeout(
         cache: &Arc<ProxyCache>,
-        _handler: &Arc<ProxyHandler>,
+        handler: &Arc<ProxyHandler>,
         socket: &Arc<UdpSocket>,
         config: &RetryConfig,
         mut entry: ProxyCacheEntry,
@@ -170,8 +170,8 @@ impl RetryManager {
                 "Max retries exceeded, sending Access-Reject"
             );
 
-            // Send Access-Reject to NAS
-            Self::send_reject(socket, &entry).await?;
+            // Send Access-Reject to NAS, from the socket it sent to.
+            Self::send_reject(&handler.nas_socket(), &entry).await?;
 
             // Remove from cache
             cache.remove(&entry.proxy_state);

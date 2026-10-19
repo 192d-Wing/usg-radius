@@ -1,0 +1,72 @@
+# Interop test: usg-radius proxy and EAP-TLS home server against FreeRADIUS and
+# eapol_test. Run it with tests/interop/run.sh (which generates the test PKI,
+# builds, runs the checks in the `nas` container and tears down).
+#
+#   nas (eapol_test, radclient) 10.77.0.40
+#     --[nas-proxy-secret-1]-->   usg-proxy 10.77.0.20
+#                                   --[proxy-freeradius-secret-2]--> freeradius 10.77.0.10
+#     --[nas-usghome-secret-3]--> usg-home  10.77.0.30   (EAP-TLS, no proxy)
+#
+# Fixed addresses: the servers' client lists and the proxy's home-server entry
+# are plain IPs, which keeps the configs free of DNS and of compose internals.
+name: usg-radius-interop
+
+networks:
+  radius:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.77.0.0/24
+
+services:
+  freeradius:
+    build: ./freeradius
+    image: usg-radius-interop/freeradius
+    networks:
+      radius:
+        ipv4_address: 10.77.0.10
+    volumes:
+      - ./freeradius/clients.conf:/etc/freeradius/3.0/clients.conf:ro
+      - ./freeradius/eap:/etc/freeradius/3.0/mods-available/eap:ro
+      - ./freeradius/authorize:/etc/freeradius/3.0/mods-config/files/authorize:ro
+      - ./certs:/etc/freeradius/interop-certs:ro
+
+  usg-proxy:
+    build:
+      context: ../..
+      dockerfile: tests/interop/usg-radius/Dockerfile
+    image: usg-radius-interop/usg-radius
+    command: ["/etc/radius/proxy.json"]
+    networks:
+      radius:
+        ipv4_address: 10.77.0.20
+    volumes:
+      - ./usg-radius/proxy.json:/etc/radius/proxy.json:ro
+    depends_on:
+      - freeradius
+
+  usg-home:
+    image: usg-radius-interop/usg-radius
+    command: ["/etc/radius/home.json"]
+    networks:
+      radius:
+        ipv4_address: 10.77.0.30
+    volumes:
+      - ./usg-radius/home.json:/etc/radius/home.json:ro
+      - ./certs:/certs:ro
+    depends_on:
+      - usg-proxy
+
+  nas:
+    build: ./eapol_test
+    image: usg-radius-interop/eapol_test
+    networks:
+      radius:
+        ipv4_address: 10.77.0.40
+    volumes:
+      - ./certs:/certs:ro
+    profiles: ["test"]
+    depends_on:
+      - freeradius
+      - usg-proxy
+      - usg-home

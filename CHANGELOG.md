@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   EAP-TLS Access-Accepts.
 - **EAP-TEAP MSK derivation** (RFC 7170 §5.4) from S-IMCK, gated on a verified
   Crypto-Binding response.
+- **Reproducible interop test** (`tests/interop/`, `tests/interop/run.sh`)
+  exercising usg-radius in proxy mode and as an EAP-TLS home server against
+  FreeRADIUS 3.2 and eapol_test (wpa_supplicant 2.11), with a different shared
+  secret on each hop. It proves EAP-TLS over TLS 1.3 and PAP through the proxy,
+  the MS-MPPE key re-encryption on both legs, and usg-radius's own MS-MPPE /
+  RFC 9190 exporter output, all against independent implementations. Documented
+  in `docs/docs/development/INTEROP_TESTING.md`.
 
 ### Security
 
@@ -88,6 +95,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Type-Code context; using `"client EAP encryption"` produced an MSK no
   RFC 9190 supplicant shares. Derivation is now selected by the negotiated
   TLS version.
+- **EAP-TLS over TLS 1.3 sent EAP-Success without the RFC 9190 §2.5 commitment
+  message, so OpenSSL-based peers derived no key.** After the TLS handshake the
+  server jumped straight to EAP-Success, skipping the protected success
+  indication (a TLS application-data record of one `0x00` octet the peer
+  acknowledges). wpa_supplicant's TLS 1.3 EAP-TLS peer installs no MSK without
+  it: direct EAP-TLS to usg-radius failed with an MS-MPPE / Session-Id mismatch
+  even though the handshake succeeded (the unit tests missed it by driving
+  rustls against a rustls peer). The server now sends the commitment as its own
+  EAP-Request and sends EAP-Success — whose Identifier now echoes the peer's
+  last EAP-Response per RFC 3748 §4.2 — only once the peer acknowledges it.
+  TLS 1.2 EAP-TLS, which has no commitment message, is unchanged.
+- **Proxied responses and timeout rejects were sent from the proxy's upstream
+  socket, not the port the NAS sent to.** The proxy reads home-server replies on
+  a dedicated socket (ephemeral port) and relayed them to the NAS from that
+  socket; a NAS whose RADIUS socket is `connect()`ed to the proxy (eapol_test,
+  wpa_supplicant and most embedded NASes) drops datagrams from any other source
+  port, so every proxied authentication appeared to time out. Replies and
+  `RetryManager` rejects now go out through the server's listening socket.
 - An EAP-TEAP conversation that reached `Complete` without a verified
   Crypto-Binding is now rejected instead of accepted.
 

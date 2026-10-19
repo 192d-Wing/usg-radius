@@ -99,3 +99,8 @@ Home = "index.md"
 "Examples" = [
     { "Basic Authentication" = "examples/basic-auth.md" },
 ]
+
+[[project.nav]]
+"Development" = [
+    { "Interoperability Testing" = "development/INTEROP_TESTING.md" },
+]
