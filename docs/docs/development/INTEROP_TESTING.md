@@ -48,6 +48,36 @@ FreeRADIUS configuration (`freeradius/`), the two usg-radius configurations
 supplicant configs (`eapol_test/`), and `eapol_test/run-tests.sh`, which runs
 inside the `nas` container and holds every assertion.
 
+## In CI
+
+The GitHub Actions workflow `.github/workflows/interop.yml` (job **Interop /
+FreeRADIUS + eapol_test**) runs `tests/interop/run.sh` on `ubuntu-latest`:
+
+- on every pull request that touches `crates/**`, `tests/interop/**`,
+  `Cargo.toml`, `Cargo.lock`, any `Dockerfile` or the workflow itself;
+- nightly at 05:23 UTC on the default branch;
+- on demand from the Actions tab (`workflow_dispatch`).
+
+The job fails when any assertion fails (`run.sh` exits non-zero as soon as one
+check does). On failure it uploads an `interop-logs` artifact holding
+`run.log` (the full `run.sh` output: the PASS/FAIL line per assertion, the
+eapol_test and radclient summaries and the per-check log tails) and the
+complete `freeradius.log`, `usg-proxy.log` and `usg-home.log`.
+
+The three harness images build from public Debian and `rust:*-slim-bookworm`
+images, not from the Iron Bank base the shipping `Dockerfile` uses, so the job
+needs no registry login and has no public-image fallback: Dependabot and fork
+pull requests run the same build as everything else.
+
+Two caches keep the runtime reasonable. The cargo registry and target dir
+inside the usg-radius image build are BuildKit cache mounts, saved across runs
+with `actions/cache` (keyed on `Cargo.lock`, so dependencies compile once per
+lockfile change) and copied into the builder by `buildkit-cache-dance`; the
+image layers (apt installs, the wpa_supplicant build, the FreeRADIUS package)
+are cached through buildx's `type=gha` backend. The workflow exports
+`CARGO_BUILD_JOBS=4` for the 4-vCPU runner; `compose.yaml` passes it to the
+image build (default 2).
+
 ## What is checked
 
 Sixteen assertions across four scenarios. All pass on the current tree (run
