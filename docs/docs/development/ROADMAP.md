@@ -2,7 +2,7 @@
 
 This document outlines the development roadmap for the USG RADIUS project, organized by release milestones.
 
-## Current Status: v0.11.0 (MS-MPPE keys + WPA-Enterprise through the proxy)
+## Current Status: v0.11.1 (MS-MPPE keys + WPA-Enterprise through the proxy)
 
 **Release Date**: October 2026
 **Status**: ✅ Complete - Production-ready with RadSec (RFC 6614) as the default transport, server-originated CoA/Disconnect (RFC 5176), RFC 2548 MS-MPPE key delivery on EAP Access-Accepts, a proxy that re-keys both legs, management API mTLS + ABAC, and Kubernetes-only deployment
@@ -1386,7 +1386,8 @@ We welcome community contributions! Priority areas:
 | v0.8.0 | Q2 2026 | RadSec (shipped as part of v0.10.0) | ✅ Done (DTLS, cert rotation deferred) |
 | v0.9.0 | Q2 2026 | Kubernetes-only deployment, mgmt API auth; CoA shipped in v0.10.0 | ✅ Done (UDP CoA deferred) |
 | v0.10.x | Q2 2026 | RadSec + CoA/Disconnect | ✅ Done |
-| v0.11.0 | Q4 2026 | MS-MPPE keys, RFC 9190 TLS 1.3 keying, proxy re-keying | ✅ Done (current) |
+| v0.11.0 | Q4 2026 | MS-MPPE keys, RFC 9190 TLS 1.3 keying, proxy re-keying | ✅ Done |
+| v0.11.1 | Q4 2026 | Patch: ships the v0.11.0 binaries the release workflow failed to attach; draft-then-publish release workflow | ✅ Done (current) |
 | v1.0.0 | 2027 | Production Release | 10 |
 
 **Remaining Estimated Development Time**: ~10 weeks for v1.0.0 hardening, plus the deferred RadSec/CoA follow-ups above

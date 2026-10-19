@@ -4,7 +4,7 @@ This document identifies gaps between the current USG RADIUS implementation and 
 
 ## Summary
 
-**Overall Status**: Production-ready for modern enterprise authentication with EAP-TLS over RadSec, server-originated CoA/Disconnect, comprehensive rate limiting, accounting, and security features. Reflects the code at **v0.11.0**.
+**Overall Status**: Production-ready for modern enterprise authentication with EAP-TLS over RadSec, server-originated CoA/Disconnect, comprehensive rate limiting, accounting, and security features. Reflects the code at **v0.11.1** (v0.11.0 plus the release-workflow fix).
 
 **Implemented**: Core RADIUS authentication (RFC 2865, PAP + CHAP), Accounting (RFC 2866), Message-Authenticator (RFC 2869 / RFC 3579), EAP-TLS (RFC 5216 / RFC 9190), MS-MPPE key delivery (RFC 2548), RadSec (RFC 6614), CoA/Disconnect (RFC 5176), RADIUS proxy with secret re-keying on both legs, Rate Limiting, DoS Protection
 **Partial**: EAP-TEAP (RFC 7170) inner methods, Status-Server (RFC 5997) edge cases, certificate revocation (implemented in `radius-proto`, not integrated into the server)
