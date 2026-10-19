@@ -211,3 +211,51 @@ jobs:
             ${{ github.actor == 'dependabot[bot]' && 'IB_ALPINE=docker.io/library/alpine:3.22' || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  web-ui:
+    name: Web UI
+    runs-on: ubuntu-latest
+    # dorny/paths-filter lists a pull request's changed files through the API,
+    # which needs pull-requests: read on top of the workflow's contents: read.
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Nothing else in CI touches ui/web, so a lockfile that no longer
+      # installs (Dependabot #50) used to pass every check. Run the SPA
+      # install, type-check and build only when ui/web (or this workflow)
+      # changed; the job still appears, and passes, on every other run.
+      - name: Detect ui/web changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            web:
+              - 'ui/web/**'
+              - '.github/workflows/ci.yml'
+
+      - name: Set up Node.js
+        if: steps.changes.outputs.web == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/web/package-lock.json
+
+      - name: Install dependencies
+        if: steps.changes.outputs.web == 'true'
+        working-directory: ui/web
+        run: npm ci
+
+      - name: Type-check
+        if: steps.changes.outputs.web == 'true'
+        working-directory: ui/web
+        run: npx tsc --noEmit -p .
+
+      - name: Build
+        if: steps.changes.outputs.web == 'true'
+        working-directory: ui/web
+        run: npm run build
