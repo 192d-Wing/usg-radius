@@ -390,7 +390,7 @@ mod tests {
     }
 
     fn gen_chain() -> TestChain {
-        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
 
         let ca_key = KeyPair::generate().unwrap();
         let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
@@ -399,17 +399,18 @@ mod tests {
             .distinguished_name
             .push(DnType::CommonName, "USG Test NAS CA");
         let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::from_params(&ca_params, &ca_key);
 
         let server_key = KeyPair::generate().unwrap();
         let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        let server = server_params.signed_by(&server_key, &ca, &ca_key).unwrap();
+        let server = server_params.signed_by(&server_key, &issuer).unwrap();
 
         let client_key = KeyPair::generate().unwrap();
         let mut client_params = CertificateParams::new(vec!["nas-1.usg.test".to_string()]).unwrap();
         client_params
             .distinguished_name
             .push(DnType::CommonName, "switch-eth0");
-        let client = client_params.signed_by(&client_key, &ca, &ca_key).unwrap();
+        let client = client_params.signed_by(&client_key, &issuer).unwrap();
 
         TestChain {
             ca_pem: ca.pem(),

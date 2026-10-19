@@ -874,7 +874,7 @@ pub mod eap_tls {
     ///
     /// PRF(secret, label, seed) = P_SHA256(secret, label + seed)
     fn tls_prf_sha256(secret: &[u8], label: &[u8], seed: &[u8], output_len: usize) -> Vec<u8> {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         type HmacSha256 = Hmac<Sha256>;
 
         // Combine label and seed

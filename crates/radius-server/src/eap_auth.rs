@@ -967,7 +967,7 @@ mod eap_tls_mppe_tests {
     /// Throwaway CA + CA-signed server certificate, written to PEM files the
     /// way `configure_tls` expects them.
     fn gen_pki() -> TestPki {
-        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
 
         let ca_key = KeyPair::generate().unwrap();
         let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
@@ -976,11 +976,12 @@ mod eap_tls_mppe_tests {
             .distinguished_name
             .push(DnType::CommonName, "USG Test EAP CA");
         let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::from_params(&ca_params, &ca_key);
 
         let server_key = KeyPair::generate().unwrap();
         let server = CertificateParams::new(vec![SERVER_NAME.to_string()])
             .unwrap()
-            .signed_by(&server_key, &ca, &ca_key)
+            .signed_by(&server_key, &issuer)
             .unwrap();
 
         let dir = tempfile::tempdir().unwrap();

@@ -205,7 +205,7 @@ pub fn encrypt_key_attribute(
 /// 15-bit base, incremented per attribute (RFC 2548 §2.4.2 uniqueness rule;
 /// RFC 2868 §3.5 Tunnel-Password shares the same salt space).
 pub fn generate_salts(count: usize) -> Vec<[u8; 2]> {
-    use rand::Rng;
+    use rand::RngExt;
     let base: u16 = rand::rng().random::<u16>() & 0x7FFF;
     (0..count)
         .map(|i| (0x8000 | (base.wrapping_add(i as u16) & 0x7FFF)).to_be_bytes())

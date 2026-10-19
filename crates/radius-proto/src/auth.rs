@@ -1,5 +1,5 @@
 use crate::packet::Packet;
-use rand::Rng;
+use rand::RngExt;
 
 /// Generate a random Request Authenticator (16 bytes) per RFC 2865 Section 3
 pub fn generate_request_authenticator() -> [u8; 16] {
