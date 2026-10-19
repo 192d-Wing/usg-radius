@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **RustCrypto and rand majors.** `sha2` 0.10 → 0.11, `hmac` 0.12 → 0.13 and
+  `md-5` 0.10 → 0.11 (all on `digest` 0.11, so the HMAC-MD5
+  Message-Authenticator, the TLS 1.2 PRF used by EAP-TLS/TEAP key derivation
+  and the TEAP Compound-MAC keep a single digest generation), `rand` 0.9 → 0.10
+  (`Rng` → `RngExt` for `fill` / `random` / `random_range`; no change to which
+  generator is used) and the test-only `rcgen` 0.13 → 0.14 (`signed_by` takes
+  an `Issuer`). No wire-format or key-derivation change; the existing
+  known-answer tests cover every affected primitive. `pbkdf2`, `argon2` and
+  `sqlx` still carry the previous `digest` 0.10 generation internally.
+
 ## [0.11.1] - 2026-10-18
 
 Ships the v0.11.0 binaries that the release workflow failed to attach: the

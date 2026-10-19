@@ -13,7 +13,7 @@
 //! - Request Authenticator (for requests) or calculated Response Authenticator (for responses)
 //! - Message-Authenticator field set to all zeros during calculation
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use md5_digest::Md5;
 
 type HmacMd5 = Hmac<Md5>;

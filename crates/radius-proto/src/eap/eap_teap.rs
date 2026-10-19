@@ -40,7 +40,7 @@ use super::eap_tls::{EapTlsPacket, EapTlsServer};
 use std::sync::Arc;
 
 // Cryptographic imports for Crypto-Binding
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 /// TEAP TLV Type (RFC 7170 Section 4.2)
@@ -722,7 +722,7 @@ impl CryptoBinding {
 
     /// Generate random nonce
     pub fn generate_nonce() -> [u8; 32] {
-        use rand::Rng;
+        use rand::RngExt;
         let mut nonce = [0u8; 32];
         rand::rng().fill(&mut nonce);
         nonce
@@ -1677,7 +1677,7 @@ impl EapPayloadHandler {
 
     /// Create EAP-MD5 Challenge request
     fn create_md5_challenge_request(&mut self) -> TeapTlv {
-        use rand::Rng;
+        use rand::RngExt;
 
         let identifier = self.next_identifier();
 
