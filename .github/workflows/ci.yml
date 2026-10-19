@@ -185,7 +185,16 @@ jobs:
       # Authenticate to Iron Bank so the Dockerfile's `FROM registry1.dso.mil/...`
       # base image can be pulled. REPO1 is the robot CLI secret (password),
       # REPO1_USER is the robot username.
+      #
+      # Workflow runs triggered by Dependabot get no repository/organization
+      # Actions secrets (only the read-only GITHUB_TOKEN), so the login step
+      # fails with "Username and password required" on every Dependabot PR.
+      # Skip the login there and build on the public Alpine image of the same
+      # release instead, so the Rust build inside Docker (musl, pinned
+      # toolchain) is still exercised for dependency bumps. Pushes and
+      # human-authored PRs keep building on the Iron Bank base.
       - name: Log in to Iron Bank (registry1.dso.mil)
+        if: github.actor != 'dependabot[bot]'
         uses: docker/login-action@v3
         with:
           registry: registry1.dso.mil
@@ -198,5 +207,7 @@ jobs:
           context: .
           push: false
           tags: usg-radius-server:test
+          build-args: |
+            ${{ github.actor == 'dependabot[bot]' && 'IB_ALPINE=docker.io/library/alpine:3.22' || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
