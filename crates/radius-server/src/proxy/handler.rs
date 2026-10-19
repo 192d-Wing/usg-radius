@@ -25,6 +25,13 @@ pub struct ProxyHandler {
     cache: Arc<ProxyCache>,
     /// UDP socket for communicating with home servers
     socket: Arc<UdpSocket>,
+    /// Socket the NAS talked to (the server's listening socket). Relayed
+    /// responses and timeout rejects go out through it, so they come from the
+    /// address and port the NAS sent its request to; a NAS whose RADIUS socket
+    /// is `connect()`ed to the proxy (eapol_test, wpa_supplicant, most
+    /// embedded NASes) discards datagrams from any other source port. `None`
+    /// (tests, embedding) falls back to `socket`.
+    nas_socket: Option<Arc<UdpSocket>>,
 }
 
 impl ProxyHandler {
@@ -40,7 +47,15 @@ impl ProxyHandler {
         Ok(ProxyHandler {
             cache,
             socket: Arc::new(socket),
+            nas_socket: None,
         })
+    }
+
+    /// Reply to NASes through `socket` (the server's listening socket) instead
+    /// of the home-server socket. See [`ProxyHandler::nas_socket`].
+    pub fn with_nas_socket(mut self, socket: Arc<UdpSocket>) -> Self {
+        self.nas_socket = Some(socket);
+        self
     }
 
     /// Forward a request to a home server
@@ -197,9 +212,9 @@ impl ProxyHandler {
 
         let response = rewrite_response_for_nas(response, &entry)?;
 
-        // Forward response to original NAS
+        // Forward response to original NAS, from the address it sent to.
         let response_data = response.encode()?;
-        self.socket
+        self.nas_socket()
             .send_to(&response_data, entry.original_source)
             .await?;
 
@@ -217,6 +232,15 @@ impl ProxyHandler {
     /// Get the proxy socket for listening to responses
     pub fn socket(&self) -> Arc<UdpSocket> {
         Arc::clone(&self.socket)
+    }
+
+    /// The socket responses to NASes are sent from: the one set with
+    /// [`ProxyHandler::with_nas_socket`], else the home-server socket.
+    pub fn nas_socket(&self) -> Arc<UdpSocket> {
+        self.nas_socket
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::clone(&self.socket))
     }
 
     /// Get cache reference for statistics
@@ -1342,6 +1366,48 @@ mod tests {
             name: Some("Test Server".to_string()),
         };
         Arc::new(HomeServer::new(config).unwrap())
+    }
+
+    #[tokio::test]
+    async fn handle_response_replies_from_the_nas_socket() {
+        let cache = Arc::new(ProxyCache::new(Duration::from_secs(60), 1000));
+        let listener = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let handler = ProxyHandler::new(cache.clone(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap()
+            .with_nas_socket(Arc::clone(&listener));
+        let upstream_port = handler.socket().local_addr().unwrap().port();
+        assert_ne!(upstream_port, listener.local_addr().unwrap().port());
+
+        let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut entry = create_test_entry(nas.local_addr().unwrap());
+        let home_server = create_test_home_server();
+        let home_addr = home_server.address;
+        entry.home_server = home_server;
+        cache.insert(entry).unwrap();
+
+        handler
+            .handle_response(home_access_accept_with_keys(), home_addr)
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 4096];
+        let (len, from) = tokio::time::timeout(Duration::from_secs(2), nas.recv_from(&mut buf))
+            .await
+            .expect("NAS must receive the relayed Accept")
+            .unwrap();
+        assert_eq!(
+            from,
+            listener.local_addr().unwrap(),
+            "relayed response must come from the socket the NAS sent to"
+        );
+        let relayed = Packet::decode(&buf[..len]).unwrap();
+        assert_eq!(relayed.code, Code::AccessAccept);
+        assert!(verify_response_authenticator(
+            &relayed,
+            &REQUEST_AUTH,
+            CLIENT_SECRET
+        ));
     }
 
     fn create_test_home_server() -> Arc<HomeServer> {

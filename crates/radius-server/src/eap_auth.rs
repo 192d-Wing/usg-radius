@@ -476,6 +476,19 @@ impl EapAuthHandler {
             return make_challenge(frag, id).unwrap_or(AuthResult::Reject);
         }
 
+        // 1b) RFC 9190 Section 2.5 protected success: once we have sent the
+        // commitment message (a TLS 1.3 application-data 0x00), the peer's next
+        // EAP-Response — an empty EAP-TLS ACK — is the cue to send EAP-Success.
+        // Its payload needs no processing, so finish without feeding rustls.
+        if tls_server.commitment_sent() && tls_server.is_handshake_complete() {
+            return self.finish_eap_tls_success(
+                username,
+                session_id,
+                tls_server,
+                eap_response.identifier,
+            );
+        }
+
         // 2) Otherwise: parse the inbound EAP-TLS packet and feed rustls.
         let tls_packet = match EapTlsPacket::from_eap_data(&eap_response.data) {
             Ok(p) => p,
@@ -503,8 +516,8 @@ impl EapAuthHandler {
                 make_challenge(frag, id).unwrap_or(AuthResult::Reject)
             }
 
-            // No outbound data. Either the handshake just finished, or rustls
-            // is still waiting for more from the peer.
+            // No outbound handshake data. Either the handshake just
+            // finished, or rustls is still waiting for more from the peer.
             Ok(None) => {
                 if !tls_server.is_handshake_complete() {
                     // Mid-handshake with nothing to send back is wrong — peer
@@ -515,13 +528,9 @@ impl EapAuthHandler {
                     );
                     return AuthResult::Reject;
                 }
-                if tls_server.extract_keys().is_err() {
-                    error!(
-                        session_id,
-                        "continue_eap_tls: extract_keys failed after handshake"
-                    );
-                    return AuthResult::Reject;
-                }
+
+                // Verify the peer certificate's identity (client-cert mode)
+                // before signaling success either way.
                 let identity_verified =
                     if let Some(_peer_certs) = tls_server.get_peer_certificates() {
                         tls_server.verify_peer_identity(username).unwrap_or(false)
@@ -536,62 +545,113 @@ impl EapAuthHandler {
                     return AuthResult::Reject;
                 }
 
-                // Build an EAP-Success packet and attach it to the Accept as
-                // EAP-Message attribute(s). RFC 3579 §3.3: the server.rs
-                // helper will then add Message-Authenticator before computing
-                // Response-Authenticator.
-                let success_id = {
-                    let mut manager = self.session_manager.write().unwrap();
-                    if let Some(s) = manager.get_session_mut(session_id) {
-                        let _ = s.transition(EapState::Success);
-                        s.next_identifier()
-                    } else {
-                        eap_response.identifier.wrapping_add(1)
-                    }
-                };
-                let success = EapPacket::success(success_id);
-                let mut attrs = match radius_proto::eap::eap_to_radius_attributes(&success) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        error!(session_id, error = ?e, "continue_eap_tls: failed to wrap EAP-Success");
+                // RFC 9190 §2.5: EAP-TLS over TLS 1.3 requires a protected
+                // success indication — a TLS application-data record of a single
+                // 0x00 octet — that the peer acknowledges before EAP-Success.
+                // Peers (e.g. wpa_supplicant) derive no MSK without it, so the
+                // 4-way handshake and the MS-MPPE keys would both be unusable.
+                // Send it as its own EAP-Request; the peer's ACK is handled by
+                // the commitment fast path above. TLS 1.2 (RFC 5216) has no
+                // commitment message, so it succeeds immediately.
+                if tls_server.is_tls13() {
+                    let record = match tls_server.write_commitment_record() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!(session_id, error = ?e, "continue_eap_tls: failed to build commitment message");
+                            return AuthResult::Reject;
+                        }
+                    };
+                    tls_server.queue_outgoing_tls(record, 1020);
+                    let Some(frag) = tls_server.next_outgoing_fragment() else {
+                        error!(
+                            session_id,
+                            "continue_eap_tls: commitment produced no fragment"
+                        );
                         return AuthResult::Reject;
-                    }
-                };
-
-                // RFC 5216 §2.3 / RFC 9190 §2.3: the MSK extracted above goes
-                // to the Access-Accept builder, which encrypts it into the
-                // RFC 2548 MS-MPPE-Recv/Send-Key attributes with the client's
-                // shared secret and this request's authenticator.
-                let Some(msk) = tls_server.get_msk().map(|k| k.to_vec()) else {
-                    error!(
+                    };
+                    let id = next_id();
+                    debug!(
                         session_id,
-                        "continue_eap_tls: MSK missing after extract_keys"
+                        identifier = id,
+                        "continue_eap_tls: sending RFC 9190 commitment message"
                     );
-                    return AuthResult::Reject;
-                };
-
-                // RFC 9190 §2.5 / RFC 4072 §3.2: EAP-Key-Name carries the EAP
-                // Session-Id (TLS 1.3 only; rustls cannot build the TLS 1.2 form).
-                if let Some(session_id_bytes) = tls_server.session_id()
-                    && let Ok(a) = Attribute::new(AttributeType::EapKeyName as u8, session_id_bytes)
-                {
-                    attrs.push(a);
+                    return make_challenge(frag, id).unwrap_or(AuthResult::Reject);
                 }
 
-                debug!(
+                self.finish_eap_tls_success(
+                    username,
                     session_id,
-                    username, "continue_eap_tls: handshake complete, EAP-Success"
-                );
-                AuthResult::Accept {
-                    attributes: attrs,
-                    msk: Some(msk),
-                }
+                    tls_server,
+                    eap_response.identifier,
+                )
             }
 
             Err(e) => {
                 error!(session_id, error = ?e, "continue_eap_tls: TLS processing error");
                 AuthResult::Reject
             }
+        }
+    }
+
+    /// Build the EAP-Success Access-Accept for a completed EAP-TLS exchange.
+    ///
+    /// For TLS 1.3 this runs after the peer has acknowledged the RFC 9190 §2.5
+    /// commitment message; for TLS 1.2 it runs as soon as the handshake
+    /// completes. It extracts the MSK/EMSK (RFC 5216 §2.3 / RFC 9190 §2.3),
+    /// wraps an EAP-Success whose Identifier echoes the peer's last
+    /// EAP-Response (RFC 3748 §4.2), and attaches the EAP-Key-Name Session-Id
+    /// (RFC 9190 §2.5 / RFC 4072 §3.2, TLS 1.3 only). The returned MSK is
+    /// encrypted into MS-MPPE-Recv/Send-Key by the Access-Accept builder.
+    #[cfg(feature = "tls")]
+    fn finish_eap_tls_success(
+        &self,
+        username: &str,
+        session_id: &str,
+        tls_server: &mut EapTlsServer,
+        last_eap_identifier: u8,
+    ) -> AuthResult {
+        if tls_server.extract_keys().is_err() {
+            error!(
+                session_id,
+                "finish_eap_tls_success: extract_keys failed after handshake"
+            );
+            return AuthResult::Reject;
+        }
+        {
+            let mut manager = self.session_manager.write().unwrap();
+            if let Some(s) = manager.get_session_mut(session_id) {
+                let _ = s.transition(EapState::Success);
+            }
+        }
+        // RFC 3748 §4.2: the EAP-Success Identifier matches the peer's last
+        // EAP-Response (the commitment ACK for TLS 1.3).
+        let success = EapPacket::success(last_eap_identifier);
+        let mut attrs = match radius_proto::eap::eap_to_radius_attributes(&success) {
+            Ok(a) => a,
+            Err(e) => {
+                error!(session_id, error = ?e, "finish_eap_tls_success: failed to wrap EAP-Success");
+                return AuthResult::Reject;
+            }
+        };
+        let Some(msk) = tls_server.get_msk().map(|k| k.to_vec()) else {
+            error!(
+                session_id,
+                "finish_eap_tls_success: MSK missing after extract_keys"
+            );
+            return AuthResult::Reject;
+        };
+        if let Some(session_id_bytes) = tls_server.session_id()
+            && let Ok(a) = Attribute::new(AttributeType::EapKeyName as u8, session_id_bytes)
+        {
+            attrs.push(a);
+        }
+        debug!(
+            session_id,
+            username, "continue_eap_tls: success (MSK + EAP-Key-Name emitted)"
+        );
+        AuthResult::Accept {
+            attributes: attrs,
+            msk: Some(msk),
         }
     }
 
@@ -959,6 +1019,9 @@ mod eap_tls_mppe_tests {
     struct Supplicant {
         conn: ClientConnection,
         reassembly: Vec<u8>,
+        /// Application data the peer read post-handshake (e.g. the RFC 9190
+        /// commitment 0x00).
+        app_data: Vec<u8>,
     }
 
     impl Supplicant {
@@ -982,6 +1045,7 @@ mod eap_tls_mppe_tests {
             Supplicant {
                 conn,
                 reassembly: Vec::new(),
+                app_data: Vec::new(),
             }
         }
 
@@ -1010,6 +1074,15 @@ mod eap_tls_mppe_tests {
             let data = std::mem::take(&mut self.reassembly);
             self.conn.read_tls(&mut &data[..]).unwrap();
             self.conn.process_new_packets().unwrap();
+            // Drain any post-handshake application data (RFC 9190 commitment).
+            use std::io::Read as _;
+            let mut buf = [0u8; 64];
+            while let Ok(n) = self.conn.reader().read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                self.app_data.extend_from_slice(&buf[..n]);
+            }
             let out = self.pending_tls();
             if out.is_empty() {
                 Self::ack(request.identifier)
@@ -1161,6 +1234,80 @@ mod eap_tls_mppe_tests {
         );
     }
 
+    /// RFC 9190 §2.5 regression (interop with wpa_supplicant / FreeRADIUS over
+    /// TLS 1.3): before EAP-Success the server MUST send a commitment message —
+    /// a TLS application-data record of a single 0x00 octet — as its own
+    /// EAP-Request, and send EAP-Success only after the peer acknowledges it.
+    /// Without it, an OpenSSL-based peer derives no MSK and the authentication
+    /// fails even though the TLS handshake succeeded. The exchange here is
+    /// driven explicitly so the extra round and the 0x00 payload are asserted,
+    /// not merely tolerated.
+    #[test]
+    fn eap_tls_tls13_sends_rfc9190_commitment_before_success() {
+        let pki = gen_pki();
+        let handler = eap_handler(&pki);
+        let mut peer = Supplicant::new(&pki);
+
+        let mut request = identity_request();
+        let mut challenges_after_app_data = 0usize;
+        let (attributes, msk) = loop {
+            assert!(
+                request.identifier < 64,
+                "EAP-TLS conversation did not converge"
+            );
+            match handler.authenticate_request(&request, SECRET) {
+                AuthResult::Challenge {
+                    state, attributes, ..
+                } => {
+                    // Once the peer has seen the commitment, no further
+                    // Challenge should carry TLS handshake data.
+                    if !peer.app_data.is_empty() {
+                        challenges_after_app_data += 1;
+                    }
+                    let mut challenge =
+                        packet_with(Code::AccessChallenge, request.identifier, attributes);
+                    challenge
+                        .add_attribute(Attribute::new(AttributeType::State as u8, state).unwrap());
+                    request = answer_challenge(&mut peer, &challenge);
+                }
+                AuthResult::Accept { attributes, msk } => break (attributes, msk),
+                AuthResult::Reject => panic!("EAP-TLS rejected at id {}", request.identifier),
+            }
+        };
+
+        // The peer received exactly the one-octet 0x00 commitment as TLS
+        // application data, the hallmark of RFC 9190 §2.5 protected success.
+        assert_eq!(
+            peer.app_data,
+            vec![0x00],
+            "peer must receive the RFC 9190 commitment message (application data 0x00)"
+        );
+        // The commitment arrived as its own round: the peer saw it, then
+        // answered once more (the ACK) before the Accept — no extra Challenge
+        // carrying handshake data followed it.
+        assert_eq!(
+            challenges_after_app_data, 0,
+            "EAP-Success must follow the commitment ACK with no further challenges"
+        );
+
+        // Success still carries the correct, peer-matching key material.
+        let msk = msk.expect("EAP-TLS Accept must carry the MSK");
+        assert_eq!(
+            msk,
+            peer.msk(),
+            "server MSK must match the peer after commitment"
+        );
+        let accept = packet_with(Code::AccessAccept, 0, attributes);
+        let key_name = accept
+            .find_attribute(AttributeType::EapKeyName as u8)
+            .expect("EAP-Key-Name on the Access-Accept");
+        assert_eq!(
+            key_name.value,
+            peer.session_id(),
+            "EAP-Key-Name must equal the peer's derived Session-Id"
+        );
+    }
+
     #[tokio::test]
     async fn access_accept_carries_encrypted_ms_mppe_keys() {
         let pki = gen_pki();
@@ -1171,7 +1318,7 @@ mod eap_tls_mppe_tests {
             ..Config::default()
         };
         let cfg = Arc::new(ServerConfig::from_config(config, Arc::new(handler)).unwrap());
-        let nas_ip = "10.0.0.1".parse().unwrap();
+        let nas_ip = "10.0.0.1:1812".parse().unwrap();
 
         let mut request = identity_request();
         let accept = loop {

@@ -1330,6 +1330,12 @@ pub mod eap_tls {
         context: EapTlsContext,
         /// Server configuration
         config: std::sync::Arc<rustls::ServerConfig>,
+        /// Whether the RFC 9190 Section 2.5 "protected success indication"
+        /// (commitment message) has been emitted. TLS 1.3 EAP-TLS requires the
+        /// server to send a TLS application-data record of one `0x00` octet and
+        /// have the peer acknowledge it before EAP-Success; the peer derives no
+        /// key otherwise. Always false for a TLS 1.2 session.
+        commitment_sent: bool,
     }
 
     #[cfg(feature = "tls")]
@@ -1340,6 +1346,7 @@ pub mod eap_tls {
                 connection: None,
                 context: EapTlsContext::new(),
                 config,
+                commitment_sent: false,
             }
         }
 
@@ -1408,6 +1415,46 @@ pub mod eap_tls {
                 .as_ref()
                 .map(|c| !c.is_handshaking())
                 .unwrap_or(false)
+        }
+
+        /// True once the TLS handshake has negotiated TLS 1.3. EAP-TLS over
+        /// TLS 1.3 (RFC 9190) needs the commitment-message exchange; EAP-TLS
+        /// over TLS 1.2 (RFC 5216) does not.
+        pub fn is_tls13(&self) -> bool {
+            self.connection.as_ref().and_then(|c| c.protocol_version())
+                == Some(rustls::ProtocolVersion::TLSv1_3)
+        }
+
+        /// Whether the RFC 9190 Section 2.5 commitment message has been sent.
+        pub fn commitment_sent(&self) -> bool {
+            self.commitment_sent
+        }
+
+        /// Emit the RFC 9190 Section 2.5 "protected success indication": a TLS
+        /// 1.3 application-data record whose payload is a single `0x00` octet.
+        /// The caller fragments the returned record into an EAP-Request and
+        /// sends EAP-Success only after the peer acknowledges it. May only be
+        /// called once the handshake is complete; sets [`Self::commitment_sent`].
+        pub fn write_commitment_record(&mut self) -> Result<Vec<u8>, EapError> {
+            use std::io::Write as _;
+            let conn = self.connection.as_mut().ok_or(EapError::InvalidState)?;
+            if conn.is_handshaking() {
+                return Err(EapError::InvalidState);
+            }
+            conn.writer()
+                .write_all(&[0x00])
+                .map_err(|e| EapError::TlsError(format!("Failed to queue commitment: {}", e)))?;
+            let mut record = Vec::new();
+            conn.write_tls(&mut record).map_err(|e| {
+                EapError::TlsError(format!("Failed to encode commitment record: {}", e))
+            })?;
+            if record.is_empty() {
+                return Err(EapError::TlsError(
+                    "commitment message produced no TLS record".to_string(),
+                ));
+            }
+            self.commitment_sent = true;
+            Ok(record)
         }
 
         /// True if there are still outgoing TLS fragments queued from a

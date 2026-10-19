@@ -172,7 +172,6 @@ async fn handle_connection(
         nas_identity(leaf, peer)
     };
 
-    let peer_ip = peer.ip();
     debug!("RadSec connection from {peer} established as NAS '{nas_id}' (mTLS verified)");
 
     // NOTE: unlike the UDP path, RadSec does not apply per-source rate limiting —
@@ -197,7 +196,7 @@ async fn handle_connection(
     loop {
         // Drain every complete frame already buffered before awaiting more I/O.
         while let Some(frame) = take_frame(&mut buf)? {
-            dispatch_inbound(&frame, peer_ip, &server_config, &mut wr, &mut pending).await?;
+            dispatch_inbound(&frame, peer, &server_config, &mut wr, &mut pending).await?;
         }
 
         tokio::select! {
@@ -243,7 +242,7 @@ struct Pending {
 /// the normal request pipeline and its response (if any) is written back.
 async fn dispatch_inbound(
     frame: &[u8],
-    peer_ip: IpAddr,
+    peer: SocketAddr,
     server_config: &Arc<ServerConfig>,
     wr: &mut (impl AsyncWriteExt + Unpin),
     pending: &mut HashMap<u8, Pending>,
@@ -281,7 +280,7 @@ async fn dispatch_inbound(
         return Ok(());
     }
 
-    match RadiusServer::process_request(frame, peer_ip, RADSEC_SECRET, server_config).await {
+    match RadiusServer::process_request(frame, peer, RADSEC_SECRET, server_config).await {
         Ok(Some(response)) => {
             wr.write_all(&response).await?;
             wr.flush().await?;

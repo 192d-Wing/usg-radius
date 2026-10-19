@@ -1,0 +1,35 @@
+{
+  "_comment": "usg-radius as the proxy. NAS hop secret differs from the home hop secret, so every relayed attribute that depends on the secret (User-Password, MS-MPPE-*-Key, Message-Authenticator, Response Authenticator) must be re-keyed.",
+  "listen_address": "0.0.0.0",
+  "listen_port": 1812,
+  "transport": "udp-insecure",
+  "secret": "unused-default-secret",
+  "clients": [
+    { "name": "nas (eapol_test / radclient)", "address": "10.77.0.40/32", "secret": "nas-proxy-secret-1" }
+  ],
+  "users": [],
+  "verbose": true,
+  "log_level": "debug",
+  "strict_rfc_compliance": true,
+  "proxy": {
+    "enabled": true,
+    "cache_ttl": 60,
+    "max_outstanding": 100,
+    "proxy_timeout": 5,
+    "default_realm": "local",
+    "pools": [
+      {
+        "name": "freeradius",
+        "strategy": "failover",
+        "servers": [
+          { "name": "freeradius", "address": "10.77.0.10:1812", "secret": "proxy-freeradius-secret-2", "timeout": 5, "max_outstanding": 100 }
+        ]
+      }
+    ],
+    "realms": [
+      { "name": "freeradius.test", "match": { "type": "suffix", "pattern": "freeradius.test" }, "pool": "freeradius", "strip_realm": false }
+    ],
+    "health_check": { "enabled": false },
+    "retry": { "max_retries": 1, "retry_interval": 2, "failover_on_timeout": false }
+  }
+}
