@@ -80,7 +80,7 @@ image build (default 2).
 
 ## What is checked
 
-Sixteen assertions across four scenarios. All pass on the current tree (run
+Fifteen assertions across four scenarios. All pass on the current tree (run
 `tests/interop/run.sh`).
 
 ### 1 & 2 — EAP-TLS through the proxy to FreeRADIUS
