@@ -302,6 +302,7 @@ correct stripping of server-added Proxy-State on the response leg.
   Access-Accept, salt-encrypted per RFC 2548 §2.4 under the client secret and
   Request Authenticator (`"radsec"` under RadSec)
 - ✅ EAP-Key-Name (RFC 9190 §2.5 Session-Id) on TLS 1.3 Access-Accepts
+- ✅ RFC 9190 §2.5 commitment message (protected success indication) sent after the TLS 1.3 handshake; EAP-Success only on the peer's acknowledgement, with its Identifier echoing the peer's last EAP-Response (RFC 3748 §4.2)
 - ✅ Cryptographically secure session binding
 
 **Session Management (100%)**:
@@ -914,7 +915,7 @@ Total:         156+ tests
 | Bandwidth Throttling | - | ✅ Complete | v0.2.0 | CRITICAL | Bandwidth protection |
 | Accounting | 2866 | ✅ Complete | v0.3.0 | HIGH | Session tracking |
 | EAP-TLS | 5216 | ✅ Complete | v0.5.0 | HIGH | Modern auth |
-| EAP-TLS over TLS 1.3 keys | 9190 | ✅ Complete | v0.11.0 | HIGH | Exporter labels + EAP-Key-Name |
+| EAP-TLS over TLS 1.3 keys | 9190 | ✅ Complete | v0.11.0 | HIGH | Exporter labels, §2.5 commitment message, EAP-Key-Name; verified against eapol_test |
 | MS-MPPE-Send/Recv-Key | 2548 | ✅ Complete | v0.11.0 | HIGH | Required for the 802.11i 4-way handshake |
 | Vendor-Specific codec | 2865 §5.26 | ✅ Complete | v0.11.0 | MEDIUM | Sub-attribute encode/decode; no dictionaries |
 | Tunnel-Password | 2868 §3.5 | ⚠️ Codec + proxy re-key | v0.11.0 | LOW | Other tunnel attributes not interpreted |
@@ -991,6 +992,10 @@ The current implementation is **PRODUCTION-READY** for:
      the client secret, dropping any that fail to decrypt, and recomputes
      Message-Authenticator / Response Authenticator for the NAS
      ([crates/radius-server/src/proxy/handler.rs](../../crates/radius-server/src/proxy/handler.rs))
+   - Relayed responses and timeout Access-Rejects are sent from the server's
+     listening socket (the port the NAS sent to), so `connect()`ed NAS sockets
+     accept them; interop-tested against FreeRADIUS + eapol_test with a
+     different secret on each hop (`tests/interop/run.sh`)
    - Proxy-State echoed; multi-Proxy-State ordering regression tests pending
    - Hot reload not available
    - Upstream (proxy) leg is UDP only
