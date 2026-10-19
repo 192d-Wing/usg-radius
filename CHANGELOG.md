@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-10-18
+
+Ships the v0.11.0 binaries that the release workflow failed to attach: the
+v0.11.0 GitHub release was published with no assets, and because releases are
+immutable the tag cannot be amended, so this patch release carries the Linux
+tarball and checksum built from the same code plus the workflow fix below.
+
 ### Fixed
 
 - **Release workflow published the GitHub release before uploading its
