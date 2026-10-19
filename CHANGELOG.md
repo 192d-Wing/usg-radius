@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Release workflow published the GitHub release before uploading its
+  assets.** The repository uses immutable releases, so the Linux tarball upload
+  for v0.11.0 was rejected (`Cannot upload assets to an immutable release`) and
+  the release went out with no binaries; the tag name cannot be reused. The
+  workflow now creates a draft, uploads the binary and checksum into it, and
+  publishes only after the binary and both container-image manifests succeed,
+  so a failed run leaves a completable draft rather than an empty release. The
+  deprecated `actions/create-release` and `actions/upload-release-asset`
+  are replaced by the `gh` CLI, and release notes are taken from the matching
+  CHANGELOG section.
+
 ## [0.11.0] - 2026-10-18
 
 Delivers the keys WPA-Enterprise needs and makes them survive the proxy. The

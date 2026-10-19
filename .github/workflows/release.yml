@@ -13,27 +13,44 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The repository uses immutable releases: once a release is published its
+  # assets and tag can no longer be changed, so every asset must be attached
+  # while the release is still a draft. Flow: create a draft here, let the
+  # build jobs upload into it, and publish in `publish-release` only after
+  # the binary and the container images have all succeeded. A failed run
+  # therefore leaves a draft that can be completed or discarded, never a
+  # published release with missing assets.
   create-release:
-    name: Create Release
+    name: Create Draft Release
     runs-on: ubuntu-latest
     outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
       version: ${{ steps.get_version.outputs.version }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Get version from tag
         id: get_version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
+      # Release notes: the matching CHANGELOG section when there is one,
+      # otherwise GitHub's generated notes.
+      - name: Create draft release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          draft: false
-          prerelease: false
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.get_version.outputs.version }}
+        run: |
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          if [ -s notes.md ]; then
+            gh release create "$TAG" --draft --title "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --draft --title "$TAG" --generate-notes
+          fi
 
   build-linux:
     name: Build Linux Binary
@@ -53,30 +70,33 @@ jobs:
         run: strip target/release/usg-radius
 
       - name: Create archive
+        env:
+          VERSION: ${{ needs.create-release.outputs.version }}
         run: |
           cd target/release
-          tar czf usg-radius-${{ needs.create-release.outputs.version }}-x86_64-linux.tar.gz usg-radius
-          sha256sum usg-radius-${{ needs.create-release.outputs.version }}-x86_64-linux.tar.gz > usg-radius-${{ needs.create-release.outputs.version }}-x86_64-linux.tar.gz.sha256
+          tar czf "usg-radius-${VERSION}-x86_64-linux.tar.gz" usg-radius
+          sha256sum "usg-radius-${VERSION}-x86_64-linux.tar.gz" > "usg-radius-${VERSION}-x86_64-linux.tar.gz.sha256"
 
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
+      - name: Upload assets to draft release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./target/release/usg-radius-${{ needs.create-release.outputs.version }}-x86_64-linux.tar.gz
-          asset_name: usg-radius-${{ needs.create-release.outputs.version }}-x86_64-linux.tar.gz
-          asset_content_type: application/gzip
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.create-release.outputs.version }}
+        run: |
+          gh release upload "$TAG" --clobber \
+            "target/release/usg-radius-${VERSION}-x86_64-linux.tar.gz" \
+            "target/release/usg-radius-${VERSION}-x86_64-linux.tar.gz.sha256"
 
-      - name: Upload SHA256
-        uses: actions/upload-release-asset@v1
+  publish-release:
+    name: Publish Release
+    needs: [create-release, build-linux, merge-image]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish draft release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./target/release/usg-radius-${{ needs.create-release.outputs.version }}-x86_64-linux.tar.gz.sha256
-          asset_name: usg-radius-${{ needs.create-release.outputs.version }}-x86_64-linux.tar.gz.sha256
-          asset_content_type: text/plain
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
 
   # Build each architecture in parallel on a NATIVE runner (no QEMU), push each
   # by digest, then assemble a single multi-arch manifest in `merge-image`.
