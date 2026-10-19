@@ -266,11 +266,11 @@ fn demonstrate_key_derivation() -> Result<(), Box<dyn std::error::Error>> {
         println!("  MSK: {} bytes", msk.len());
         println!("    First 16 bytes: {:02x?}", &msk[0..16]);
 
-        // MSK is used to derive RADIUS MS-MPPE keys
-        // MS-MPPE-Send-Key = first 32 bytes of MSK
-        // MS-MPPE-Recv-Key = second 32 bytes of MSK
-        println!("    MS-MPPE-Send-Key: {:02x?}", &msk[0..32]);
-        println!("    MS-MPPE-Recv-Key: {:02x?}", &msk[32..64]);
+        // MSK is used to derive RADIUS MS-MPPE keys (RFC 2548 §2.4)
+        // MS-MPPE-Recv-Key = first 32 bytes of MSK
+        // MS-MPPE-Send-Key = second 32 bytes of MSK
+        println!("    MS-MPPE-Recv-Key: {:02x?}", &msk[0..32]);
+        println!("    MS-MPPE-Send-Key: {:02x?}", &msk[32..64]);
     }
 
     if let Some(emsk) = ctx.get_emsk() {

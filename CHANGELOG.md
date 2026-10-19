@@ -7,6 +7,198 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **CI Docker Build failed on every Dependabot PR after the public-Alpine
+  fallback (#66): `adduser: uid '999' in use`.** The Iron Bank Alpine image has
+  uid/gid 999 free; the public `alpine:3.22` image already uses gid 999 for its
+  `ping` group, which busybox `adduser -u 999` reports as a uid clash. The runtime stage
+  now takes 999 when it is free (unchanged for shipped images, which
+  `deploy/base` pins to 999) and falls back to a free id only on the public
+  image, which is built for CI and never pushed.
+
+### Changed
+
+- **RustCrypto and rand majors.** `sha2` 0.10 → 0.11, `hmac` 0.12 → 0.13 and
+  `md-5` 0.10 → 0.11 (all on `digest` 0.11, so the HMAC-MD5
+  Message-Authenticator, the TLS 1.2 PRF used by EAP-TLS/TEAP key derivation
+  and the TEAP Compound-MAC keep a single digest generation), `rand` 0.9 → 0.10
+  (`Rng` → `RngExt` for `fill` / `random` / `random_range`; no change to which
+  generator is used) and the test-only `rcgen` 0.13 → 0.14 (`signed_by` takes
+  an `Issuer`). No wire-format or key-derivation change; the existing
+  known-answer tests cover every affected primitive. `pbkdf2`, `argon2` and
+  `sqlx` still carry the previous `digest` 0.10 generation internally.
+
+## [0.11.1] - 2026-10-18
+
+Ships the v0.11.0 binaries that the release workflow failed to attach: the
+v0.11.0 GitHub release was published with no assets, and because releases are
+immutable the tag cannot be amended, so this patch release carries the Linux
+tarball and checksum built from the same code plus the workflow fix below.
+
+### Fixed
+
+- **Release workflow published the GitHub release before uploading its
+  assets.** The repository uses immutable releases, so the Linux tarball upload
+  for v0.11.0 was rejected (`Cannot upload assets to an immutable release`) and
+  the release went out with no binaries; the tag name cannot be reused. The
+  workflow now creates a draft, uploads the binary and checksum into it, and
+  publishes only after the binary and both container-image manifests succeed,
+  so a failed run leaves a completable draft rather than an empty release. The
+  deprecated `actions/create-release` and `actions/upload-release-asset`
+  are replaced by the `gh` CLI, and release notes are taken from the matching
+  CHANGELOG section.
+
+## [0.11.0] - 2026-10-18
+
+Delivers the keys WPA-Enterprise needs and makes them survive the proxy. The
+Access-Accept that ends an EAP-TLS or EAP-TEAP exchange now carries the RFC 2548
+MS-MPPE-Send-Key / MS-MPPE-Recv-Key (with RFC 9190 TLS 1.3 keying, including
+the §2.5 commitment message OpenSSL-based supplicants require, and RFC 7170
+TEAP key derivation corrected), and the RADIUS proxy now re-keys every
+secret-bound field on both legs — User-Password and Message-Authenticator toward
+the home server; MS-MPPE keys, Tunnel-Password and Message-Authenticator back
+toward the NAS — and replies from the port the NAS sent to, so 802.1X through
+the proxy completes the 4-way handshake instead of stalling. All of it is
+proven against FreeRADIUS and wpa_supplicant's eapol_test by a new interop
+harness. Also clears the open `cargo audit` findings.
+
+### Added
+
+- **MS-MPPE-Send-Key / MS-MPPE-Recv-Key (RFC 2548 §2.4)** on the Access-Accept
+  that concludes an EAP-TLS or EAP-TEAP exchange, so the NAS receives the PMK
+  for the 802.11i 4-way handshake. The keys are salt-encrypted under the
+  client's shared secret (`"radsec"` under RadSec) and the Request
+  Authenticator in the Access-Accept builder; EAP handlers now return the MSK
+  on `AuthResult::Accept { msk }` instead of attaching raw attributes.
+- **Vendor-Specific (26) sub-attribute codec** (`radius_proto::VendorSpecific`,
+  `Packet::find_vendor_attributes`) and `radius_proto::mppe` with known-answer
+  and round-trip tests.
+- **Tunnel-Password (69) codec** (RFC 2868 §3.5: `radius_proto::tunnel_password`,
+  `AttributeType::TunnelPassword`) with known-answer and round-trip tests.
+- **EAP-Key-Name (102)** carrying the RFC 9190 §2.5 EAP Session-Id on TLS 1.3
+  EAP-TLS Access-Accepts.
+- **EAP-TEAP MSK derivation** (RFC 7170 §5.4) from S-IMCK, gated on a verified
+  Crypto-Binding response.
+- **Reproducible interop test** (`tests/interop/`, `tests/interop/run.sh`)
+  exercising usg-radius in proxy mode and as an EAP-TLS home server against
+  FreeRADIUS 3.2 and eapol_test (wpa_supplicant 2.11), with a different shared
+  secret on each hop. It proves EAP-TLS over TLS 1.3 and PAP through the proxy,
+  the MS-MPPE key re-encryption on both legs, and usg-radius's own MS-MPPE /
+  RFC 9190 exporter output, all against independent implementations. Documented
+  in `docs/docs/development/INTEROP_TESTING.md`.
+
+### Changed
+
+- `AuthResult::Accept` gained an `msk: Option<Vec<u8>>` field (breaking for
+  direct constructors; use `AuthResult::accept()` for key-less success).
+- `ProxyError` gained an `InvalidUserPassword` variant, and a proxy cache entry's
+  `original_request` now holds the re-keyed packet that was actually forwarded
+  (and is resent on retry), not the NAS's original.
+
+### Fixed
+
+- **EAP-TLS over TLS 1.3 derived the MSK with the TLS 1.2 exporter label.**
+  RFC 9190 §2.3 requires `"EXPORTER_EAP_TLS_Key_Material"` with the `0x0D`
+  Type-Code context; using `"client EAP encryption"` produced an MSK no
+  RFC 9190 supplicant shares. Derivation is now selected by the negotiated
+  TLS version.
+- **EAP-TLS over TLS 1.3 sent EAP-Success without the RFC 9190 §2.5 commitment
+  message, so OpenSSL-based peers derived no key.** After the TLS handshake the
+  server jumped straight to EAP-Success, skipping the protected success
+  indication (a TLS application-data record of one `0x00` octet the peer
+  acknowledges). wpa_supplicant's TLS 1.3 EAP-TLS peer installs no MSK without
+  it: direct EAP-TLS to usg-radius failed with an MS-MPPE / Session-Id mismatch
+  even though the handshake succeeded (the unit tests missed it by driving
+  rustls against a rustls peer). The server now sends the commitment as its own
+  EAP-Request and sends EAP-Success — whose Identifier now echoes the peer's
+  last EAP-Response per RFC 3748 §4.2 — only once the peer acknowledges it.
+  TLS 1.2 EAP-TLS, which has no commitment message, is unchanged.
+- **EAP-TEAP IMCK/CMK derivation did not follow RFC 7170 §5.2.** IMCK[j] was
+  expanded with an ad-hoc HMAC construction instead of the TLS 1.2 PRF, and
+  CMK[j] was taken from the first 20 octets of IMCK[j], overlapping S-IMCK[j],
+  instead of the last 20. Both now match the RFC (and hostapd's
+  `eap_teap_derive_imck`), so the Compound-MAC and the MSK/EMSK derived from
+  S-IMCK interoperate with conforming peers.
+- An EAP-TEAP conversation that reached `Complete` without a verified
+  Crypto-Binding is now rejected instead of accepted.
+- **Proxied Access-Requests were forwarded under the NAS's secret, so home
+  servers rejected PAP and EAP.** The request leg appended Proxy-State and
+  relayed the packet otherwise verbatim: its User-Password (RFC 2865 §5.2,
+  encrypted under the client secret and Request Authenticator) and its
+  Message-Authenticator (RFC 3579 §3.2, HMAC-MD5 under the client secret and
+  mandatory on EAP requests) were invalid for any home server whose secret
+  differs. The proxy now decrypts User-Password under the client secret and
+  re-encrypts it under the home server secret, then recomputes
+  Message-Authenticator under the home server secret over the packet including
+  our Proxy-State (adding one when the request carries EAP-Message). The
+  Request Authenticator is forwarded unchanged, as RFC 2865 §2.3 allows, so the
+  response leg keeps keying off the NAS's value; CHAP-Password is bound to the
+  challenge rather than the secret and is forwarded as is. A User-Password that
+  does not decrypt under the client secret fails the forward instead of sending
+  the home server garbage.
+- **Proxied Access-Accepts forwarded MS-MPPE keys the NAS could not decrypt.**
+  RFC 2548 §2.4.2 binds MS-MPPE-Send-Key / MS-MPPE-Recv-Key to the shared
+  secret of the hop that encrypted them, so a home server's keys were relayed
+  under the wrong secret and every EAP-TLS/TEAP session authenticated through
+  the proxy stalled in the 802.11i 4-way handshake. The proxy now decrypts the
+  keys with the home server secret, re-encrypts them with the client's secret
+  and fresh salts, and drops any key that fails to decrypt instead of
+  forwarding garbage. On the same path it now verifies the home server's
+  Response Authenticator before relaying (the documented step was never
+  implemented) and recomputes Message-Authenticator under the client secret
+  (RFC 3579 §3.2), which was previously left as the home server's HMAC and
+  rejected by the NAS on every proxied EAP response.
+- **Proxied Access-Accepts forwarded Tunnel-Password the NAS could not decrypt.**
+  RFC 2868 §3.5 Tunnel-Password is salt-encrypted with the same MD5 chain as the
+  MS-MPPE keys (`MD5(secret || Request-Authenticator || Salt)`, Tag octet in
+  front), so a home server's tunnel password relayed through the proxy was
+  bound to the wrong secret and unusable by the NAS. The proxy now decrypts
+  every Tunnel-Password under the home server secret and re-encrypts it under
+  the client secret with a fresh salt — unique across the packet, including the
+  MS-MPPE salts — keeping its Tag and position. Passwords that fail to decrypt
+  are dropped and logged, as for the MS-MPPE keys.
+- **Proxy timeout Access-Reject was signed with an empty secret, so the NAS
+  discarded it.** After a proxied request exhausted its retries, `RetryManager`
+  computed the Response Authenticator of the Access-Reject it sends back to the
+  NAS with `b""` instead of the NAS's shared secret. The NAS verifies that
+  authenticator under the shared secret, silently drops the mismatch, and keeps
+  waiting until its own timeout. The reject is now signed with the client
+  secret recorded in the proxy cache entry, with a loopback test asserting it
+  verifies under that secret and not under an empty one.
+- **Proxied responses and timeout rejects were sent from the proxy's upstream
+  socket, not the port the NAS sent to.** The proxy reads home-server replies on
+  a dedicated socket (ephemeral port) and relayed them to the NAS from that
+  socket; a NAS whose RADIUS socket is `connect()`ed to the proxy (eapol_test,
+  wpa_supplicant and most embedded NASes) drops datagrams from any other source
+  port, so every proxied authentication appeared to time out. Replies and
+  `RetryManager` rejects now go out through the server's listening socket.
+- **`radius-proto` built with both `tls` and `revocation` panicked at
+  `ServerConfig::builder()`** ("Could not automatically determine the
+  process-level CryptoProvider"): `reqwest`'s `rustls-tls` feature compiled
+  rustls's `ring` provider in next to the workspace's `aws-lc-rs`. `reqwest`
+  now uses `rustls-tls-webpki-roots-no-provider` (same WebPKI roots, no `ring`),
+  and the `revocation` module installs the `aws-lc-rs` default provider before
+  building its HTTP client if none is set. The shipped `radius-server` binary
+  never enables `revocation` and was unaffected; `cargo test --all-features`
+  was. Test code was also cleared of the clippy 1.99 lints so
+  `cargo clippy --all-targets --all-features -D warnings` passes on stable.
+- `cargo clippy -D warnings` on current stable (1.99) failed with
+  `double_must_use` inside the `#[async_trait]` expansion of `StateBackend`;
+  bumped `async-trait` 0.1.89→0.1.92, whose release resolves that lint in the
+  generated code. No source changes.
+
+### Security
+
+- Updated transitive dependencies to clear `cargo audit` findings published since
+  v0.10.1: `rustls` 0.23.40→0.23.46 (RUSTSEC-2026-0285, -0346, -0348, -0349 —
+  including an unauthenticated ServerHello key-exchange downgrade that matters for
+  RadSec), `quinn-proto` 0.11.14→0.11.19 (RUSTSEC-2026-0185, -0338, -0339, -0340,
+  -0342), `h2` 0.4.14→0.4.20 (RUSTSEC-2026-0258), `crossbeam-epoch` 0.9.18→0.9.21
+  (RUSTSEC-2026-0204), plus `event-listener` 5.4.2 (RUSTSEC-2026-0221) and the
+  yanked `spin` 0.9.8→0.9.9. `aws-lc-rs`/`aws-lc-sys` and `rustls-webpki` moved
+  with `rustls`. `cargo audit` is now clean with no warnings.
+
 ## [0.10.1] - 2026-06-17
 
 ### Fixed

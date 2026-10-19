@@ -19,6 +19,8 @@ RADIUS was designed in 1997, and while widely used, it has known security limita
 ❌ **Client authentication** - Clients not cryptographically authenticated
 ❌ **Traffic analysis** - Packet metadata visible
 
+These weaknesses apply to the plain UDP transport (`transport: "udp-insecure"`). The default RadSec transport (RFC 6614) wraps the whole exchange in mutually authenticated TLS 1.3 and closes all five gaps; see [Transport Security (RadSec)](#transport-security-radsec) below.
+
 ## Cryptographic Weaknesses
 
 ### MD5 Hash Function
@@ -56,8 +58,9 @@ Encrypted = Password XOR MD5(Secret + Authenticator)
 
 **Mitigations:**
 
-- Use strong shared secrets (16+ characters, random)
-- Use network security (VPN, IPsec)
+- Use RadSec (`transport: "radsec"`) so the packet is never exposed on the wire
+- Use strong shared secrets (16+ characters, random) where UDP is unavoidable
+- Use network security (VPN, IPsec) for any remaining UDP legs
 - Monitor for unusual traffic
 - Implement account lockout policies
 
@@ -442,25 +445,23 @@ For compliance and forensic analysis, enable JSON audit logging:
 - ✅ Server version
 - ❌ Passwords (never log passwords)
 
-**Log Rotation:**
+**Log Rotation and Retention:**
 
-Use system tools like `logrotate` for audit log rotation:
+The server runs as a Kubernetes `Deployment` (the systemd unit was removed in v0.9.0), so there is no host `logrotate` hook and no `systemctl reload`. Send the audit trail to stdout and let the cluster log pipeline handle rotation and retention:
 
-```bash
-# /etc/logrotate.d/radius
-/var/log/radius/audit.log {
-    daily
-    rotate 90
-    compress
-    delaycompress
-    notifempty
-    create 0640 radius radius
-    sharedscripts
-    postrotate
-        systemctl reload radius
-    endscript
+```json
+{
+  "audit_log_path": "stdout"
 }
 ```
+
+`"stdout"` (or `"-"`) is recognized by the audit logger (`crates/radius-server/src/audit.rs`) and emits one JSON object per line, interleaved with the regular `tracing` output. From there:
+
+- **Node level**: the container runtime (containerd) rotates `/var/log/pods/...` according to the kubelet's `containerLogMaxSize` / `containerLogMaxFiles` settings.
+- **Cluster level**: ship the stream with your log collector (Fluent Bit, Vector, Promtail/Alloy, Datadog agent, etc.) and apply the 90-day retention required by your compliance program in the log store (Loki, Elasticsearch, S3, SIEM).
+- **Filtering**: audit entries carry `"event_type"`; filter on it in the collector to route the audit trail to a dedicated index or bucket separate from debug logs.
+
+If you must write to a file instead (for example a sidecar collector that tails a shared `emptyDir`), the server appends to `audit_log_path` without rotating it; the sidecar is responsible for rotation, and the server does not need to be signalled after rotation because it reopens nothing (rotate by copy-truncate).
 
 ### Monitoring
 
@@ -488,12 +489,14 @@ Monitor for security events:
 2. **Investigation**:
 
    ```bash
-   # Check recent auth failures
-   grep "REJECT" /var/log/radius.log | tail -100
+   # Recent auth failures (audit sink on stdout)
+   kubectl -n radius logs deploy/usg-radius-server --since=1h | grep '"event_type":"auth_failure"' | tail -100
 
-   # Check specific user
-   grep "user=alice" /var/log/radius.log
+   # Specific user
+   kubectl -n radius logs deploy/usg-radius-server --since=24h | grep '"username":"alice"'
    ```
+
+   Use your log store's query language (LogQL, KQL, etc.) for anything older than the pod's local log window.
 
 3. **Response**:
    - Lock compromised accounts
@@ -533,30 +536,86 @@ Different industries have different requirements:
 - Implement account lockout
 - Monitor and log access
 
+## Transport Security (RadSec)
+
+RadSec (RADIUS over TLS, RFC 6614) shipped in v0.10.0 and is the **default transport for configuration files**. It replaces the shared-secret + source-IP trust model with mutually authenticated TLS:
+
+- ✅ **TLS 1.3 only**, ML-KEM-1024-only key exchange (FIPS 203) via the shared `usg-fips-tls` provider; the negotiated parameters are re-checked after the handshake and the connection is dropped if anything falls outside the allow-list.
+- ✅ **Mutual TLS**: every NAS presents a client certificate verified against `radsec.client_ca_path`. The certificate Common Name is the server's authenticated notion of "which switch" and is the identity used to address CoA/Disconnect requests.
+- ✅ **Forward secrecy** from the ephemeral ML-KEM key exchange.
+- ✅ Inside the tunnel the payload is standard RADIUS using the fixed secret `"radsec"` (RFC 6614 §2.3); the real protection is the TLS layer.
+- ✅ Authentication, accounting, Status-Server and server-originated CoA/Disconnect (RFC 5176) share one long-lived connection per NAS on 2083/tcp.
+
+**Configuration** (`transport` selects the listener; `radsec` is required when `transport` is `"radsec"`):
+
+```json
+{
+  "transport": "radsec",
+  "radsec": {
+    "listen_address": "::",
+    "listen_port": 2083,
+    "cert_path": "/etc/radius/radsec/server.pem",
+    "key_path": "/etc/radius/radsec/server-key.pem",
+    "client_ca_path": "/etc/radius/radsec/nas-ca.pem"
+  }
+}
+```
+
+| `transport` | Listener | Trust model | Notes |
+|-------------|----------|-------------|-------|
+| `"radsec"` (default for config files) | 2083/tcp, TLS 1.3 mTLS | NAS client certificate | Requires the `tls` cargo feature (built into the container image since v0.10.1) |
+| `"udp-insecure"` | `listen_port`/udp (1812) | Shared secret + source IP | **Not FIPS-approved**, spoofable; logs a prominent startup warning. Only for development against legacy NASes |
+
+Limitations: no DTLS (RFC 7360), no certificate hot-rotation (restart the pod to pick up renewed certificates), and no CRL/OCSP check on NAS certificates yet (the `revocation` module in `radius-proto` is not wired into the server).
+
+## Management API Authentication
+
+The management API (`/api/v1/*`, including `PUT /api/v1/policy` and `POST /api/v1/coa`) is protected by an optional `mgmt` block (v0.9.0): mutual TLS on the listener plus an AWS-IAM-style attribute-based access policy with explicit-deny-wins and default-deny. **Without a `mgmt` block the API is open** and the server logs a warning at startup, so configure it before exposing the port beyond the pod network.
+
+```json
+{
+  "mgmt": {
+    "tls": {
+      "cert_path": "/etc/radius/mgmt/server.pem",
+      "key_path": "/etc/radius/mgmt/server-key.pem",
+      "client_ca_path": "/etc/radius/mgmt/client-ca.pem"
+    },
+    "access_policy_file": "/etc/radius/access-policy.json",
+    "trust_forwarded_identity": true
+  }
+}
+```
+
+- `tls.client_ca_path` present ⇒ client certificates are required and verified.
+- `access_policy_file` set ⇒ authorization is enforced; the policy can be hot-reloaded with `SIGHUP` and never fails open.
+- Authorization denials are written to the JSON audit log as `unauthorized_client` events.
+
+See [Management API Authentication](mgmt-api-auth.md) for the policy schema, condition keys, and the BFF client-certificate setup.
+
+## EAP Methods
+
+- ✅ **EAP-TLS** (RFC 5216): certificate-based 802.1X with mutual TLS, MSK/EMSK derivation via RFC 5705. See [EAP-TLS](../protocol/EAP-TLS.md).
+- ⚠️ **EAP-TEAP** (RFC 7170): TLS tunnel and TLV protocol with RFC-correct Crypto-Binding; inner methods producing real keying material are still pending.
+- ✅ **Message-Authenticator** is required on every EAP Access-Request (RFC 3579 §3.2, Blast-RADIUS / CVE-2024-3596 mitigation) and added to every EAP-bearing reply.
+- ❌ EAP-TTLS and PEAP are not planned; use EAP-TLS or EAP-TEAP.
+- ✅ **MS-MPPE-Send-Key / MS-MPPE-Recv-Key** (RFC 2548 §2.4) are attached to the EAP Access-Accept, salt-encrypted under the client secret, so the NAS receives the PMK for the 802.11i 4-way handshake (since v0.11.0). The proxy re-encrypts them (and Tunnel-Password) for the NAS and re-keys User-Password / Message-Authenticator for the home server.
+
 ## Future Enhancements
 
-Planned security improvements:
+Remaining security work:
 
-1. **RadSec (RADIUS over TLS/DTLS)**:
-   - End-to-end encryption
-   - Certificate-based authentication
-   - Perfect Forward Secrecy
-
-2. **Modern Crypto**:
-   - Support for SHA-256
-   - ChaCha20-Poly1305
-   - Modern key derivation
-
-3. **EAP Methods**:
-   - EAP-TLS
-   - EAP-TTLS
-   - EAP-PEAP
+1. **RadSec**: DTLS transport, certificate hot-rotation, revocation checking of NAS certificates
+2. **EAP**: EAP-TEAP inner methods with real IMSK, CRL/OCSP integration for client certificates
+3. **Status-Server**: verify Message-Authenticator (RFC 5997 §4.1)
+4. **Modern Crypto for UDP**: the UDP transport is bound to MD5 by RFC 2865; prefer RadSec rather than waiting for stronger UDP primitives
 
 ## Security Checklist
 
 Before deploying to production:
 
-- [ ] Strong shared secrets (16+ characters)
+- [ ] RadSec transport enabled (`transport: "radsec"`) with a NAS client CA; `udp-insecure` only where unavoidable
+- [ ] Management API protected (`mgmt.tls.client_ca_path` and `mgmt.access_policy_file` set)
+- [ ] Strong shared secrets (16+ characters) for any `udp-insecure` clients
 - [ ] Unique secrets per client
 - [ ] Firewall rules restricting access
 - [ ] Network isolation or VPN
@@ -565,7 +624,7 @@ Before deploying to production:
 - [ ] Strong password policy
 - [ ] Account lockout implemented
 - [ ] Comprehensive logging enabled (`log_level: "info"`)
-- [ ] JSON audit trail enabled (`audit_log_path` configured)
+- [ ] JSON audit trail enabled (`audit_log_path` set to `"stdout"` or a collected file)
 - [ ] Strict RFC compliance enabled (`strict_rfc_compliance: true`)
 - [ ] Rate limiting configured appropriately
 - [ ] Request deduplication cache enabled
@@ -574,18 +633,22 @@ Before deploying to production:
 - [ ] Regular security audits scheduled
 - [ ] Secret rotation procedure defined
 - [ ] Backup and recovery tested
-- [ ] Log rotation configured (logrotate)
+- [ ] Log retention configured in the cluster log pipeline (collector + store)
 
 ## References
 
 - [RFC 2865 - RADIUS](https://tools.ietf.org/html/rfc2865)
 - [RFC 2866 - RADIUS Accounting](https://tools.ietf.org/html/rfc2866)
 - [RFC 3579 - RADIUS EAP Support](https://tools.ietf.org/html/rfc3579)
+- [RFC 5176 - Dynamic Authorization Extensions (CoA/Disconnect)](https://tools.ietf.org/html/rfc5176)
+- [RFC 5216 - EAP-TLS](https://tools.ietf.org/html/rfc5216)
 - [RFC 6614 - RADIUS over TLS (RadSec)](https://tools.ietf.org/html/rfc6614)
+- [RFC 7170 - EAP-TEAP](https://tools.ietf.org/html/rfc7170)
 - [NIST SP 800-63B - Digital Identity Guidelines](https://pages.nist.gov/800-63-3/sp800-63b.html)
 
 ## Next Steps
 
 - [Server Configuration](../configuration/server.md)
 - [Client Configuration](../configuration/clients.md)
+- [Management API Authentication](mgmt-api-auth.md)
 - [Monitoring and Logging](monitoring.md) (future)

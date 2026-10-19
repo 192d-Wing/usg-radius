@@ -332,7 +332,7 @@ mod tests {
     fn test_crl_config_default() {
         let config = CrlConfig::default();
         assert_eq!(config.static_crl_paths.len(), 0);
-        assert_eq!(config.enable_http_fetch, true);
+        assert!(config.enable_http_fetch);
         assert_eq!(config.http_timeout_secs, 5);
         assert_eq!(config.cache_ttl_secs, 3600);
         assert_eq!(config.max_cache_entries, 100);
@@ -348,14 +348,14 @@ mod tests {
         let config = CrlConfig::static_files(paths.clone());
 
         assert_eq!(config.static_crl_paths, paths);
-        assert_eq!(config.enable_http_fetch, false);
+        assert!(!config.enable_http_fetch);
     }
 
     #[test]
     fn test_crl_config_http_fetch() {
         let config = CrlConfig::http_fetch(10, 7200, 200);
 
-        assert_eq!(config.enable_http_fetch, true);
+        assert!(config.enable_http_fetch);
         assert_eq!(config.http_timeout_secs, 10);
         assert_eq!(config.cache_ttl_secs, 7200);
         assert_eq!(config.max_cache_entries, 200);

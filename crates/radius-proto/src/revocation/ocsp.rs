@@ -905,6 +905,7 @@ impl OcspClient {
     /// # Arguments
     /// * `timeout` - HTTP request timeout in seconds
     pub fn new(timeout: u64) -> Result<Self, RevocationError> {
+        super::ensure_default_crypto_provider();
         let http_client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(timeout))
             .build()

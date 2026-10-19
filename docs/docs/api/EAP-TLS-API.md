@@ -584,13 +584,14 @@ ctx.server_random = Some(extract_server_random_from_tls());
 // Derive keys
 ctx.derive_session_keys()?;
 
-// Get MSK for RADIUS MS-MPPE keys
+// Get MSK for RADIUS MS-MPPE keys (RFC 2548 §2.4): Recv-Key = MSK[0..32],
+// Send-Key = MSK[32..64]. Encryption needs the client's shared secret and the
+// Request Authenticator of the Access-Request being answered.
 if let Some(msk) = ctx.get_msk() {
-    let send_key = &msk[0..32];
-    let recv_key = &msk[32..64];
-
-    // Add to RADIUS Access-Accept
-    add_ms_mppe_keys(&mut radius_packet, send_key, recv_key);
+    let keys = radius_proto::MppeKeys::from_msk(msk)?;
+    for attr in keys.to_attributes(shared_secret, &request.authenticator)? {
+        radius_packet.add_attribute(attr);
+    }
 }
 
 // Send EAP-Success

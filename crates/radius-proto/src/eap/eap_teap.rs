@@ -40,7 +40,7 @@ use super::eap_tls::{EapTlsPacket, EapTlsServer};
 use std::sync::Arc;
 
 // Cryptographic imports for Crypto-Binding
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 /// TEAP TLV Type (RFC 7170 Section 4.2)
@@ -611,45 +611,81 @@ impl CryptoBinding {
     ///                   IMSK[0], 60)
     ///
     /// Where session_key_seed is derived from TLS master secret.
+    ///
+    /// TLS-PRF is the TLS 1.2 PRF (RFC 5246 §5, `P_SHA256`), matching
+    /// hostapd's `eap_teap_derive_imck`.
     pub fn derive_imck(session_key_seed: &[u8], imsk: &[u8]) -> Vec<u8> {
-        // For MVP, use HMAC-SHA256 as TLS-PRF with expansion to 60 bytes
-        // In production, should use actual TLS PRF from the TLS version negotiated
+        Self::tls_prf_sha256(
+            session_key_seed,
+            b"Inner Methods Compound Keys",
+            imsk,
+            Self::IMCK_LENGTH,
+        )
+    }
 
-        let label = b"Inner Methods Compound Keys";
+    /// Length of IMCK[j] (RFC 7170 §5.2: 60 octets).
+    pub const IMCK_LENGTH: usize = 60;
 
-        // HMAC-SHA256 produces 32 bytes, we need 60 bytes
-        // Use iterative HMAC to expand the output
-        let mut output = Vec::with_capacity(60);
+    /// Length of CMK[j] (RFC 7170 §5.2: the last 20 octets of IMCK[j]).
+    pub const CMK_LENGTH: usize = 20;
 
-        // First iteration: HMAC(seed, label || imsk || 0x01)
-        let mut mac = Hmac::<Sha256>::new_from_slice(session_key_seed)
-            .expect("HMAC can take key of any size");
-        mac.update(label);
-        mac.update(imsk);
-        mac.update(&[0x01]);
-        let a1 = mac.finalize().into_bytes();
-        output.extend_from_slice(&a1);
+    /// Derive CMK (Compound MAC Key) from IMCK - RFC 7170 Section 5.2
+    ///
+    /// CMK[j] = last 20 octets of IMCK[j] (octets 40..60); S-IMCK[j] is the
+    /// first 40, so the two never overlap.
+    pub fn derive_cmk(imck: &[u8]) -> Vec<u8> {
+        imck[Self::S_IMCK_LENGTH..Self::S_IMCK_LENGTH + Self::CMK_LENGTH].to_vec()
+    }
 
-        // Second iteration: HMAC(seed, A1 || label || imsk || 0x02)
-        let mut mac = Hmac::<Sha256>::new_from_slice(session_key_seed)
-            .expect("HMAC can take key of any size");
-        mac.update(&a1);
-        mac.update(label);
-        mac.update(imsk);
-        mac.update(&[0x02]);
-        let a2 = mac.finalize().into_bytes();
-        output.extend_from_slice(&a2);
+    /// Length of S-IMCK[j] (RFC 7170 §5.2: the first 40 octets of IMCK[j]).
+    pub const S_IMCK_LENGTH: usize = 40;
 
-        // Truncate to 60 bytes
-        output.truncate(60);
+    /// S-IMCK[j] — the first 40 octets of IMCK[j] (RFC 7170 §5.2), the secret
+    /// the MSK and EMSK are derived from.
+    pub fn s_imck(&self) -> &[u8] {
+        &self.imck[..Self::S_IMCK_LENGTH]
+    }
+
+    /// TLS 1.2 PRF (RFC 5246 §5, `P_SHA256(secret, label || seed)`) truncated
+    /// to `length` octets — the "TLS-PRF" RFC 7170 §5 refers to.
+    pub fn tls_prf_sha256(secret: &[u8], label: &[u8], seed: &[u8], length: usize) -> Vec<u8> {
+        let hmac = |key: &[u8], parts: &[&[u8]]| {
+            let mut mac =
+                Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
+            for part in parts {
+                mac.update(part);
+            }
+            mac.finalize().into_bytes()
+        };
+        let mut label_seed = Vec::with_capacity(label.len() + seed.len());
+        label_seed.extend_from_slice(label);
+        label_seed.extend_from_slice(seed);
+
+        let mut output = Vec::with_capacity(length + 32);
+        let mut a = hmac(secret, &[&label_seed]); // A(1)
+        while output.len() < length {
+            output.extend_from_slice(&hmac(secret, &[&a, &label_seed]));
+            a = hmac(secret, &[&a]); // A(i+1)
+        }
+        output.truncate(length);
         output
     }
 
-    /// Derive CMK (Compound MAC Key) from IMCK - RFC 7170 Section 5.3
-    ///
-    /// CMK = First 20 bytes of IMCK
-    pub fn derive_cmk(imck: &[u8]) -> Vec<u8> {
-        imck[..20].to_vec()
+    /// EAP MSK of the TEAP conversation (RFC 7170 §5.4):
+    /// `MSK = TLS-PRF(S-IMCK[j], "Session Key Generating Function", 64)`.
+    pub fn derive_msk(&self) -> Vec<u8> {
+        Self::tls_prf_sha256(self.s_imck(), b"Session Key Generating Function", &[], 64)
+    }
+
+    /// EAP EMSK of the TEAP conversation (RFC 7170 §5.4):
+    /// `EMSK = TLS-PRF(S-IMCK[j], "Extended Session Key Generating Function", 64)`.
+    pub fn derive_emsk(&self) -> Vec<u8> {
+        Self::tls_prf_sha256(
+            self.s_imck(),
+            b"Extended Session Key Generating Function",
+            &[],
+            64,
+        )
     }
 
     /// Calculate Compound MAC - RFC 7170 Section 5.3
@@ -686,7 +722,7 @@ impl CryptoBinding {
 
     /// Generate random nonce
     pub fn generate_nonce() -> [u8; 32] {
-        use rand::Rng;
+        use rand::RngExt;
         let mut nonce = [0u8; 32];
         rand::rng().fill(&mut nonce);
         nonce
@@ -758,6 +794,10 @@ pub struct EapTeapServer {
     /// computation/verification (since BUFFER is `history || cb_tlv_zeroed`).
     phase2_tlv_history: Vec<u8>,
 
+    /// Set once the peer's Crypto-Binding response verified, i.e. the inner
+    /// method succeeded *and* is bound to this tunnel. Gates `get_msk`.
+    crypto_binding_verified: bool,
+
     /// Test-only override for `session_key_seed`.
     ///
     /// When set, `derive_session_key_seed` returns this value instead of
@@ -791,6 +831,7 @@ impl EapTeapServer {
             intermediate_results: Vec::new(),
             crypto_binding: None,
             phase2_tlv_history: Vec::new(),
+            crypto_binding_verified: false,
             #[cfg(test)]
             test_session_key_seed: None,
         }
@@ -813,6 +854,7 @@ impl EapTeapServer {
             intermediate_results: Vec::new(),
             crypto_binding: None,
             phase2_tlv_history: Vec::new(),
+            crypto_binding_verified: false,
             #[cfg(test)]
             test_session_key_seed: None,
         }
@@ -836,6 +878,19 @@ impl EapTeapServer {
     /// Check if TEAP authentication is complete
     pub fn is_complete(&self) -> bool {
         self.phase == TeapPhase::Complete
+    }
+
+    /// EAP MSK (RFC 7170 §5.4) for the MS-MPPE keys on the Access-Accept.
+    ///
+    /// `Some` only after the inner method succeeded and the peer's
+    /// Crypto-Binding response verified; a failed or unbound conversation
+    /// yields no keying material. Derived from S-IMCK[j] with the TLS 1.2 PRF
+    /// (`P_SHA256`).
+    pub fn get_msk(&self) -> Option<Vec<u8>> {
+        if !self.crypto_binding_verified {
+            return None;
+        }
+        self.crypto_binding.as_ref().map(CryptoBinding::derive_msk)
     }
 
     /// Derive `session_key_seed` for Crypto-Binding (RFC 7170 §5.2).
@@ -1265,6 +1320,7 @@ impl EapTeapServer {
                         crypto_binding.client_nonce = Some(cb_response.nonce);
                     }
                     self.phase = TeapPhase::Complete;
+                    self.crypto_binding_verified = mac_ok;
                     let result_tlv = if mac_ok {
                         TeapResult::Success.to_result_tlv()
                     } else {
@@ -1314,6 +1370,7 @@ impl EapTeapServer {
         }
 
         self.phase = TeapPhase::Complete;
+        self.crypto_binding_verified = mac_ok;
         let result_tlv = if mac_ok {
             TeapResult::Success.to_result_tlv()
         } else {
@@ -1620,7 +1677,7 @@ impl EapPayloadHandler {
 
     /// Create EAP-MD5 Challenge request
     fn create_md5_challenge_request(&mut self) -> TeapTlv {
-        use rand::Rng;
+        use rand::RngExt;
 
         let identifier = self.next_identifier();
 
@@ -1780,7 +1837,7 @@ mod tests {
     fn test_tlv_new() {
         let tlv = TeapTlv::new(TlvType::Result, true, vec![0x00, 0x01]);
         assert_eq!(tlv.tlv_type, 3);
-        assert_eq!(tlv.mandatory, true);
+        assert!(tlv.mandatory);
         assert_eq!(tlv.value, vec![0x00, 0x01]);
     }
 
@@ -1817,7 +1874,7 @@ mod tests {
         let (tlv, consumed) = TeapTlv::from_bytes(&data).unwrap();
         assert_eq!(consumed, 6);
         assert_eq!(tlv.tlv_type, 3);
-        assert_eq!(tlv.mandatory, true);
+        assert!(tlv.mandatory);
         assert_eq!(tlv.value, vec![0x00, 0x01]);
     }
 
@@ -1876,7 +1933,7 @@ mod tests {
         let tlv = result.to_result_tlv();
 
         assert_eq!(tlv.tlv_type, 3);
-        assert_eq!(tlv.mandatory, true);
+        assert!(tlv.mandatory);
         assert_eq!(tlv.value, vec![0x00, 0x01]);
 
         let parsed = TeapResult::from_result_tlv(&tlv).unwrap();
@@ -1900,7 +1957,7 @@ mod tests {
         let tlv = result.to_intermediate_result_tlv();
 
         assert_eq!(tlv.tlv_type, 10); // Intermediate-Result
-        assert_eq!(tlv.mandatory, true);
+        assert!(tlv.mandatory);
     }
 
     #[test]
@@ -1909,7 +1966,7 @@ mod tests {
         let tlv = identity.to_tlv();
 
         assert_eq!(tlv.tlv_type, 2); // Identity-Type
-        assert_eq!(tlv.mandatory, true);
+        assert!(tlv.mandatory);
         assert_eq!(tlv.value, vec![0x00, 0x01]);
 
         let parsed = IdentityType::from_tlv(&tlv).unwrap();
@@ -2501,7 +2558,7 @@ mod tests {
         // Note: Can't test actual encryption without completing handshake
         // This test now validates that the function signature is correct
         // Full encryption testing requires integration test with real TLS handshake
-        let result = server.encrypt_and_send_tlvs(&[tlv.clone()]);
+        let result = server.encrypt_and_send_tlvs(std::slice::from_ref(&tlv));
 
         // Should succeed (will encrypt once handshake is complete in real usage)
         assert!(result.is_ok());
@@ -2539,11 +2596,44 @@ mod tests {
         let imck = CryptoBinding::derive_imck(&session_key_seed, &imsk);
         let cmk = CryptoBinding::derive_cmk(&imck);
 
-        // CMK should be 20 bytes (first 20 bytes of IMCK)
+        // RFC 7170 §5.2: CMK[j] is the last 20 octets of the 60-octet IMCK[j]
+        assert_eq!(imck.len(), 60);
         assert_eq!(cmk.len(), 20);
+        assert_eq!(&cmk[..], &imck[40..60]);
 
-        // Should match first 20 bytes of IMCK
-        assert_eq!(&cmk[..], &imck[..20]);
+        // S-IMCK[j] is the first 40 octets; CMK must not overlap it
+        let cb = CryptoBinding::new(&session_key_seed, &imsk);
+        assert_eq!(cb.s_imck(), &cb.imck[..40]);
+        assert_eq!(&cb.cmk[..], &cb.imck[40..]);
+        assert_ne!(&cb.cmk[..], &cb.s_imck()[..20]);
+    }
+
+    #[test]
+    fn test_crypto_binding_imck_is_tls12_prf() {
+        // IMCK[0] = TLS-PRF(session_key_seed, "Inner Methods Compound Keys", IMSK[0], 60)
+        // Reference value computed with an independent P_SHA256 (RFC 5246 §5)
+        // implementation for session_key_seed = 0x01*32, IMSK = 0x02*32.
+        let session_key_seed = vec![0x01; 32];
+        let imsk = vec![0x02; 32];
+
+        let imck = CryptoBinding::derive_imck(&session_key_seed, &imsk);
+        assert_eq!(
+            imck,
+            CryptoBinding::tls_prf_sha256(
+                &session_key_seed,
+                b"Inner Methods Compound Keys",
+                &imsk,
+                60
+            )
+        );
+
+        let expected = "b28ef7509fc65d482b822c35a530a1dfd22b798ba367e7d5ea8136bd4acc6b17\
+                        bbabbe9d422de41cfdb162f6daae8252fde8ee0a0eeec93d85c45c8c";
+        let expected: Vec<u8> = (0..expected.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&expected[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(imck, expected);
     }
 
     #[test]
@@ -3313,5 +3403,135 @@ mod tests {
         // Handshake not complete -> InvalidState.
         let result = server.export_keying_material(b"some label", None, 32);
         assert!(matches!(result, Err(EapError::InvalidState)));
+    }
+
+    // --- RFC 7170 §5.4 MSK derivation ------------------------------------------
+
+    /// TLS 1.2 PRF known-answer vector (SHA-256), as published on the IETF TLS
+    /// list and reproduced in the Go and mbedTLS test suites.
+    #[test]
+    fn tls_prf_sha256_matches_published_vector() {
+        let secret = [
+            0x9b, 0xbe, 0x43, 0x6b, 0xa9, 0x40, 0xf0, 0x17, 0xb1, 0x76, 0x52, 0x84, 0x9a, 0x71,
+            0xdb, 0x35,
+        ];
+        let seed = [
+            0xa0, 0xba, 0x9f, 0x93, 0x6c, 0xda, 0x31, 0x18, 0x27, 0xa6, 0xf7, 0x96, 0xff, 0xd5,
+            0x19, 0x8c,
+        ];
+        let out = CryptoBinding::tls_prf_sha256(&secret, b"test label", &seed, 100);
+        let expected = "e3f229ba727be17b8d122620557cd453c2aab21d07c3d495329b52d4e61edb5a6b301791e90d35c9c9a46b4e14baf9af0fa022f7077def17abfd3797c0564bab4fbc91666e9def9b97fce34f796789baa48082d122ee42c5a72e5a5110fff70187347b66";
+        assert_eq!(hex::encode(out), expected);
+    }
+
+    #[test]
+    fn msk_and_emsk_derive_from_s_imck_with_distinct_labels() {
+        let cb = CryptoBinding::new(&[0x11u8; 40], &[0x22u8; 32]);
+        assert_eq!(cb.s_imck().len(), CryptoBinding::S_IMCK_LENGTH);
+        assert_eq!(cb.s_imck(), &cb.imck[..40]);
+
+        let msk = cb.derive_msk();
+        let emsk = cb.derive_emsk();
+        assert_eq!(msk.len(), 64);
+        assert_eq!(emsk.len(), 64);
+        assert_ne!(msk, emsk);
+        assert_eq!(
+            msk,
+            CryptoBinding::tls_prf_sha256(
+                &cb.imck[..40],
+                b"Session Key Generating Function",
+                &[],
+                64
+            )
+        );
+        // Different inner keys → different MSK.
+        let other = CryptoBinding::new(&[0x11u8; 40], &[0x23u8; 32]);
+        assert_ne!(other.derive_msk(), msk);
+    }
+
+    /// Build a TEAP server positioned just after a successful inner
+    /// Basic-Password-Auth, i.e. having sent its Crypto-Binding request.
+    fn server_awaiting_crypto_binding() -> EapTeapServer {
+        use std::sync::Arc as StdArc;
+        // Several rustls providers may be compiled in under --all-features;
+        // `ServerConfig::builder()` then needs an explicit process default.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let config = StdArc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(StdArc::new(
+                    rustls::server::ResolvesServerCertUsingSni::new(),
+                )),
+        );
+        let handler = BasicPasswordAuthHandler::new("alice".to_string(), "secret".to_string());
+        let mut server = EapTeapServer::with_inner_method(config, Box::new(handler));
+        server.initialize_connection().unwrap();
+        server.test_session_key_seed = Some(vec![0x5Au8; 40]);
+        server.phase = TeapPhase::Phase2InnerAuth;
+
+        let mut value = Vec::new();
+        value.extend_from_slice(&5u16.to_be_bytes());
+        value.extend_from_slice(b"alice");
+        value.extend_from_slice(&6u16.to_be_bytes());
+        value.extend_from_slice(b"secret");
+        let password_response = TeapTlv::new(TlvType::BasicPasswordAuthResp, true, value);
+        server
+            .process_phase2_tlvs_test(&[password_response])
+            .unwrap();
+        assert!(server.crypto_binding.is_some());
+        server
+    }
+
+    fn crypto_binding_response(server: &EapTeapServer, valid_mac: bool) -> TeapTlv {
+        let template = CryptoBindingTlv {
+            version: CryptoBindingTlv::VERSION,
+            received_version: CryptoBindingTlv::VERSION,
+            sub_type: CryptoBindingTlv::SUBTYPE_RESPONSE,
+            nonce: [0x77u8; 32],
+            compound_mac: vec![0u8; 32],
+        };
+        let compound_mac = if valid_mac {
+            let mut buffer = server.phase2_tlv_history.clone();
+            buffer.extend_from_slice(&template.to_tlv().to_bytes());
+            CryptoBinding::calculate_compound_mac(
+                &server.crypto_binding.as_ref().unwrap().cmk,
+                &buffer,
+            )
+        } else {
+            vec![0xEEu8; 32]
+        };
+        CryptoBindingTlv {
+            compound_mac,
+            ..template
+        }
+        .to_tlv()
+    }
+
+    #[test]
+    fn get_msk_available_only_after_verified_crypto_binding() {
+        let mut server = server_awaiting_crypto_binding();
+        assert!(
+            server.get_msk().is_none(),
+            "no MSK before the peer's binding"
+        );
+
+        let response = crypto_binding_response(&server, true);
+        server.process_phase2_tlvs_test(&[response]).unwrap();
+        assert!(server.is_complete());
+
+        let msk = server.get_msk().expect("MSK after verified crypto-binding");
+        assert_eq!(msk.len(), 64);
+        assert_eq!(msk, server.crypto_binding.as_ref().unwrap().derive_msk());
+    }
+
+    #[test]
+    fn get_msk_withheld_when_crypto_binding_fails() {
+        let mut server = server_awaiting_crypto_binding();
+        let response = crypto_binding_response(&server, false);
+        server.process_phase2_tlvs_test(&[response]).unwrap();
+        // The conversation is over (Result=Failure sent) but no key material
+        // may leak to the Access-Accept builder.
+        assert!(server.is_complete());
+        assert!(server.get_msk().is_none());
     }
 }

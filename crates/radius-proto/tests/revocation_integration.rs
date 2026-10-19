@@ -295,7 +295,7 @@ fn test_crl_cache_integration() {
     // 2. Second request: cache hit → no HTTP fetch
     // 3. After TTL: cache expired → HTTP fetch → cache update
 
-    assert!(true, "CRL caching integration requires HTTP server setup");
+    // Placeholder: CRL caching integration requires HTTP server setup.
 }
 
 /// Integration test with EAP-TLS
@@ -309,10 +309,7 @@ fn test_eap_tls_revocation_integration() {
     // 4. Check revocation
     // 5. Accept or reject authentication
 
-    assert!(
-        true,
-        "EAP-TLS integration requires full TLS handshake setup"
-    );
+    // Placeholder: EAP-TLS integration requires full TLS handshake setup.
 }
 
 // Future integration tests to add:
@@ -440,7 +437,7 @@ fn test_ocsp_config_json_serialization() {
     // Deserialize from JSON
     let deserialized: RevocationConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized.check_mode, RevocationCheckMode::PreferOcsp);
-    assert_eq!(deserialized.ocsp_config.enabled, true);
+    assert!(deserialized.ocsp_config.enabled);
 }
 
 /// Test OCSP disabled configuration
@@ -473,12 +470,12 @@ fn test_production_ocsp_configuration_example() {
         },
         ocsp_config: OcspConfig {
             enabled: true,
-            http_timeout_secs: 5,   // 5 second timeout for OCSP
-            cache_ttl_secs: 3600,   // Cache responses for 1 hour
-            max_cache_entries: 100, // Cache up to 100 responses
-            enable_nonce: true,     // Enable replay protection
-            max_response_size_bytes: 1 * 1024 * 1024, // 1 MB limit
-            prefer_ocsp: true,      // Prefer OCSP over CRL
+            http_timeout_secs: 5,                 // 5 second timeout for OCSP
+            cache_ttl_secs: 3600,                 // Cache responses for 1 hour
+            max_cache_entries: 100,               // Cache up to 100 responses
+            enable_nonce: true,                   // Enable replay protection
+            max_response_size_bytes: 1024 * 1024, // 1 MB limit
+            prefer_ocsp: true,                    // Prefer OCSP over CRL
         },
     };
 

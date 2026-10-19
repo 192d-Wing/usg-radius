@@ -8,7 +8,7 @@
 
 use crate::proxy::error::{ProxyError, ProxyResult};
 use crate::proxy::home_server::{HomeServer, HomeServerConfig};
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -285,9 +285,9 @@ mod tests {
         // Should cycle through all 3 servers
         assert_eq!(selections.len(), 9);
         // Pattern should repeat: Server0, Server1, Server2, Server0, Server1, Server2, ...
-        for i in 0..9 {
+        for (i, selection) in selections.iter().enumerate() {
             let expected = format!("Server{}", i % 3);
-            assert_eq!(selections[i], expected);
+            assert_eq!(*selection, expected);
         }
     }
 

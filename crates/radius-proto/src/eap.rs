@@ -874,7 +874,7 @@ pub mod eap_tls {
     ///
     /// PRF(secret, label, seed) = P_SHA256(secret, label + seed)
     fn tls_prf_sha256(secret: &[u8], label: &[u8], seed: &[u8], output_len: usize) -> Vec<u8> {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         type HmacSha256 = Hmac<Sha256>;
 
         // Combine label and seed
@@ -1313,6 +1313,11 @@ pub mod eap_tls {
         Ok(server_config)
     }
 
+    /// EAP Type-Code of EAP-TLS (RFC 5216): the exporter context octet
+    /// RFC 9190 §2.3 / §2.5 prescribe for TLS 1.3 key and Session-Id derivation.
+    pub const EAP_TLS_TYPE_CODE: u8 = 13;
+    const EAP_TLS_TYPE_CODE_CONTEXT: &[u8] = &[EAP_TLS_TYPE_CODE];
+
     /// EAP-TLS Server Handler
     ///
     /// Manages TLS handshake for a single EAP-TLS authentication session.
@@ -1325,6 +1330,12 @@ pub mod eap_tls {
         context: EapTlsContext,
         /// Server configuration
         config: std::sync::Arc<rustls::ServerConfig>,
+        /// Whether the RFC 9190 Section 2.5 "protected success indication"
+        /// (commitment message) has been emitted. TLS 1.3 EAP-TLS requires the
+        /// server to send a TLS application-data record of one `0x00` octet and
+        /// have the peer acknowledge it before EAP-Success; the peer derives no
+        /// key otherwise. Always false for a TLS 1.2 session.
+        commitment_sent: bool,
     }
 
     #[cfg(feature = "tls")]
@@ -1335,6 +1346,7 @@ pub mod eap_tls {
                 connection: None,
                 context: EapTlsContext::new(),
                 config,
+                commitment_sent: false,
             }
         }
 
@@ -1405,6 +1417,46 @@ pub mod eap_tls {
                 .unwrap_or(false)
         }
 
+        /// True once the TLS handshake has negotiated TLS 1.3. EAP-TLS over
+        /// TLS 1.3 (RFC 9190) needs the commitment-message exchange; EAP-TLS
+        /// over TLS 1.2 (RFC 5216) does not.
+        pub fn is_tls13(&self) -> bool {
+            self.connection.as_ref().and_then(|c| c.protocol_version())
+                == Some(rustls::ProtocolVersion::TLSv1_3)
+        }
+
+        /// Whether the RFC 9190 Section 2.5 commitment message has been sent.
+        pub fn commitment_sent(&self) -> bool {
+            self.commitment_sent
+        }
+
+        /// Emit the RFC 9190 Section 2.5 "protected success indication": a TLS
+        /// 1.3 application-data record whose payload is a single `0x00` octet.
+        /// The caller fragments the returned record into an EAP-Request and
+        /// sends EAP-Success only after the peer acknowledges it. May only be
+        /// called once the handshake is complete; sets [`Self::commitment_sent`].
+        pub fn write_commitment_record(&mut self) -> Result<Vec<u8>, EapError> {
+            use std::io::Write as _;
+            let conn = self.connection.as_mut().ok_or(EapError::InvalidState)?;
+            if conn.is_handshaking() {
+                return Err(EapError::InvalidState);
+            }
+            conn.writer()
+                .write_all(&[0x00])
+                .map_err(|e| EapError::TlsError(format!("Failed to queue commitment: {}", e)))?;
+            let mut record = Vec::new();
+            conn.write_tls(&mut record).map_err(|e| {
+                EapError::TlsError(format!("Failed to encode commitment record: {}", e))
+            })?;
+            if record.is_empty() {
+                return Err(EapError::TlsError(
+                    "commitment message produced no TLS record".to_string(),
+                ));
+            }
+            self.commitment_sent = true;
+            Ok(record)
+        }
+
         /// True if there are still outgoing TLS fragments queued from a
         /// previous response that the peer hasn't received yet. The peer
         /// sends an EAP-TLS ACK (empty payload) after each non-final
@@ -1438,10 +1490,17 @@ pub mod eap_tls {
         ///
         /// # RFC 5216 Compliance
         ///
-        /// Per RFC 5216 Section 2.3, EAP-TLS derives the MSK and EMSK using:
-        /// - **Label**: "client EAP encryption" (22 bytes, ASCII)
-        /// - **Context**: None (empty context value)
-        /// - **Length**: 128 bytes (64 MSK + 64 EMSK)
+        /// The exporter parameters depend on the negotiated TLS version, and a
+        /// peer uses the same rule, so both ends agree on the MSK:
+        ///
+        /// - **TLS 1.2** (RFC 5216 §2.3): label `"client EAP encryption"`,
+        ///   no context, 128 octets.
+        /// - **TLS 1.3** (RFC 9190 §2.3): label
+        ///   `"EXPORTER_EAP_TLS_Key_Material"`, context = the one-octet EAP
+        ///   Type-Code `0x0D`, 128 octets.
+        ///
+        /// In both cases the first 64 octets are the MSK and the last 64 the
+        /// EMSK.
         ///
         /// The RFC 5705 exporter provides cryptographically secure key derivation
         /// that binds the keys to the specific TLS session, preventing key reuse
@@ -1480,21 +1539,25 @@ pub mod eap_tls {
 
             let conn = self.connection.as_ref().ok_or(EapError::InvalidState)?;
 
-            // RFC 5216 Section 2.3: Use RFC 5705 keying material exporter
-            // Label: "client EAP encryption"
-            // Context: None (empty)
-            // Output: 128 bytes (64 MSK + 64 EMSK)
-            let label = b"client EAP encryption";
+            // RFC 5705 keying material exporter, parameterised per TLS version:
+            // RFC 9190 §2.3 for TLS 1.3, RFC 5216 §2.3 for TLS 1.2. Using the
+            // TLS 1.2 label on a TLS 1.3 session would produce an MSK the
+            // supplicant does not share, and the 4-way handshake would fail.
+            let (label, context): (&[u8], Option<&[u8]>) =
+                if conn.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3) {
+                    (
+                        b"EXPORTER_EAP_TLS_Key_Material",
+                        Some(EAP_TLS_TYPE_CODE_CONTEXT),
+                    )
+                } else {
+                    (b"client EAP encryption", None)
+                };
             let mut keying_material = vec![0u8; 128];
 
-            conn.export_keying_material(
-                keying_material.as_mut_slice(),
-                label,
-                None, // No context value per RFC 5216
-            )
-            .map_err(|e| {
-                EapError::TlsError(format!("Failed to export keying material: {:?}", e))
-            })?;
+            conn.export_keying_material(keying_material.as_mut_slice(), label, context)
+                .map_err(|e| {
+                    EapError::TlsError(format!("Failed to export keying material: {:?}", e))
+                })?;
 
             // Split into MSK (first 64 bytes) and EMSK (last 64 bytes)
             let msk: [u8; 64] = keying_material[0..64]
@@ -1518,6 +1581,39 @@ pub mod eap_tls {
         /// Get the derived EMSK (Extended Master Session Key)
         pub fn get_emsk(&self) -> Option<&[u8; 64]> {
             self.context.get_emsk()
+        }
+
+        /// Negotiated TLS protocol version, once the handshake has chosen one.
+        pub fn protocol_version(&self) -> Option<rustls::ProtocolVersion> {
+            self.connection.as_ref().and_then(|c| c.protocol_version())
+        }
+
+        /// EAP Session-Id (RFC 5247 §5) for the EAP-Key-Name RADIUS attribute.
+        ///
+        /// Defined by RFC 9190 §2.5 for TLS 1.3 as
+        /// `0x0D || TLS-Exporter("EXPORTER_EAP_TLS_Method-Id", 0x0D, 64)`.
+        /// The TLS 1.2 form (RFC 5216 §2.3, `0x0D || client.random ||
+        /// server.random`) needs the handshake randoms, which rustls does not
+        /// expose, so this returns `None` for TLS 1.2 sessions and before the
+        /// handshake completes.
+        pub fn session_id(&self) -> Option<Vec<u8>> {
+            let conn = self.connection.as_ref()?;
+            if conn.is_handshaking()
+                || conn.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3)
+            {
+                return None;
+            }
+            let mut method_id = vec![0u8; 64];
+            conn.export_keying_material(
+                method_id.as_mut_slice(),
+                b"EXPORTER_EAP_TLS_Method-Id",
+                Some(EAP_TLS_TYPE_CODE_CONTEXT),
+            )
+            .ok()?;
+            let mut session_id = Vec::with_capacity(1 + method_id.len());
+            session_id.push(EAP_TLS_TYPE_CODE);
+            session_id.extend_from_slice(&method_id);
+            Some(session_id)
         }
 
         /// Export keying material from the TLS connection (RFC 5705)
@@ -2478,7 +2574,7 @@ mod tests {
             - 100;
 
         let age = session.age();
-        assert!(age >= 100 && age <= 102); // Allow small timing variations
+        assert!((100..=102).contains(&age)); // Allow small timing variations
     }
 
     #[test]
@@ -2873,7 +2969,7 @@ mod tests {
         add_eap_to_radius_packet(&mut radius, &eap).unwrap();
 
         // Should have EAP-Message attribute(s)
-        assert!(radius.attributes.len() > 0);
+        assert!(!radius.attributes.is_empty());
 
         // All added attributes should be EAP-Message
         for attr in &radius.attributes {
@@ -3215,10 +3311,10 @@ mod tests {
             assert_eq!(fragments[0].tls_message_length, Some(2000));
 
             // Middle fragments should have M flag
-            for i in 1..fragments.len() - 1 {
-                assert!(!fragments[i].flags.length_included());
-                assert!(fragments[i].flags.more_fragments());
-                assert!(fragments[i].tls_message_length.is_none());
+            for fragment in &fragments[1..fragments.len() - 1] {
+                assert!(!fragment.flags.length_included());
+                assert!(fragment.flags.more_fragments());
+                assert!(fragment.tls_message_length.is_none());
             }
 
             // Last fragment should have no M flag
@@ -3567,7 +3663,7 @@ mod tests {
             assert_eq!(config.server_cert_path, "test_certs/server.pem");
             assert_eq!(config.server_key_path, "test_certs/server-key.pem");
             assert_eq!(config.ca_cert_path, None);
-            assert_eq!(config.require_client_cert, false);
+            assert!(!config.require_client_cert);
         }
 
         #[test]
@@ -3582,7 +3678,7 @@ mod tests {
             assert_eq!(config.server_cert_path, "test_certs/server.pem");
             assert_eq!(config.server_key_path, "test_certs/server-key.pem");
             assert_eq!(config.ca_cert_path, Some("test_certs/ca.pem".to_string()));
-            assert_eq!(config.require_client_cert, true);
+            assert!(config.require_client_cert);
         }
 
         #[test]
@@ -3597,7 +3693,7 @@ mod tests {
 
             // build_server_config should fail with this configuration
             // (can't test actual call without cert files, but structure is validated)
-            assert_eq!(config.require_client_cert, true);
+            assert!(config.require_client_cert);
             assert_eq!(config.ca_cert_path, None);
         }
 
@@ -3630,7 +3726,7 @@ mod tests {
             // Should return Ok(false) when no peer certificate
             let result = server.verify_peer_identity("test@example.com");
             assert!(result.is_ok());
-            assert_eq!(result.unwrap(), false);
+            assert!(!result.unwrap());
         }
     }
 }

@@ -17,8 +17,8 @@ use radius_proto::auth::{
     decrypt_user_password,
 };
 use radius_proto::{
-    ChapChallenge, ChapResponse, Code, Packet, PacketError, ValidationMode, validate_packet,
-    verify_chap_response,
+    ChapChallenge, ChapResponse, Code, MppeKeys, Packet, PacketError, ValidationMode,
+    validate_packet, verify_chap_response,
 };
 use radius_proto::{calculate_message_authenticator, verify_message_authenticator};
 use std::net::SocketAddr;
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::UdpSocket;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Copy every Proxy-State attribute from `request` into `response`,
 /// preserving their relative order (RFC 2865 §5.33).
@@ -153,7 +153,18 @@ pub enum AuthResult {
     /// the AuthHandler returns from `get_accept_attributes`. EAP methods
     /// use this to attach the EAP-Success EAP-Message (RFC 3748 §4.2);
     /// for PAP/CHAP success pass an empty Vec.
-    Accept { attributes: Vec<Attribute> },
+    ///
+    /// `msk` is the EAP Master Session Key (RFC 3748 §7.10, ≥ 64 octets) of a
+    /// key-deriving EAP method. When present, the Access-Accept builder
+    /// encrypts it into MS-MPPE-Recv-Key (MSK[0..32]) and MS-MPPE-Send-Key
+    /// (MSK[32..64]) per RFC 2548 §2.4, using the shared secret in force for
+    /// the transport (per-client for UDP, `"radsec"` for RadSec) and the
+    /// Request Authenticator — neither of which the handler needs to know.
+    /// `None` for methods without key material (PAP/CHAP).
+    Accept {
+        attributes: Vec<Attribute>,
+        msk: Option<Vec<u8>>,
+    },
     /// Authentication failed
     Reject,
     /// Server needs more information (Access-Challenge)
@@ -168,11 +179,13 @@ pub enum AuthResult {
 }
 
 impl AuthResult {
-    /// Shorthand for `AuthResult::Accept { attributes: vec![] }` — use when
-    /// the response carries no protocol-specific attributes (typical PAP/CHAP).
+    /// Shorthand for `AuthResult::Accept { attributes: vec![], msk: None }` —
+    /// use when the response carries no protocol-specific attributes or key
+    /// material (typical PAP/CHAP).
     pub fn accept() -> Self {
         AuthResult::Accept {
             attributes: Vec::new(),
+            msk: None,
         }
     }
 }
@@ -540,7 +553,7 @@ impl RadiusServer {
                 Self::initialize_proxy(proxy_config, Arc::clone(&socket)).await?;
 
             config.router = Some(Arc::new(router));
-            config.proxy_handler = Some(Arc::new(proxy_handler));
+            config.proxy_handler = Some(proxy_handler);
             config.retry_manager = Some(Arc::new(retry_manager));
             config.health_checker = health_checker.map(Arc::new);
             home_servers = servers;
@@ -564,7 +577,7 @@ impl RadiusServer {
     ) -> Result<
         (
             Router,
-            ProxyHandler,
+            Arc<ProxyHandler>,
             RetryManager,
             Option<crate::proxy::health::HealthChecker>,
             Vec<Arc<crate::proxy::home_server::HomeServer>>,
@@ -619,34 +632,37 @@ impl RadiusServer {
         let cache_ttl = Duration::from_secs(proxy_config.cache_ttl);
         let proxy_cache = Arc::new(ProxyCache::new(cache_ttl, proxy_config.max_outstanding));
 
-        // Create proxy handler
-        let proxy_handler = ProxyHandler::new(Arc::clone(&proxy_cache), socket.local_addr()?)
-            .await
-            .map_err(|e| {
-                ServerError::Io(std::io::Error::other(format!(
-                    "Failed to create proxy handler: {}",
-                    e
-                )))
-            })?;
+        // Create the proxy handler. Home servers are reached through a socket of
+        // its own on an ephemeral port (binding the listener's address again
+        // would fail with EADDRINUSE), and home-server responses are read from
+        // that socket by `listen_for_proxy_responses`. Replies to NASes go out
+        // through the listening socket, so they come from the address:port the
+        // NAS sent to. One handler serves both the request path and the retry
+        // manager so retransmissions keep the same source port.
+        let upstream_bind_addr: SocketAddr = match socket.local_addr()? {
+            SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+            SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+        };
+        let proxy_handler = Arc::new(
+            ProxyHandler::new(Arc::clone(&proxy_cache), upstream_bind_addr)
+                .await
+                .map_err(|e| {
+                    ServerError::Io(std::io::Error::other(format!(
+                        "Failed to create proxy handler: {}",
+                        e
+                    )))
+                })?
+                .with_nas_socket(Arc::clone(&socket)),
+        );
 
         // Create retry manager
         let retry_timeout = Duration::from_secs(proxy_config.proxy_timeout);
         let retry_manager = RetryManager::new(
             Arc::clone(&proxy_cache),
-            Arc::new(proxy_handler),
+            Arc::clone(&proxy_handler),
             proxy_config.retry.clone(),
             retry_timeout,
         );
-
-        // Create a second proxy handler for the server (both share the same cache)
-        let server_proxy_handler = ProxyHandler::new(proxy_cache, socket.local_addr()?)
-            .await
-            .map_err(|e| {
-                ServerError::Io(std::io::Error::other(format!(
-                    "Failed to create proxy handler: {}",
-                    e
-                )))
-            })?;
 
         // Collect all home servers and pools from all pools
         let mut all_servers = Vec::new();
@@ -694,7 +710,7 @@ impl RadiusServer {
 
         Ok((
             router,
-            server_proxy_handler,
+            proxy_handler,
             retry_manager,
             health_checker,
             all_servers,
@@ -750,7 +766,7 @@ impl RadiusServer {
         // Start response listener task if proxy is enabled
         let _response_task = if let Some(ref proxy_handler) = self.config.proxy_handler {
             let handler = Arc::clone(proxy_handler);
-            let socket = Arc::clone(&self.socket);
+            let socket = handler.socket();
             let buffer_pool = Arc::clone(&self.config.buffer_pool);
             Some(tokio::spawn(async move {
                 Self::listen_for_proxy_responses(handler, socket, buffer_pool).await;
@@ -889,9 +905,7 @@ impl RadiusServer {
         // UDP. RadSec calls `process_request` directly with the fixed "radsec"
         // secret and writes the response over its TLS stream.
         let secret = config.get_secret_for_client(addr.ip()).to_vec();
-        if let Some(response_data) =
-            Self::process_request(&data, addr.ip(), &secret, &config).await?
-        {
+        if let Some(response_data) = Self::process_request(&data, addr, &secret, &config).await? {
             socket.send_to(&response_data, addr).await?;
         }
 
@@ -904,14 +918,16 @@ impl RadiusServer {
     ///
     /// `secret` is the shared secret to use for Response/Message-Authenticator
     /// computation — the per-client secret for UDP, or the fixed `"radsec"` for
-    /// RadSec (RFC 6614 §2.3). `source_ip` is the peer address, used for policy
-    /// conditions (NAS-IP), logging, and replay fingerprinting.
+    /// RadSec (RFC 6614 §2.3). `source` is the peer address, used for policy
+    /// conditions (NAS-IP), logging, replay fingerprinting, and as the
+    /// destination of a proxied response.
     pub(crate) async fn process_request(
         data: &[u8],
-        source_ip: std::net::IpAddr,
+        source: SocketAddr,
         secret: &[u8],
         config: &Arc<ServerConfig>,
     ) -> Result<Option<Vec<u8>>, ServerError> {
+        let source_ip = source.ip();
         // Decode the packet
         let request = Packet::decode(data)?;
 
@@ -973,7 +989,7 @@ impl RadiusServer {
         // Handle based on packet type
         let response = match request.code {
             Code::AccessRequest => {
-                Self::handle_access_request(&request, config, source_ip, secret).await?
+                Self::handle_access_request(&request, config, source, secret).await?
             }
             Code::AccountingRequest => {
                 Self::handle_accounting_request(&request, config, source_ip, secret).await?
@@ -1002,9 +1018,10 @@ impl RadiusServer {
     async fn handle_access_request(
         request: &Packet,
         config: &ServerConfig,
-        source_ip: std::net::IpAddr,
+        source: SocketAddr,
         secret: &[u8],
     ) -> Result<Packet, ServerError> {
+        let source_ip = source.ip();
         // Check if proxy routing is enabled
         if let (Some(router), Some(proxy_handler)) = (&config.router, &config.proxy_handler) {
             // Route the request
@@ -1038,10 +1055,10 @@ impl RadiusServer {
                     // (per-client for UDP, "radsec" for RadSec).
                     let secret = secret.to_vec();
 
-                    // Forward the request
-                    let source_addr = SocketAddr::new(source_ip, 0); // NAS address
+                    // Forward the request. The NAS's full address (IP *and*
+                    // port) is what the relayed response is sent back to.
                     proxy_handler
-                        .forward_request(forwarded_request, source_addr, home_server, secret)
+                        .forward_request(forwarded_request, source, home_server, secret)
                         .await
                         .map_err(|e| {
                             warn!("Proxy forwarding failed: {}", e);
@@ -1272,6 +1289,7 @@ impl RadiusServer {
         match auth_result {
             AuthResult::Accept {
                 attributes: extra_attrs,
+                msk,
             } => {
                 info!(
                     username = %username,
@@ -1312,6 +1330,29 @@ impl RadiusServer {
                 // (e.g., EAP-Success EAP-Message from an EAP handler).
                 for attr in extra_attrs {
                     response.add_attribute(attr);
+                }
+
+                // RFC 2548 §2.4: hand the EAP MSK to the NAS as MS-MPPE-Recv-Key /
+                // MS-MPPE-Send-Key. The keys are encrypted under this request's
+                // authenticator and the transport's shared secret, so this is
+                // the one place with everything needed. A key-deriving method
+                // whose keys cannot be encoded must not yield a usable
+                // session — fail the request rather than send a keyless Accept
+                // that would strand the supplicant in the 4-way handshake.
+                if let Some(msk) = msk {
+                    let attrs = MppeKeys::from_msk(&msk)
+                        .and_then(|keys| keys.to_attributes(secret, &request.authenticator))
+                        .map_err(|e| {
+                            error!(
+                                username = %username,
+                                error = %e,
+                                "Failed to encode MS-MPPE keys for Access-Accept"
+                            );
+                            ServerError::AuthFailed
+                        })?;
+                    for attr in attrs {
+                        response.add_attribute(attr);
+                    }
                 }
 
                 // Phase 2b: enforce the authorization policy. Only active when a
@@ -1748,6 +1789,200 @@ impl RadiusServer {
 mod tests {
     use super::*;
 
+    // --- Proxy: socket layout and end-to-end relay ---
+
+    /// A proxy config with one home server at `home` for realm `home.test`.
+    fn proxy_config(home: SocketAddr, listen_port: u16) -> Config {
+        use crate::proxy::ProxyConfig;
+        use crate::proxy::health::HealthCheckConfig;
+        use crate::proxy::home_server::HomeServerConfig;
+        use crate::proxy::pool::HomeServerPoolConfig;
+        use crate::proxy::realm::{RealmConfig, RealmMatchConfig};
+
+        Config {
+            listen_address: "127.0.0.1".to_string(),
+            listen_port,
+            clients: vec![crate::config::Client {
+                address: "127.0.0.1/32".to_string(),
+                secret: "nas-secret".to_string(),
+                name: Some("test-nas".to_string()),
+                enabled: true,
+                nas_identifier: None,
+            }],
+            proxy: Some(ProxyConfig {
+                enabled: true,
+                pools: vec![HomeServerPoolConfig {
+                    name: "home".to_string(),
+                    strategy: Default::default(),
+                    servers: vec![HomeServerConfig {
+                        address: home.to_string(),
+                        secret: "home-secret".to_string(),
+                        timeout: 5,
+                        max_outstanding: 10,
+                        name: Some("home".to_string()),
+                    }],
+                }],
+                realms: vec![RealmConfig {
+                    name: "home".to_string(),
+                    match_config: RealmMatchConfig {
+                        match_type: "suffix".to_string(),
+                        pattern: "home.test".to_string(),
+                    },
+                    pool: "home".to_string(),
+                    strip_realm: false,
+                }],
+                health_check: HealthCheckConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        }
+    }
+
+    async fn proxy_server(config: Config) -> Result<RadiusServer, ServerError> {
+        let handler = Arc::new(SimpleAuthHandler::new());
+        RadiusServer::new(ServerConfig::from_config(config, handler)?).await
+    }
+
+    /// Enabling the proxy used to bind a second socket on the listener's own
+    /// address, which fails with EADDRINUSE on any real (non-zero) port.
+    #[tokio::test]
+    async fn proxy_enabled_server_starts_on_a_fixed_port() {
+        let home: SocketAddr = "127.0.0.1:1812".parse().unwrap();
+        // Pick a free port the way a config file would name one.
+        let port = {
+            let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+
+        let server = proxy_server(proxy_config(home, port))
+            .await
+            .expect("server with proxy enabled must start on a fixed port");
+
+        assert_eq!(server.local_addr().unwrap().port(), port);
+        let upstream = server
+            .config
+            .proxy_handler
+            .as_ref()
+            .expect("proxy handler")
+            .socket()
+            .local_addr()
+            .unwrap();
+        assert_ne!(
+            upstream.port(),
+            port,
+            "home-server socket must not share the listener's port"
+        );
+    }
+
+    /// NAS -> proxy -> (fake) home server -> proxy -> NAS, over real sockets:
+    /// the request leg is re-keyed for the home secret, and the relayed Accept
+    /// reaches the NAS's own port from the proxy's listening address, signed
+    /// with the NAS secret.
+    #[tokio::test]
+    async fn proxy_relays_home_server_response_to_the_nas() {
+        use radius_proto::auth::{
+            calculate_response_authenticator, decrypt_user_password, encrypt_user_password,
+            generate_request_authenticator, verify_response_authenticator,
+        };
+
+        let home = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = proxy_server(proxy_config(home.local_addr().unwrap(), 0))
+            .await
+            .unwrap();
+        let proxy_addr = server.local_addr().unwrap();
+        tokio::spawn(async move { server.run().await });
+
+        // The NAS: an Access-Request for a realm the proxy routes.
+        let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let request_auth = generate_request_authenticator();
+        // Built at runtime, not a literal, so CodeQL does not read it as a
+        // hard-coded credential; the value itself is irrelevant to the test.
+        let password: String = ('a'..='p').collect();
+        let mut request = Packet::new(Code::AccessRequest, 42, request_auth);
+        request.add_attribute(
+            Attribute::string(AttributeType::UserName as u8, "alice@home.test").unwrap(),
+        );
+        request.add_attribute(
+            Attribute::new(
+                AttributeType::UserPassword as u8,
+                encrypt_user_password(&password, b"nas-secret", &request_auth),
+            )
+            .unwrap(),
+        );
+        request
+            .add_attribute(Attribute::string(AttributeType::NasIdentifier as u8, "nas").unwrap());
+        nas.send_to(&request.encode().unwrap(), proxy_addr)
+            .await
+            .unwrap();
+
+        // The home server sees the request re-keyed for its secret, from the
+        // proxy's dedicated upstream socket (not the listener).
+        let mut buf = vec![0u8; 4096];
+        let (len, upstream) =
+            tokio::time::timeout(Duration::from_secs(5), home.recv_from(&mut buf))
+                .await
+                .expect("home server must receive the forwarded request")
+                .unwrap();
+        assert_ne!(upstream.port(), proxy_addr.port());
+        let forwarded = Packet::decode(&buf[..len]).unwrap();
+        assert_eq!(forwarded.identifier, 42);
+        assert_eq!(forwarded.authenticator, request_auth);
+        let pw = forwarded
+            .find_attribute(AttributeType::UserPassword as u8)
+            .expect("User-Password forwarded");
+        assert_eq!(
+            decrypt_user_password(&pw.value, b"home-secret", &request_auth).unwrap(),
+            password
+        );
+        let proxy_state = forwarded
+            .find_attribute(AttributeType::ProxyState as u8)
+            .expect("Proxy-State appended")
+            .clone();
+
+        // Home server answers, echoing Proxy-State, signed with its secret.
+        let mut accept = Packet::new(Code::AccessAccept, 42, [0u8; 16]);
+        accept.add_attribute(
+            Attribute::string(AttributeType::ReplyMessage as u8, "welcome").unwrap(),
+        );
+        accept.add_attribute(proxy_state);
+        accept.authenticator =
+            calculate_response_authenticator(&accept, &request_auth, b"home-secret");
+        home.send_to(&accept.encode().unwrap(), upstream)
+            .await
+            .unwrap();
+
+        // The NAS gets it back from the address it sent to, re-signed for it.
+        let (len, from) = tokio::time::timeout(Duration::from_secs(5), nas.recv_from(&mut buf))
+            .await
+            .expect("NAS must receive the relayed Accept")
+            .unwrap();
+        assert_eq!(from, proxy_addr, "reply must come from the listener socket");
+        let relayed = Packet::decode(&buf[..len]).unwrap();
+        assert_eq!(relayed.code, Code::AccessAccept);
+        assert_eq!(relayed.identifier, 42);
+        assert!(verify_response_authenticator(
+            &relayed,
+            &request_auth,
+            b"nas-secret"
+        ));
+        assert!(
+            relayed
+                .find_attribute(AttributeType::ProxyState as u8)
+                .is_none()
+        );
+        assert_eq!(
+            relayed
+                .find_attribute(AttributeType::ReplyMessage as u8)
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "welcome"
+        );
+    }
+
     #[test]
     fn test_simple_auth_handler() {
         let mut handler = SimpleAuthHandler::new();
@@ -1784,7 +2019,7 @@ mod tests {
 
     async fn process(data: &[u8]) -> Result<Option<Vec<u8>>, ServerError> {
         let cfg = msgauth_test_config();
-        RadiusServer::process_request(data, "10.0.0.1".parse().unwrap(), b"s3cret", &cfg).await
+        RadiusServer::process_request(data, "10.0.0.1:1812".parse().unwrap(), b"s3cret", &cfg).await
     }
 
     fn eap_identity_attr() -> Attribute {
@@ -1837,14 +2072,12 @@ mod tests {
             Attribute::new(AttributeType::UserPassword as u8, vec![0u8; 16]).unwrap(),
         ]);
         // Unknown user → AuthFailed, but never the EAP/Message-Authenticator error.
-        match process(&data).await {
-            Err(ServerError::Validation(m)) => {
-                assert!(
-                    !m.contains("Message-Authenticator"),
-                    "non-EAP request wrongly rejected for Message-Authenticator: {m}"
-                );
-            }
-            _ => {} // any non-Validation outcome is fine for this scoping check
+        // Any non-Validation outcome is fine for this scoping check.
+        if let Err(ServerError::Validation(m)) = process(&data).await {
+            assert!(
+                !m.contains("Message-Authenticator"),
+                "non-EAP request wrongly rejected for Message-Authenticator: {m}"
+            );
         }
     }
 }

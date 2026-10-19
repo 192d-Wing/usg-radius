@@ -172,7 +172,6 @@ async fn handle_connection(
         nas_identity(leaf, peer)
     };
 
-    let peer_ip = peer.ip();
     debug!("RadSec connection from {peer} established as NAS '{nas_id}' (mTLS verified)");
 
     // NOTE: unlike the UDP path, RadSec does not apply per-source rate limiting —
@@ -197,7 +196,7 @@ async fn handle_connection(
     loop {
         // Drain every complete frame already buffered before awaiting more I/O.
         while let Some(frame) = take_frame(&mut buf)? {
-            dispatch_inbound(&frame, peer_ip, &server_config, &mut wr, &mut pending).await?;
+            dispatch_inbound(&frame, peer, &server_config, &mut wr, &mut pending).await?;
         }
 
         tokio::select! {
@@ -243,7 +242,7 @@ struct Pending {
 /// the normal request pipeline and its response (if any) is written back.
 async fn dispatch_inbound(
     frame: &[u8],
-    peer_ip: IpAddr,
+    peer: SocketAddr,
     server_config: &Arc<ServerConfig>,
     wr: &mut (impl AsyncWriteExt + Unpin),
     pending: &mut HashMap<u8, Pending>,
@@ -281,7 +280,7 @@ async fn dispatch_inbound(
         return Ok(());
     }
 
-    match RadiusServer::process_request(frame, peer_ip, RADSEC_SECRET, server_config).await {
+    match RadiusServer::process_request(frame, peer, RADSEC_SECRET, server_config).await {
         Ok(Some(response)) => {
             wr.write_all(&response).await?;
             wr.flush().await?;
@@ -391,7 +390,7 @@ mod tests {
     }
 
     fn gen_chain() -> TestChain {
-        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
 
         let ca_key = KeyPair::generate().unwrap();
         let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
@@ -400,17 +399,18 @@ mod tests {
             .distinguished_name
             .push(DnType::CommonName, "USG Test NAS CA");
         let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::from_params(&ca_params, &ca_key);
 
         let server_key = KeyPair::generate().unwrap();
         let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        let server = server_params.signed_by(&server_key, &ca, &ca_key).unwrap();
+        let server = server_params.signed_by(&server_key, &issuer).unwrap();
 
         let client_key = KeyPair::generate().unwrap();
         let mut client_params = CertificateParams::new(vec!["nas-1.usg.test".to_string()]).unwrap();
         client_params
             .distinguished_name
             .push(DnType::CommonName, "switch-eth0");
-        let client = client_params.signed_by(&client_key, &ca, &ca_key).unwrap();
+        let client = client_params.signed_by(&client_key, &issuer).unwrap();
 
         TestChain {
             ca_pem: ca.pem(),

@@ -38,7 +38,11 @@ pub fn generate_proxy_state_key() -> ProxyStateKey {
 /// Proxy cache entry
 #[derive(Clone)]
 pub struct ProxyCacheEntry {
-    /// Original request packet from NAS
+    /// The request as forwarded to the home server: the NAS's packet with our
+    /// Proxy-State appended and User-Password / Message-Authenticator re-keyed
+    /// for the home server secret (see `rewrite_request_for_home_server`). Its
+    /// Request Authenticator is the NAS's, unchanged, so the response leg can
+    /// use it for both hops. Retries resend this packet as is.
     pub original_request: Packet,
     /// Original source address (NAS)
     pub original_source: SocketAddr,

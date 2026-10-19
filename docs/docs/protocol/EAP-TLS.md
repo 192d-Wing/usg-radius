@@ -137,7 +137,10 @@ ctx.derive_session_keys()?;
 // Get keys for RADIUS attributes (MS-MPPE keys)
 if let Some(msk) = ctx.get_msk() {
     println!("MSK: {} bytes", msk.len()); // 64 bytes
-    // Use MSK to generate RADIUS MS-MPPE-Send-Key and MS-MPPE-Recv-Key
+    // radius_proto::MppeKeys::from_msk(msk) splits it into MS-MPPE-Recv-Key
+    // (MSK[0..32]) and MS-MPPE-Send-Key (MSK[32..64]); `to_attributes` encrypts
+    // them per RFC 2548 §2.4 for the Access-Accept. The server does this
+    // automatically when an EAP handler returns `AuthResult::Accept { msk }`.
 }
 
 if let Some(emsk) = ctx.get_emsk() {
