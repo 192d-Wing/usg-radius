@@ -52,8 +52,16 @@ RUN cargo build --release -p radius-server --no-default-features --features obse
 
 # ---- runtime: minimal Iron Bank Alpine, non-root ----
 FROM ${IB_ALPINE} AS runtime
+# The service runs as uid/gid 999, which deploy/base pins via runAsUser /
+# runAsGroup / fsGroup, and both are free on the Iron Bank image. The public
+# alpine image (CI's IB_ALPINE fallback for Dependabot PRs, never shipped)
+# already uses gid 999 for its `ping` group, which makes `adduser -u 999` fail
+# with "uid '999' in use", so fall back to a free id there instead of failing
+# the build; the Iron Bank path is unchanged.
 RUN apk add --no-cache ca-certificates libgcc \
-    && adduser -D -H -u 999 -s /sbin/nologin radius \
+    && { addgroup -g 999 radius 2>/dev/null || addgroup radius; } \
+    && { adduser -D -H -u 999 -G radius -s /sbin/nologin radius 2>/dev/null \
+         || adduser -D -H -G radius -s /sbin/nologin radius; } \
     && mkdir -p /etc/radius /var/log/radius \
     && chown -R radius:radius /etc/radius /var/log/radius
 COPY --from=builder /build/target/release/usg-radius /usr/local/bin/usg-radius

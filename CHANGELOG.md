@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **CI Docker Build failed on every Dependabot PR after the public-Alpine
+  fallback (#66): `adduser: uid '999' in use`.** The Iron Bank Alpine image has
+  uid/gid 999 free; the public `alpine:3.22` image already uses gid 999 for its
+  `ping` group, which busybox `adduser -u 999` reports as a uid clash. The runtime stage
+  now takes 999 when it is free (unchanged for shipped images, which
+  `deploy/base` pins to 999) and falls back to a free id only on the public
+  image, which is built for CI and never pushed.
+
 ### Changed
 
 - **RustCrypto and rand majors.** `sha2` 0.10 → 0.11, `hmac` 0.12 → 0.13 and
