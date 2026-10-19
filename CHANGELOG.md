@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Interop test in CI.** `.github/workflows/interop.yml` runs
+  `tests/interop/run.sh` (usg-radius as proxy and as EAP-TLS home server
+  against FreeRADIUS 3.2 and eapol_test, 15 assertions) on `ubuntu-latest`:
+  on pull requests that touch `crates/**`, `tests/interop/**`, the Cargo
+  manifests or any `Dockerfile`, nightly, and on demand. The job fails on any
+  failed assertion and uploads `run.sh`'s output plus the three servers' full
+  logs as an `interop-logs` artifact on failure. The cargo registry and target
+  dir of the in-image build and the image layers are cached across runs;
+  `compose.yaml` now passes `CARGO_BUILD_JOBS` through to the usg-radius image
+  build (default 2, CI uses 4).
+
 ### Fixed
 
 - **CI Docker Build failed on every Dependabot PR after the public-Alpine

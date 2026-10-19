@@ -10,7 +10,9 @@ usg-radius instances (proxy and EAP-TLS home server) on a compose network with
 fixed addresses, runs the checks from the `nas` container and tears down. Exit
 status 0 means every check passed. See
 [docs/docs/development/INTEROP_TESTING.md](../../docs/docs/development/INTEROP_TESTING.md)
-for what each check proves, the secrets per hop, and how to debug a failure.
+for what each check proves, the secrets per hop, how to debug a failure, and
+the CI job (`.github/workflows/interop.yml`) that runs this on pull requests,
+nightly and on demand.
 
 Layout:
 

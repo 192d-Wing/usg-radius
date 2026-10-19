@@ -1,0 +1,158 @@
+# Interop test: usg-radius as proxy and as EAP-TLS home server against
+# FreeRADIUS 3.2 and eapol_test (wpa_supplicant 2.11), driven by
+# tests/interop/run.sh. Fifteen assertions; the job fails if any one fails.
+# See docs/docs/development/INTEROP_TESTING.md.
+#
+# Base images: the three harness images build from public Debian and rust
+# images (tests/interop/*/Dockerfile), not from the Iron Bank Alpine base the
+# shipping Dockerfile uses, so there is no registry1.dso.mil login here and no
+# IB_ALPINE fallback: Dependabot and fork PRs run the exact same build.
+name: Interop
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly on the default branch, 05:23 UTC.
+    - cron: '23 5 * * *'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'crates/**'
+      - 'tests/interop/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Dockerfile'
+      - '**/Dockerfile'
+      - '.github/workflows/interop.yml'
+
+concurrency:
+  group: interop-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # tests/interop/compose.yaml passes this through as the usg-radius image's
+  # CARGO_BUILD_JOBS build arg (default 2, sized for a small Lima VM); the
+  # ubuntu-latest runner has 4 vCPUs.
+  CARGO_BUILD_JOBS: 4
+
+jobs:
+  interop:
+    name: FreeRADIUS + eapol_test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Outside the checkout so nothing here lands in a build context. (The
+      # runner context is not available in a job-level env, hence GITHUB_ENV.)
+      - name: Pick the cache directory
+        run: echo "CACHE_DIR=$RUNNER_TEMP/interop-cache" >> "$GITHUB_ENV"
+
+      # docker-container driver: needed for the type=gha layer cache below, and
+      # it is the builder both the bake step and run.sh's `compose build` use,
+      # so they share one build cache and the cargo cache mounts.
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Two layers of caching:
+      #  1. The cargo registry and target dir live in BuildKit cache mounts in
+      #     tests/interop/usg-radius/Dockerfile (so a source change rebuilds only
+      #     the crates that changed). Cache mounts are not part of the image
+      #     layer cache, so they are carried across runs with actions/cache and
+      #     copied into / out of the builder by buildkit-cache-dance. Keyed on
+      #     Cargo.lock like ci.yml: one save per dependency change, and every run
+      #     starts from compiled dependencies.
+      #  2. The image layers (apt installs, the wpa_supplicant build, the
+      #     FreeRADIUS package) go to the GitHub Actions cache through buildx
+      #     (type=gha) in the bake step.
+      - name: Cache cargo registry and target (BuildKit cache mounts)
+        id: cargo-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.CACHE_DIR }}/cargo-registry
+            ${{ env.CACHE_DIR }}/target
+          key: ${{ runner.os }}-interop-cargo-${{ hashFiles('Cargo.lock', 'tests/interop/usg-radius/Dockerfile') }}
+          restore-keys: |
+            ${{ runner.os }}-interop-cargo-
+
+      - name: Inject cargo caches into the builder
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-map: |
+            {
+              "${{ env.CACHE_DIR }}/cargo-registry": "/usr/local/cargo/registry",
+              "${{ env.CACHE_DIR }}/target": "/build/target"
+            }
+          scratch-dir: ${{ env.CACHE_DIR }}/scratch
+          skip-extraction: ${{ steps.cargo-cache.outputs.cache-hit }}
+
+      # Exposes ACTIONS_RUNTIME_TOKEN / ACTIONS_CACHE_URL to the shell so a plain
+      # `docker buildx bake` can use the type=gha cache backend.
+      - name: Expose GitHub runtime for the buildx gha cache
+        uses: crazy-max/ghaction-github-runtime@v3
+
+      # Pre-build the three images with the compose file as the bake definition
+      # (same contexts, Dockerfiles and build args run.sh uses), reading and
+      # writing the layer cache. run.sh's own `compose build` then hits this
+      # builder's local cache and only exports the images to the daemon.
+      # ignore-error: fork PRs cannot write the cache; build anyway.
+      - name: Build the harness images (layer cache)
+        working-directory: tests/interop
+        env:
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
+          # The usg-radius build context is the repository root, two levels
+          # above compose.yaml. buildx >= 0.19 refuses to read outside the
+          # bake working directory unless the path is granted with
+          # --allow=fs.read; this disables that check (older buildx ignores
+          # the variable). Same contexts run.sh's compose build uses.
+          BUILDX_BAKE_ENTITLEMENTS_FS: 0
+        run: |
+          set -x
+          args=()
+          for target in freeradius nas usg-proxy; do
+            args+=(--set "$target.cache-from=type=gha,scope=interop-$target")
+            args+=(--set "$target.cache-to=type=gha,scope=interop-$target,mode=max,ignore-error=true")
+          done
+          docker buildx bake -f compose.yaml "${args[@]}"
+
+      - name: Run the interop harness
+        id: run
+        env:
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
+          # Leave the servers up so the next step can save their full logs;
+          # run.sh already prints the tail of each on failure.
+          KEEP: 1
+        run: |
+          mkdir -p "$RUNNER_TEMP/interop-logs"
+          set -o pipefail
+          tests/interop/run.sh 2>&1 | tee "$RUNNER_TEMP/interop-logs/run.log"
+
+      - name: Collect server logs and tear down
+        if: always()
+        working-directory: tests/interop
+        run: |
+          for service in freeradius usg-proxy usg-home; do
+            docker compose -f compose.yaml logs --no-color --timestamps "$service" \
+              > "$RUNNER_TEMP/interop-logs/$service.log" 2>&1 || true
+          done
+          docker compose -f compose.yaml ps -a > "$RUNNER_TEMP/interop-logs/compose-ps.txt" 2>&1 || true
+          docker compose -f compose.yaml --profile test down --remove-orphans --timeout 2 || true
+
+      # run.log holds run.sh's output: the PASS/FAIL line per assertion, the
+      # eapol_test / radclient summaries and the per-check log tails. The
+      # <service>.log files are the complete FreeRADIUS -X and usg-radius logs.
+      - name: Upload harness logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-logs
+          path: ${{ runner.temp }}/interop-logs
+          retention-days: 14
+          if-no-files-found: warn
