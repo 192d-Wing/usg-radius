@@ -7,47 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- **Reproducible interop test** (`tests/interop/`, `tests/interop/run.sh`)
-  exercising usg-radius in proxy mode and as an EAP-TLS home server against
-  FreeRADIUS 3.2 and eapol_test (wpa_supplicant 2.11), with a different shared
-  secret on each hop. It proves EAP-TLS over TLS 1.3 and PAP through the proxy,
-  the MS-MPPE key re-encryption on both legs, and usg-radius's own MS-MPPE /
-  RFC 9190 exporter output, all against independent implementations. Documented
-  in `docs/docs/development/INTEROP_TESTING.md`.
-
-### Fixed
-
-- **EAP-TLS over TLS 1.3 sent EAP-Success without the RFC 9190 §2.5 commitment
-  message, so OpenSSL-based peers derived no key.** After the TLS handshake the
-  server jumped straight to EAP-Success, skipping the protected success
-  indication (a TLS application-data record of one `0x00` octet the peer
-  acknowledges). wpa_supplicant's TLS 1.3 EAP-TLS peer installs no MSK without
-  it: direct EAP-TLS to usg-radius failed with an MS-MPPE / Session-Id mismatch
-  even though the handshake succeeded (the unit tests missed it by driving
-  rustls against a rustls peer). The server now sends the commitment as its own
-  EAP-Request and sends EAP-Success — whose Identifier now echoes the peer's
-  last EAP-Response per RFC 3748 §4.2 — only once the peer acknowledges it.
-  TLS 1.2 EAP-TLS, which has no commitment message, is unchanged.
-- **Proxied responses and timeout rejects were sent from the proxy's upstream
-  socket, not the port the NAS sent to.** The proxy reads home-server replies on
-  a dedicated socket (ephemeral port) and relayed them to the NAS from that
-  socket; a NAS whose RADIUS socket is `connect()`ed to the proxy (eapol_test,
-  wpa_supplicant and most embedded NASes) drops datagrams from any other source
-  port, so every proxied authentication appeared to time out. Replies and
-  `RetryManager` rejects now go out through the server's listening socket.
-
 ## [0.11.0] - 2026-10-18
 
 Delivers the keys WPA-Enterprise needs and makes them survive the proxy. The
 Access-Accept that ends an EAP-TLS or EAP-TEAP exchange now carries the RFC 2548
-MS-MPPE-Send-Key / MS-MPPE-Recv-Key (with RFC 9190 TLS 1.3 keying and RFC 7170
+MS-MPPE-Send-Key / MS-MPPE-Recv-Key (with RFC 9190 TLS 1.3 keying, including
+the §2.5 commitment message OpenSSL-based supplicants require, and RFC 7170
 TEAP key derivation corrected), and the RADIUS proxy now re-keys every
 secret-bound field on both legs — User-Password and Message-Authenticator toward
 the home server; MS-MPPE keys, Tunnel-Password and Message-Authenticator back
-toward the NAS — so 802.1X through the proxy completes the 4-way handshake
-instead of stalling. Also clears the open `cargo audit` findings.
+toward the NAS — and replies from the port the NAS sent to, so 802.1X through
+the proxy completes the 4-way handshake instead of stalling. All of it is
+proven against FreeRADIUS and wpa_supplicant's eapol_test by a new interop
+harness. Also clears the open `cargo audit` findings.
 
 ### Added
 
@@ -66,6 +38,13 @@ instead of stalling. Also clears the open `cargo audit` findings.
   EAP-TLS Access-Accepts.
 - **EAP-TEAP MSK derivation** (RFC 7170 §5.4) from S-IMCK, gated on a verified
   Crypto-Binding response.
+- **Reproducible interop test** (`tests/interop/`, `tests/interop/run.sh`)
+  exercising usg-radius in proxy mode and as an EAP-TLS home server against
+  FreeRADIUS 3.2 and eapol_test (wpa_supplicant 2.11), with a different shared
+  secret on each hop. It proves EAP-TLS over TLS 1.3 and PAP through the proxy,
+  the MS-MPPE key re-encryption on both legs, and usg-radius's own MS-MPPE /
+  RFC 9190 exporter output, all against independent implementations. Documented
+  in `docs/docs/development/INTEROP_TESTING.md`.
 
 ### Changed
 
@@ -82,6 +61,17 @@ instead of stalling. Also clears the open `cargo audit` findings.
   Type-Code context; using `"client EAP encryption"` produced an MSK no
   RFC 9190 supplicant shares. Derivation is now selected by the negotiated
   TLS version.
+- **EAP-TLS over TLS 1.3 sent EAP-Success without the RFC 9190 §2.5 commitment
+  message, so OpenSSL-based peers derived no key.** After the TLS handshake the
+  server jumped straight to EAP-Success, skipping the protected success
+  indication (a TLS application-data record of one `0x00` octet the peer
+  acknowledges). wpa_supplicant's TLS 1.3 EAP-TLS peer installs no MSK without
+  it: direct EAP-TLS to usg-radius failed with an MS-MPPE / Session-Id mismatch
+  even though the handshake succeeded (the unit tests missed it by driving
+  rustls against a rustls peer). The server now sends the commitment as its own
+  EAP-Request and sends EAP-Success — whose Identifier now echoes the peer's
+  last EAP-Response per RFC 3748 §4.2 — only once the peer acknowledges it.
+  TLS 1.2 EAP-TLS, which has no commitment message, is unchanged.
 - **EAP-TEAP IMCK/CMK derivation did not follow RFC 7170 §5.2.** IMCK[j] was
   expanded with an ad-hoc HMAC construction instead of the TLS 1.2 PRF, and
   CMK[j] was taken from the first 20 octets of IMCK[j], overlapping S-IMCK[j],
@@ -134,6 +124,13 @@ instead of stalling. Also clears the open `cargo audit` findings.
   waiting until its own timeout. The reject is now signed with the client
   secret recorded in the proxy cache entry, with a loopback test asserting it
   verifies under that secret and not under an empty one.
+- **Proxied responses and timeout rejects were sent from the proxy's upstream
+  socket, not the port the NAS sent to.** The proxy reads home-server replies on
+  a dedicated socket (ephemeral port) and relayed them to the NAS from that
+  socket; a NAS whose RADIUS socket is `connect()`ed to the proxy (eapol_test,
+  wpa_supplicant and most embedded NASes) drops datagrams from any other source
+  port, so every proxied authentication appeared to time out. Replies and
+  `RetryManager` rejects now go out through the server's listening socket.
 - **`radius-proto` built with both `tls` and `revocation` panicked at
   `ServerConfig::builder()`** ("Could not automatically determine the
   process-level CryptoProvider"): `reqwest`'s `rustls-tls` feature compiled
