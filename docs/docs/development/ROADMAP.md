@@ -2,16 +2,15 @@
 
 This document outlines the development roadmap for the USG RADIUS project, organized by release milestones.
 
-## Current Status: v0.10.1 (RadSec + CoA/Disconnect)
+## Current Status: v0.11.0 (MS-MPPE keys + WPA-Enterprise through the proxy)
 
-**Release Date**: June 2026
-**Status**: ✅ Complete - Production-ready with RadSec (RFC 6614) as the default transport, server-originated CoA/Disconnect (RFC 5176), management API mTLS + ABAC, and Kubernetes-only deployment
+**Release Date**: October 2026
+**Status**: ✅ Complete - Production-ready with RadSec (RFC 6614) as the default transport, server-originated CoA/Disconnect (RFC 5176), RFC 2548 MS-MPPE key delivery on EAP Access-Accepts, a proxy that re-keys both legs, management API mTLS + ABAC, and Kubernetes-only deployment
 
 ### Known Limitations
 
-See [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md) for detailed gap analysis. Headline gaps at v0.10.1:
+See [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md) for detailed gap analysis. Headline gaps at v0.11.0:
 
-- ❌ MS-MPPE-Send-Key / MS-MPPE-Recv-Key not attached to Access-Accept (WPA-Enterprise key delivery)
 - ❌ No DTLS transport; RadSec is TLS 1.3 only
 - ❌ CoA/Disconnect only over RadSec (no UDP/3799 path)
 - ❌ No certificate hot-rotation for RadSec or EAP-TLS
@@ -19,7 +18,7 @@ See [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md) for detailed gap analysis
 - ⚠️ Status-Server does not verify Message-Authenticator and always replies Access-Accept
 - ⚠️ Only one UDP socket is bound; 1813/udp is advertised but not listened on
 
-### Completed Features (v0.1.0 through v0.10.1)
+### Completed Features (v0.1.0 through v0.11.0)
 
 
 
@@ -138,6 +137,15 @@ See [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md) for detailed gap analysis
 - ✅ `Termination-Action` reply attribute, `NAS-IPv6-Address` (95) parsing
 - ✅ Shared KAT wire-format vectors with the authenticator
 - ✅ v0.10.1: container image built with the `tls` feature
+
+#### WPA-Enterprise Key Delivery & Proxy Re-keying (v0.11.0)
+
+- ✅ MS-MPPE-Send-Key / MS-MPPE-Recv-Key (RFC 2548 §2.4) on EAP-TLS / EAP-TEAP Access-Accepts; Vendor-Specific (26) sub-attribute codec
+- ✅ RFC 9190 TLS 1.3 exporter label (`EXPORTER_EAP_TLS_Key_Material`) and EAP-Key-Name (102)
+- ✅ EAP-TEAP MSK/EMSK from S-IMCK (RFC 7170 §5.4); IMCK/CMK derived with the TLS 1.2 PRF (RFC 7170 §5.2)
+- ✅ Proxy request leg re-keys User-Password and Message-Authenticator for the home server
+- ✅ Proxy response leg verifies the home server's Response Authenticator, re-encrypts MS-MPPE keys and RFC 2868 Tunnel-Password, and re-signs Message-Authenticator for the NAS; timeout Access-Reject signed with the NAS secret
+- ✅ `cargo audit` clean; `--all-features` builds a single rustls `CryptoProvider`
 
 ## v0.2.0 - Security & Production Hardening (Q4 2025)
 
@@ -1332,13 +1340,12 @@ let config = RevocationConfig::disabled();
 
 ## Development Priorities
 
-### Remaining Work (post v0.10.1)
+### Remaining Work (post v0.11.0)
 
-1. MS-MPPE-Send-Key / MS-MPPE-Recv-Key (VSA 311) on Access-Accept
-2. Integrate CRL/OCSP (`revocation` feature) into EAP-TLS and RadSec verification
-3. EAP-TEAP inner methods with real keying material (EAP-MSCHAPv2)
-4. Status-Server Message-Authenticator verification (RFC 5997 §4.1)
-5. Dedicated accounting socket (1813/udp) or remove it from the manifests
+1. Integrate CRL/OCSP (`revocation` feature) into EAP-TLS and RadSec verification
+2. EAP-TEAP inner methods with real keying material (EAP-MSCHAPv2)
+3. Status-Server Message-Authenticator verification (RFC 5997 §4.1)
+4. Dedicated accounting socket (1813/udp) or remove it from the manifests
 
 ### Nice to Have
 
@@ -1378,7 +1385,8 @@ We welcome community contributions! Priority areas:
 | v0.7.0 | Q1 2026 | Proxy, Performance & Documentation | ✅ Done |
 | v0.8.0 | Q2 2026 | RadSec (shipped as part of v0.10.0) | ✅ Done (DTLS, cert rotation deferred) |
 | v0.9.0 | Q2 2026 | Kubernetes-only deployment, mgmt API auth; CoA shipped in v0.10.0 | ✅ Done (UDP CoA deferred) |
-| v0.10.x | Q2 2026 | RadSec + CoA/Disconnect | ✅ Done (v0.10.1 current) |
+| v0.10.x | Q2 2026 | RadSec + CoA/Disconnect | ✅ Done |
+| v0.11.0 | Q4 2026 | MS-MPPE keys, RFC 9190 TLS 1.3 keying, proxy re-keying | ✅ Done (current) |
 | v1.0.0 | 2027 | Production Release | 10 |
 
 **Remaining Estimated Development Time**: ~10 weeks for v1.0.0 hardening, plus the deferred RadSec/CoA follow-ups above

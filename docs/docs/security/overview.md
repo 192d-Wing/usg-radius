@@ -598,14 +598,14 @@ See [Management API Authentication](mgmt-api-auth.md) for the policy schema, con
 - ⚠️ **EAP-TEAP** (RFC 7170): TLS tunnel and TLV protocol with RFC-correct Crypto-Binding; inner methods producing real keying material are still pending.
 - ✅ **Message-Authenticator** is required on every EAP Access-Request (RFC 3579 §3.2, Blast-RADIUS / CVE-2024-3596 mitigation) and added to every EAP-bearing reply.
 - ❌ EAP-TTLS and PEAP are not planned; use EAP-TLS or EAP-TEAP.
-- ❌ MS-MPPE-Send-Key / MS-MPPE-Recv-Key are not yet attached to the Access-Accept, so WPA-Enterprise key delivery is incomplete.
+- ✅ **MS-MPPE-Send-Key / MS-MPPE-Recv-Key** (RFC 2548 §2.4) are attached to the EAP Access-Accept, salt-encrypted under the client secret, so the NAS receives the PMK for the 802.11i 4-way handshake (since v0.11.0). The proxy re-encrypts them (and Tunnel-Password) for the NAS and re-keys User-Password / Message-Authenticator for the home server.
 
 ## Future Enhancements
 
 Remaining security work:
 
 1. **RadSec**: DTLS transport, certificate hot-rotation, revocation checking of NAS certificates
-2. **EAP**: MS-MPPE key attributes on Access-Accept, EAP-TEAP inner methods with real IMSK, CRL/OCSP integration for client certificates
+2. **EAP**: EAP-TEAP inner methods with real IMSK, CRL/OCSP integration for client certificates
 3. **Status-Server**: verify Message-Authenticator (RFC 5997 §4.1)
 4. **Modern Crypto for UDP**: the UDP transport is bound to MD5 by RFC 2865; prefer RadSec rather than waiting for stronger UDP primitives
 

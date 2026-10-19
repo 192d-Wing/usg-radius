@@ -24,7 +24,7 @@ resources:
 images:
   - name: usg-radius-server
     newName: ghcr.io/192d-wing/usg-radius-server
-    newTag: "0.10.1"
+    newTag: "0.11.0"
 
 # EAP (EAP-TLS / EAP-TEAP) server cert + key + client-cert CA, from the dev CA.
 # Files are gitignored (private key); stable name so the volume can reference it.

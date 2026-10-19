@@ -4,11 +4,11 @@ This document identifies gaps between the current USG RADIUS implementation and 
 
 ## Summary
 
-**Overall Status**: Production-ready for modern enterprise authentication with EAP-TLS over RadSec, server-originated CoA/Disconnect, comprehensive rate limiting, accounting, and security features. Reflects the code at **v0.10.1**.
+**Overall Status**: Production-ready for modern enterprise authentication with EAP-TLS over RadSec, server-originated CoA/Disconnect, comprehensive rate limiting, accounting, and security features. Reflects the code at **v0.11.0**.
 
-**Implemented**: Core RADIUS authentication (RFC 2865, PAP + CHAP), Accounting (RFC 2866), Message-Authenticator (RFC 2869 / RFC 3579), EAP-TLS (RFC 5216), RadSec (RFC 6614), CoA/Disconnect (RFC 5176), Rate Limiting, DoS Protection
+**Implemented**: Core RADIUS authentication (RFC 2865, PAP + CHAP), Accounting (RFC 2866), Message-Authenticator (RFC 2869 / RFC 3579), EAP-TLS (RFC 5216 / RFC 9190), MS-MPPE key delivery (RFC 2548), RadSec (RFC 6614), CoA/Disconnect (RFC 5176), RADIUS proxy with secret re-keying on both legs, Rate Limiting, DoS Protection
 **Partial**: EAP-TEAP (RFC 7170) inner methods, Status-Server (RFC 5997) edge cases, certificate revocation (implemented in `radius-proto`, not integrated into the server)
-**Missing**: MS-MPPE key attributes on Access-Accept, legacy tunneled EAP methods (TTLS/PEAP), DTLS transport, UDP-originated CoA
+**Missing**: legacy tunneled EAP methods (TTLS/PEAP), DTLS transport, UDP-originated CoA
 
 **Major Milestones Completed**:
 
@@ -22,6 +22,7 @@ This document identifies gaps between the current USG RADIUS implementation and 
 - ✅ v0.9.0: Kubernetes-only deployment, management API mTLS + ABAC, live session index
 - ✅ v0.10.0: RadSec transport (RFC 6614), server-originated CoA/Disconnect (RFC 5176), Message-Authenticator required on EAP requests
 - ✅ v0.10.1: Container image built with the `tls` feature (RadSec / EAP-TLS fix)
+- ✅ v0.11.0: MS-MPPE-Send/Recv-Key (RFC 2548) on EAP Access-Accepts, RFC 9190 TLS 1.3 exporter labels + EAP-Key-Name, RFC 7170 §5.2 IMCK/CMK and §5.4 MSK, Vendor-Specific and Tunnel-Password codecs, proxy re-keying of User-Password / Message-Authenticator / MS-MPPE / Tunnel-Password
 
 ---
 
@@ -290,7 +291,7 @@ correct stripping of server-added Proxy-State on the response leg.
 - ✅ Subject Alternative Name (SAN) verification
 - ✅ Common Name (CN) verification
 
-**Cryptography (⚠️ partial)**:
+**Cryptography (100%)**:
 
 - ✅ Production key extraction using RFC 5705 (export_keying_material)
 - ✅ MSK derivation (64 bytes) - RFC 5216 Section 2.3 (TLS 1.2) / RFC 9190 Section 2.3 (TLS 1.3)
@@ -317,7 +318,7 @@ correct stripping of server-added Proxy-State on the response leg.
 - ✅ EAP-Message attribute fragmentation
 - ✅ State attribute handling
 - ✅ Access-Challenge generation
-- ⚠️ Access-Accept on EAP-Success (MSK is derived but MS-MPPE keys are not attached, see Cryptography)
+- ✅ Access-Accept on EAP-Success carrying MS-MPPE-Send/Recv-Key (see Cryptography)
 - ✅ Integration with inner auth handlers
 
 **Certificate Management (100%)**:
@@ -887,7 +888,7 @@ Total:         156+ tests
 4. ❌ **Hot Configuration Reload** - Deferred (only the mgmt access policy reloads on SIGHUP)
 5. ⚠️ **Health Monitoring** - Basic Status-Server implemented; Message-Authenticator not verified, always Access-Accept
 6. ⚠️ **Certificate Revocation (CRL/OCSP)** - Module implemented under the `revocation` feature, not integrated into `radius-server`
-7. ❌ **MS-MPPE Keys** - MSK derived but MS-MPPE-Send/Recv-Key (VSA 311) not attached to Access-Accept
+7. ✅ **MS-MPPE Keys** - MS-MPPE-Send/Recv-Key (RFC 2548 §2.4) attached to EAP Access-Accepts (v0.11.0)
 
 ### Priority 4 (LOW) - ❌ NOT PLANNED
 
@@ -913,9 +914,10 @@ Total:         156+ tests
 | Bandwidth Throttling | - | ✅ Complete | v0.2.0 | CRITICAL | Bandwidth protection |
 | Accounting | 2866 | ✅ Complete | v0.3.0 | HIGH | Session tracking |
 | EAP-TLS | 5216 | ✅ Complete | v0.5.0 | HIGH | Modern auth |
-| EAP-TLS over TLS 1.3 keys | 9190 | ✅ Complete | unreleased | HIGH | Exporter labels + EAP-Key-Name |
-| MS-MPPE-Send/Recv-Key | 2548 | ✅ Complete | unreleased | HIGH | Required for the 802.11i 4-way handshake |
-| Vendor-Specific codec | 2865 §5.26 | ✅ Complete | unreleased | MEDIUM | Sub-attribute encode/decode; no dictionaries |
+| EAP-TLS over TLS 1.3 keys | 9190 | ✅ Complete | v0.11.0 | HIGH | Exporter labels + EAP-Key-Name |
+| MS-MPPE-Send/Recv-Key | 2548 | ✅ Complete | v0.11.0 | HIGH | Required for the 802.11i 4-way handshake |
+| Vendor-Specific codec | 2865 §5.26 | ✅ Complete | v0.11.0 | MEDIUM | Sub-attribute encode/decode; no dictionaries |
+| Tunnel-Password | 2868 §3.5 | ⚠️ Codec + proxy re-key | v0.11.0 | LOW | Other tunnel attributes not interpreted |
 | EAP Framework | 3748 | ✅ Complete | v0.5.0 | HIGH | Infrastructure |
 | Audit Logging | - | ✅ Complete | v0.1.1+ | HIGH | Compliance |
 | LDAP Backend | - | ✅ Complete | - | MEDIUM | Enterprise auth |
@@ -945,7 +947,7 @@ The current implementation is **PRODUCTION-READY** for:
    - Certificate-based authentication
    - WPA2/WPA3 Enterprise
    - Mutual TLS authentication
-   - ⚠️ MSK derived, but MS-MPPE keys are not yet delivered to the NAS (see RFC 2869 Cryptography)
+   - ✅ MS-MPPE-Send/Recv-Key delivered on the Access-Accept for the 4-way handshake (v0.11.0)
 
 2. **VPN Authentication with EAP-TLS**
    - Certificate-based VPN access
@@ -1011,13 +1013,10 @@ The current implementation is **PRODUCTION-READY** for:
    - EAP-TTLS, PEAP, EAP-MSCHAPv2 not implemented
    - Use EAP-TLS or EAP-TEAP
 
-2. **WPA-Enterprise key delivery**
-   - MS-MPPE-Send-Key / MS-MPPE-Recv-Key not attached to Access-Accept
-
-3. **RADIUS over DTLS (RFC 7360)**
+2. **RADIUS over DTLS (RFC 7360)**
    - Not implemented; RadSec is TLS 1.3 only
 
-4. **Dedicated accounting port**
+3. **Dedicated accounting port**
    - 1813/udp is advertised but not bound; accounting is accepted on the authentication socket or over RadSec
 
 ---
@@ -1081,7 +1080,7 @@ The USG RADIUS server is **production-ready** for modern enterprise deployments 
 
 **Strengths**:
 
-1. ✅ **Complete EAP-TLS implementation** - Industry-standard certificate authentication (MS-MPPE key delivery pending)
+1. ✅ **Complete EAP-TLS implementation** - Industry-standard certificate authentication with MS-MPPE key delivery
 2. ✅ **RadSec transport and CoA/Disconnect** - TLS 1.3 / ML-KEM-1024 mutual TLS with server-originated session control
 3. ✅ **Comprehensive DoS protection** - Rate limiting, connection limits, bandwidth throttling
 4. ✅ **Full accounting support** - Database backend with exports and reporting
@@ -1100,18 +1099,16 @@ The USG RADIUS server is **production-ready** for modern enterprise deployments 
 **Not Recommended For** (without additional work):
 
 - ❌ Deployments requiring legacy EAP methods (TTLS, PEAP, MSCHAPv2)
-- ❌ WPA-Enterprise deployments that need MS-MPPE keys from the Access-Accept
 - ❌ Deployments that must revoke client certificates before expiry (CRL/OCSP not integrated)
 - ❌ Environments requiring hot configuration reload
 
 **Next Development Priorities**:
 
-1. MS-MPPE-Send-Key / MS-MPPE-Recv-Key (VSA 311) encoding from the EAP MSK
-2. Integrate the `revocation` module (CRL/OCSP) into EAP-TLS and RadSec client-certificate verification
-3. EAP-TEAP inner methods with real keying material (EAP-MSCHAPv2)
-4. Status-Server Message-Authenticator verification and Accounting-Response reply (RFC 5997)
-5. Bind a dedicated accounting socket (1813/udp) or drop it from the deployment manifests
-6. Hot configuration reload
+1. Integrate the `revocation` module (CRL/OCSP) into EAP-TLS and RadSec client-certificate verification
+2. EAP-TEAP inner methods with real keying material (EAP-MSCHAPv2)
+3. Status-Server Message-Authenticator verification and Accounting-Response reply (RFC 5997)
+4. Bind a dedicated accounting socket (1813/udp) or drop it from the deployment manifests
+5. Hot configuration reload
 
 ---
 
@@ -1128,8 +1125,9 @@ The USG RADIUS server is **production-ready** for modern enterprise deployments 
 - **v0.9.0**: Kubernetes-only deployment (systemd/Compose removed), management API mTLS + ABAC, live session index, dual-stack IPv4 fix
 - **v0.10.0**: **RadSec (RFC 6614)** transport, **CoA/Disconnect (RFC 5176)** over RadSec, Message-Authenticator required on EAP requests, NAS-IPv6-Address, Termination-Action
 - **v0.10.1**: Container image built with the `tls` feature
+- **v0.11.0**: **MS-MPPE-Send/Recv-Key (RFC 2548)** on EAP Access-Accepts, RFC 9190 TLS 1.3 exporter labels + EAP-Key-Name, EAP-TEAP IMCK/CMK (RFC 7170 §5.2) and MSK (§5.4), Vendor-Specific and Tunnel-Password codecs, proxy re-keying of User-Password / Message-Authenticator (request leg) and MS-MPPE / Tunnel-Password / Message-Authenticator (response leg), signed proxy timeout rejects
 
 ---
 
 *Last Updated: 2026-10-18*
-*Document Version: 3.0 (Reconciled with the v0.10.1 code: CHAP, Message-Authenticator, RadSec, CoA, validation, MS-MPPE and revocation gaps)*
+*Document Version: 3.1 (Reconciled with the v0.11.0 code: MS-MPPE key delivery, RFC 9190 / RFC 7170 keying, proxy re-keying; revocation gap unchanged)*
