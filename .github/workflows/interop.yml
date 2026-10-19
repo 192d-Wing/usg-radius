@@ -107,6 +107,12 @@ jobs:
         working-directory: tests/interop
         env:
           BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
+          # The usg-radius build context is the repository root, two levels
+          # above compose.yaml. buildx >= 0.19 refuses to read outside the
+          # bake working directory unless the path is granted with
+          # --allow=fs.read; this disables that check (older buildx ignores
+          # the variable). Same contexts run.sh's compose build uses.
+          BUILDX_BAKE_ENTITLEMENTS_FS: 0
         run: |
           set -x
           args=()
