@@ -138,6 +138,35 @@ check "eapol_test printed FAILURE, not SUCCESS" sh -c "grep -qx 'FAILURE' '$LOG'
 check "EAP-Failure relayed through the proxy (rejected, not timed out)" grep -q 'EAP: Status notification: completion (param=failure)' "$LOG"
 
 # ---------------------------------------------------------------------------
+section "8. EAP-TLS: supplicant-side fragmentation (fragment_size=300) -> usg-radius home server"
+LOG=$LOGDIR/eap-tls-frag-usg-home.log
+eapol_test -c /etc/eapol_test/eap-tls-usg-frag.conf -a "$USG_HOME" -p 1812 \
+    -s "$NAS_USGHOME_SECRET" -r 0 -t 15 -e >"$LOG" 2>&1
+rc=$?
+summarize_eapol "$LOG"
+grep -c 'more fragments will follow' "$LOG" | sed 's/^/    supplicant fragments that needed an ACK: /'
+check "control: the supplicant really fragmented (logged a fragment with more to follow)" \
+    grep -q 'more fragments will follow' "$LOG"
+check "eapol_test exit status 0 (rc=$rc)" test "$rc" -eq 0
+check "eapol_test printed SUCCESS (every non-final fragment was ACKed, RFC 5216 2.1.5)" grep -qx 'SUCCESS' "$LOG"
+check "TLS 1.3 negotiated" grep -q 'Using TLS version TLSv1.3' "$LOG"
+check "MS-MPPE keys match the supplicant MSK after a fragmented client flight" \
+    grep -q 'MPPE keys OK: 1  mismatch: 0' "$LOG"
+
+# ---------------------------------------------------------------------------
+section "9. EAP-TLS: supplicant-side fragmentation -> usg-radius proxy -> usg-radius home server"
+LOG=$LOGDIR/eap-tls-frag-via-proxy.log
+eapol_test -c /etc/eapol_test/eap-tls-usg-frag.conf -a "$PROXY" -p 1812 \
+    -s "$NAS_PROXY_SECRET" -r 0 -t 15 -e >"$LOG" 2>&1
+rc=$?
+summarize_eapol "$LOG"
+check "control: the supplicant really fragmented" grep -q 'more fragments will follow' "$LOG"
+check "eapol_test exit status 0 (rc=$rc)" test "$rc" -eq 0
+check "eapol_test printed SUCCESS (fragment ACKs relayed by the proxy)" grep -qx 'SUCCESS' "$LOG"
+check "MS-MPPE keys re-keyed by the proxy match the supplicant MSK" \
+    grep -q 'MPPE keys OK: 1  mismatch: 0' "$LOG"
+
+# ---------------------------------------------------------------------------
 section "result"
 if [ "$failures" -eq 0 ]; then
     echo "ALL CHECKS PASSED"
