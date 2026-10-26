@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `compose.yaml` now passes `CARGO_BUILD_JOBS` through to the usg-radius image
   build (default 2, CI uses 4).
 
+### Security
+
+- Updated transitive dependencies to clear `cargo audit` findings published
+  2026-10-19 to 2026-10-23 against an unchanged lockfile: `rustls-webpki`
+  0.103.15→0.103.16 and `webpki-roots` 1.0.7→1.0.11 (RUSTSEC-2026-0382 /
+  -0381, CVE-2026-111943: distrusted emSign intermediates accepted),
+  `ctutils` 0.4.3→0.4.6 (RUSTSEC-2026-0385, non-constant-time mask
+  generation), and `tokio` 1.52.3→1.54.1 (RUSTSEC-2026-0386, `AsyncFd`
+  I/O-safety unsoundness, informational). The same `rustls-webpki`,
+  `webpki-roots` and `tokio` bumps are applied to `ui/bff/Cargo.lock`.
+
 ### Fixed
 
 - **CI Docker Build failed on every Dependabot PR after the public-Alpine
