@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-26
+
+Certificate revocation checking for EAP-TLS and RadSec: CRL and OCSP
+verification of supplicant and NAS client certificates, behind the
+`revocation` cargo feature and a fail-closed `revocation` configuration block,
+proven by the interop harness, which now runs in CI and asserts that a
+revoked supplicant is rejected while a valid one still authenticates, both
+directly and through the proxy. The release also attaches an EAP-Failure to
+every EAP Access-Reject, completes the RustCrypto and rand major migration
+with no wire-format or key-derivation change, and brings the operator UI BFF
+under `cargo audit` gating in CI.
+
 ### Added
 
 - **Certificate revocation checking (CRL/OCSP) for EAP-TLS and RadSec.** The
@@ -43,9 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   root `CLAUDE.md` documents the workflow, the CI-equivalent commands and the
   project's rules of the road.
 - **Interop test in CI.** `.github/workflows/interop.yml` runs
-- **Interop test in CI.** `.github/workflows/interop.yml` runs
   `tests/interop/run.sh` (usg-radius as proxy and as EAP-TLS home server
-  against FreeRADIUS 3.2 and eapol_test, 15 assertions) on `ubuntu-latest`:
+  against FreeRADIUS 3.2 and eapol_test, 24 assertions) on `ubuntu-latest`:
   on pull requests that touch `crates/**`, `tests/interop/**`, the Cargo
   manifests or any `Dockerfile`, nightly, and on demand. The job fails on any
   failed assertion and uploads `run.sh`'s output plus the three servers' full

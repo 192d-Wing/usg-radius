@@ -2,23 +2,23 @@
 
 This document outlines the development roadmap for the USG RADIUS project, organized by release milestones.
 
-## Current Status: v0.11.1 (MS-MPPE keys + WPA-Enterprise through the proxy)
+## Current Status: v0.12.0 (Certificate revocation for EAP-TLS and RadSec)
 
 **Release Date**: October 2026
-**Status**: ✅ Complete - Production-ready with RadSec (RFC 6614) as the default transport, server-originated CoA/Disconnect (RFC 5176), RFC 2548 MS-MPPE key delivery on EAP Access-Accepts, a proxy that re-keys both legs, management API mTLS + ABAC, and Kubernetes-only deployment
+**Status**: ✅ Complete - Production-ready with RadSec (RFC 6614) as the default transport, server-originated CoA/Disconnect (RFC 5176), RFC 2548 MS-MPPE key delivery on EAP Access-Accepts, CRL/OCSP revocation checking of EAP-TLS supplicant and RadSec client certificates (fail-closed), a proxy that re-keys both legs, management API mTLS + ABAC, and Kubernetes-only deployment
 
 ### Known Limitations
 
-See [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md) for detailed gap analysis. Headline gaps at v0.11.0:
+See [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md) for detailed gap analysis. Headline gaps at v0.12.0:
 
 - ❌ No DTLS transport; RadSec is TLS 1.3 only
 - ❌ CoA/Disconnect only over RadSec (no UDP/3799 path)
 - ❌ No certificate hot-rotation for RadSec or EAP-TLS
-- ⚠️ CRL/OCSP module implemented in `radius-proto` but not integrated into the server
+- ⚠️ CRL and OCSP response signatures are not verified by the revocation checker
 - ⚠️ Status-Server does not verify Message-Authenticator and always replies Access-Accept
 - ⚠️ Only one UDP socket is bound; 1813/udp is advertised but not listened on
 
-### Completed Features (v0.1.0 through v0.11.0)
+### Completed Features (v0.1.0 through v0.12.0)
 
 
 
@@ -146,6 +146,13 @@ See [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md) for detailed gap analysis
 - ✅ Proxy request leg re-keys User-Password and Message-Authenticator for the home server
 - ✅ Proxy response leg verifies the home server's Response Authenticator, re-encrypts MS-MPPE keys and RFC 2868 Tunnel-Password, and re-signs Message-Authenticator for the NAS; timeout Access-Reject signed with the NAS secret
 - ✅ `cargo audit` clean; `--all-features` builds a single rustls `CryptoProvider`
+
+#### Certificate Revocation for EAP-TLS & RadSec (v0.12.0)
+
+- ✅ CRL (static files + Distribution Points) and OCSP (RFC 8954 nonce) checking of EAP-TLS supplicant and RadSec NAS certificates via the `revocation` block, fail-closed by default; `revocation` cargo feature built into the release binary and images
+- ✅ EAP-Failure attached to every EAP Access-Reject (RFC 3579 §2.6.3)
+- ✅ Interop harness (FreeRADIUS 3.2 + eapol_test, 24 assertions including a revoked supplicant) running in CI
+- ✅ RustCrypto / rand major migration with no wire-format or key-derivation change; `ui/bff` under `cargo audit` gating
 
 ## v0.2.0 - Security & Production Hardening (Q4 2025)
 
@@ -1340,9 +1347,9 @@ let config = RevocationConfig::disabled();
 
 ## Development Priorities
 
-### Remaining Work (post v0.11.0)
+### Remaining Work (post v0.12.0)
 
-1. Integrate CRL/OCSP (`revocation` feature) into EAP-TLS and RadSec verification
+1. Verify CRL and OCSP response signatures in the revocation checker
 2. EAP-TEAP inner methods with real keying material (EAP-MSCHAPv2)
 3. Status-Server Message-Authenticator verification (RFC 5997 §4.1)
 4. Dedicated accounting socket (1813/udp) or remove it from the manifests
@@ -1387,7 +1394,8 @@ We welcome community contributions! Priority areas:
 | v0.9.0 | Q2 2026 | Kubernetes-only deployment, mgmt API auth; CoA shipped in v0.10.0 | ✅ Done (UDP CoA deferred) |
 | v0.10.x | Q2 2026 | RadSec + CoA/Disconnect | ✅ Done |
 | v0.11.0 | Q4 2026 | MS-MPPE keys, RFC 9190 TLS 1.3 keying, proxy re-keying | ✅ Done |
-| v0.11.1 | Q4 2026 | Patch: ships the v0.11.0 binaries the release workflow failed to attach; draft-then-publish release workflow | ✅ Done (current) |
+| v0.11.1 | Q4 2026 | Patch: ships the v0.11.0 binaries the release workflow failed to attach; draft-then-publish release workflow | ✅ Done |
+| v0.12.0 | Q4 2026 | Certificate revocation (CRL/OCSP) for EAP-TLS and RadSec, EAP-Failure on EAP rejects, interop harness in CI | ✅ Done (current) |
 | v1.0.0 | 2027 | Production Release | 10 |
 
 **Remaining Estimated Development Time**: ~10 weeks for v1.0.0 hardening, plus the deferred RadSec/CoA follow-ups above
