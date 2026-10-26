@@ -16,7 +16,8 @@
 //!
 //! # Example
 //!
-//! ```no_run
+//! (`ignore`: this module is crate-private; the example is illustrative)
+//! ```ignore
 //! use radius_proto::revocation::crl::CrlInfo;
 //! use chrono::Utc;
 //!
@@ -114,9 +115,10 @@ impl CrlInfo {
         let mut revoked_serials = HashSet::new();
 
         for revoked_cert in crl.iter_revoked_certificates() {
-            // Get serial number as raw bytes
-            let serial_bytes = revoked_cert.raw_serial();
-            revoked_serials.insert(serial_bytes.to_vec());
+            // Minimal big-endian magnitude, the same form `X509Certificate::serial`
+            // (a `BigUint`) yields, so a serial with its top bit set (DER pads it
+            // with a leading 0x00) still matches the certificate's serial.
+            revoked_serials.insert(revoked_cert.user_certificate.to_bytes_be());
         }
 
         Ok(CrlInfo {

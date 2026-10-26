@@ -399,29 +399,32 @@ async fn main() {
             }
             #[cfg(feature = "tls")]
             {
-                use radius_proto::eap::eap_tls::TlsCertificateConfig;
                 use radius_server::EapAuthHandler;
 
-                let cert_cfg = TlsCertificateConfig::new(
-                    eap_cfg.tls.cert_path.clone(),
-                    eap_cfg.tls.key_path.clone(),
-                    eap_cfg.tls.ca_path.clone(),
-                    eap_cfg.tls.require_client_cert,
-                );
                 let mut eap = EapAuthHandler::new(Arc::new(auth_handler));
+                if let Err(e) = eap.configure_from_config(eap_cfg) {
+                    error!("Failed to configure EAP: {}", e);
+                    process::exit(1);
+                }
                 if eap_cfg.enable_teap {
-                    if let Err(e) = eap.configure_teap("", cert_cfg.clone()) {
-                        error!("Failed to configure EAP-TEAP: {}", e);
-                        process::exit(1);
-                    }
                     info!("EAP-TEAP enabled (cert: {})", eap_cfg.tls.cert_path);
                 }
                 if eap_cfg.enable_tls {
-                    if let Err(e) = eap.configure_tls("", cert_cfg) {
-                        error!("Failed to configure EAP-TLS: {}", e);
-                        process::exit(1);
-                    }
                     info!("EAP-TLS enabled (cert: {})", eap_cfg.tls.cert_path);
+                }
+                if let Some(rev) = &eap_cfg.tls.revocation {
+                    info!(
+                        "EAP-TLS supplicant certificate revocation checking: mode {:?}, on_error {:?}, {} static CRL file(s), CRL fetch {}",
+                        rev.mode,
+                        rev.on_error,
+                        rev.crl.static_files.len(),
+                        if rev.crl.fetch { "on" } else { "off" }
+                    );
+                    if rev.mode.uses_ocsp() {
+                        warn!(
+                            "OCSP mode selected: OCSP response signatures are not verified in this release; prefer crl_only unless the responder path is trusted"
+                        );
+                    }
                 }
                 Arc::new(eap)
             }
