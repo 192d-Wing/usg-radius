@@ -23,7 +23,8 @@
 //!
 //! # Example
 //!
-//! ```no_run
+//! (`ignore`: this module is crate-private; the example is illustrative)
+//! ```ignore
 //! use radius_proto::revocation::fetch::CrlFetcher;
 //!
 //! # fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -53,7 +54,8 @@ const DEFAULT_MAX_CRL_SIZE: usize = 10 * 1024 * 1024;
 ///
 /// # Example
 ///
-/// ```no_run
+/// (`ignore`: this module is crate-private; the example is illustrative)
+/// ```ignore
 /// use radius_proto::revocation::fetch::CrlFetcher;
 ///
 /// let fetcher = CrlFetcher::new(5).unwrap();

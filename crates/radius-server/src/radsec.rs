@@ -57,6 +57,8 @@ pub enum RadSecError {
     Pem(#[from] rustls::pki_types::pem::Error),
     #[error("client CA bundle error: {0}")]
     RootStore(#[from] crate::tls_certs::RootStoreError),
+    #[error("client certificate verifier: {0}")]
+    ClientVerifier(#[from] crate::client_verifier::ClientVerifierError),
     #[error("invalid listen address {0:?}: {1}")]
     BadListenAddr(String, std::net::AddrParseError),
     #[error(
@@ -79,14 +81,17 @@ pub fn build_server_config(cfg: &RadSecConfig) -> Result<Arc<rustls::ServerConfi
     let certs = crate::tls_certs::load_cert_chain(&cfg.cert_path)?;
     let key = crate::tls_certs::load_private_key(&cfg.key_path)?;
 
-    // RadSec is always mutually authenticated: require + verify a NAS client cert.
-    let roots = crate::tls_certs::load_root_store(&cfg.client_ca_path)?;
-    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-        Arc::new(roots),
-        provider.clone(),
-    )
-    .build()
-    .map_err(|e| rustls::Error::General(e.to_string()))?;
+    // RadSec is always mutually authenticated: require + verify a NAS client cert,
+    // with CRL/OCSP revocation checking when `radsec.revocation` is configured.
+    let verifier = crate::client_verifier::build_client_verifier(
+        &cfg.client_ca_path,
+        Some(provider.clone()),
+        cfg.revocation.as_ref(),
+    )?;
+    if verifier.checks_revocation() {
+        info!("RadSec: NAS client certificates are checked for revocation");
+    }
+    let verifier = verifier.into_arc();
 
     let config = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&TLS13])?
@@ -387,10 +392,16 @@ mod tests {
         server_key_pem: String,
         client_cert_der: CertificateDer<'static>,
         client_key_der: PrivateKeyDer<'static>,
+        /// DER CRL from the test CA revoking `client_cert_der`.
+        crl_der: Vec<u8>,
     }
 
     fn gen_chain() -> TestChain {
-        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+        use rcgen::{
+            BasicConstraints, CertificateParams, CertificateRevocationListParams, DnType, IsCa,
+            Issuer, KeyIdMethod, KeyPair, RevocationReason, RevokedCertParams, SerialNumber,
+            date_time_ymd,
+        };
 
         let ca_key = KeyPair::generate().unwrap();
         let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
@@ -410,7 +421,26 @@ mod tests {
         client_params
             .distinguished_name
             .push(DnType::CommonName, "switch-eth0");
+        let client_serial = SerialNumber::from(vec![0x4e, 0x41, 0x53, 0x01]);
+        client_params.serial_number = Some(client_serial.clone());
         let client = client_params.signed_by(&client_key, &issuer).unwrap();
+
+        // A CRL from the same CA that revokes the NAS certificate above.
+        let crl = CertificateRevocationListParams {
+            this_update: date_time_ymd(2026, 1, 1),
+            next_update: date_time_ymd(2099, 1, 1),
+            crl_number: SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![RevokedCertParams {
+                serial_number: client_serial,
+                revocation_time: date_time_ymd(2026, 1, 2),
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            }],
+            key_identifier_method: KeyIdMethod::Sha256,
+        }
+        .signed_by(&issuer)
+        .unwrap();
 
         TestChain {
             ca_pem: ca.pem(),
@@ -419,6 +449,7 @@ mod tests {
             server_key_pem: server_key.serialize_pem(),
             client_cert_der: client.der().clone(),
             client_key_der: PrivateKeyDer::Pkcs8(client_key.serialize_der().into()),
+            crl_der: crl.der().as_ref().to_vec(),
         }
     }
 
@@ -439,19 +470,37 @@ mod tests {
     async fn start_listener(
         chain: &TestChain,
     ) -> (SocketAddr, Arc<NasRegistry>, tempfile::TempDir) {
+        start_listener_with(chain, false).await
+    }
+
+    /// Like [`start_listener`]; with `check_crl` the listener enforces the
+    /// test CA's CRL (static file, fail-closed) against NAS certificates.
+    async fn start_listener_with(
+        chain: &TestChain,
+        check_crl: bool,
+    ) -> (SocketAddr, Arc<NasRegistry>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let write = |name: &str, data: &str| {
+        let write = |name: &str, data: &[u8]| {
             let path = dir.path().join(name);
             let mut f = std::fs::File::create(&path).unwrap();
-            f.write_all(data.as_bytes()).unwrap();
+            f.write_all(data).unwrap();
             path.to_str().unwrap().to_string()
         };
+        let revocation = check_crl.then(|| crate::config::RevocationConfig {
+            crl: crate::config::CrlSettings {
+                static_files: vec![write("ca.crl", &chain.crl_der)],
+                fetch: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
         let cfg = RadSecConfig {
             listen_address: "127.0.0.1".to_string(),
             listen_port: 0,
-            cert_path: write("server.pem", &chain.server_cert_pem),
-            key_path: write("server.key", &chain.server_key_pem),
-            client_ca_path: write("ca.pem", &chain.ca_pem),
+            cert_path: write("server.pem", chain.server_cert_pem.as_bytes()),
+            key_path: write("server.key", chain.server_key_pem.as_bytes()),
+            client_ca_path: write("ca.pem", chain.ca_pem.as_bytes()),
+            revocation,
         };
 
         let tls_config = build_server_config(&cfg).unwrap();
@@ -543,6 +592,109 @@ mod tests {
             result.is_err(),
             "a non-ML-KEM client must not complete the RadSec handshake"
         );
+    }
+
+    #[cfg(feature = "revocation")]
+    #[tokio::test]
+    async fn revoked_nas_certificate_fails_closed() {
+        let chain = gen_chain();
+        let (addr, _registry, _dir) = start_listener_with(&chain, true).await;
+
+        // Right provider, valid chain, but the NAS cert is on the CA's CRL.
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config(
+            &chain,
+            usg_fips_tls::provider::fips_provider(),
+        )));
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let result = connector
+            .connect(ServerName::try_from("localhost").unwrap(), stream)
+            .await;
+        // The server rejects the certificate; the client sees either the TLS
+        // alert or the closed connection, depending on scheduling.
+        let mut tls = match result {
+            Err(_) => return,
+            Ok(tls) => tls,
+        };
+        tls.write_all(&status_server_packet(9)).await.unwrap();
+        let _ = tls.flush().await;
+        let mut resp = [0u8; RADIUS_HEADER_LEN];
+        assert!(
+            tls.read_exact(&mut resp).await.is_err(),
+            "a revoked NAS must not get a RADIUS response"
+        );
+    }
+
+    #[cfg(feature = "revocation")]
+    #[tokio::test]
+    async fn crl_checking_listener_still_accepts_an_unrevoked_nas() {
+        use rcgen::{CertificateParams, DnType, KeyPair, SerialNumber};
+
+        // Same CA and CRL as `gen_chain`, but a NAS certificate the CRL does
+        // not list. The CA key is needed to issue it, so build the chain here.
+        let mut chain = gen_chain();
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "USG Test NAS CA 2");
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+
+        let server_key = KeyPair::generate().unwrap();
+        let server = CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .signed_by(&server_key, &issuer)
+            .unwrap();
+
+        let revoked_serial = SerialNumber::from(vec![0x4e, 0x41, 0x53, 0x01]);
+        let client_key = KeyPair::generate().unwrap();
+        let mut client_params = CertificateParams::new(vec!["nas-2.usg.test".to_string()]).unwrap();
+        client_params
+            .distinguished_name
+            .push(DnType::CommonName, "switch-eth1");
+        client_params.serial_number = Some(SerialNumber::from(vec![0x4e, 0x41, 0x53, 0x02]));
+        let client = client_params.signed_by(&client_key, &issuer).unwrap();
+
+        let crl = rcgen::CertificateRevocationListParams {
+            this_update: rcgen::date_time_ymd(2026, 1, 1),
+            next_update: rcgen::date_time_ymd(2099, 1, 1),
+            crl_number: SerialNumber::from(2u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![rcgen::RevokedCertParams {
+                serial_number: revoked_serial,
+                revocation_time: rcgen::date_time_ymd(2026, 1, 2),
+                reason_code: None,
+                invalidity_date: None,
+            }],
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        }
+        .signed_by(&issuer)
+        .unwrap();
+
+        chain.ca_pem = ca.pem();
+        chain.ca_der = ca.der().clone();
+        chain.server_cert_pem = server.pem();
+        chain.server_key_pem = server_key.serialize_pem();
+        chain.client_cert_der = client.der().clone();
+        chain.client_key_der = PrivateKeyDer::Pkcs8(client_key.serialize_der().into());
+        chain.crl_der = crl.der().as_ref().to_vec();
+
+        let (addr, _registry, _dir) = start_listener_with(&chain, true).await;
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config(
+            &chain,
+            usg_fips_tls::provider::fips_provider(),
+        )));
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut tls = connector
+            .connect(ServerName::try_from("localhost").unwrap(), stream)
+            .await
+            .expect("an unrevoked NAS passes the CRL check");
+        tls.write_all(&status_server_packet(11)).await.unwrap();
+        tls.flush().await.unwrap();
+        let mut resp = [0u8; RADIUS_HEADER_LEN];
+        tls.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp[0], 2, "expected Access-Accept");
     }
 
     #[tokio::test]

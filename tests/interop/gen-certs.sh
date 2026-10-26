@@ -1,7 +1,8 @@
 #!/usr/bin/env sh
 # Generate the throw-away test PKI for the interop run: one CA, two RADIUS
-# server certificates (FreeRADIUS home server, usg-radius home server) and two
-# EAP-TLS client certificates whose CN is the EAP identity each run uses.
+# server certificates (FreeRADIUS home server, usg-radius home server), three
+# EAP-TLS client certificates whose CN is the EAP identity each run uses, and a
+# CRL from the CA that revokes one of them (client-usg-revoked).
 #
 # Everything lands in tests/interop/certs/ (git-ignored) with mode 0644: the
 # files are bind-mounted read-only into containers that run as unprivileged
@@ -69,8 +70,39 @@ issue usg-home-server   usg-home   server
 # (EapTlsServer::verify_peer_identity); FreeRADIUS does not by default.
 issue client-freeradius eaptls@freeradius.test client
 issue client-usg        eaptls@usg.test        client
+issue client-usg-revoked revoked@usg.test      client
 
-rm -f ext.cnf ca.srl
+# CRL: revoke client-usg-revoked. `openssl ca` needs a database and config even
+# for a CA whose certificates were issued with `openssl x509 -req`; it records
+# the revocation in index.txt and signs the CRL with the CA key. usg-home loads
+# it as a static CRL file (eap.tls.revocation.crl.static_files).
+cat > crl.cnf <<CNF
+[ca]
+default_ca = interop_ca
+
+[interop_ca]
+database = $out/index.txt
+new_certs_dir = $out
+certificate = $out/ca.crt
+private_key = $out/ca.key
+serial = $out/ca.srl
+crlnumber = $out/crlnumber
+default_md = sha256
+default_crl_days = $days
+policy = any_policy
+unique_subject = no
+
+[any_policy]
+commonName = supplied
+CNF
+: > index.txt
+echo 01 > crlnumber
+openssl ca -config crl.cnf -revoke client-usg-revoked.crt -crl_reason keyCompromise 2>/dev/null
+openssl ca -config crl.cnf -gencrl -out ca.crl 2>/dev/null
+openssl crl -in ca.crl -noout -text | grep -q "Serial Number: $(openssl x509 -in client-usg-revoked.crt -noout -serial | cut -d= -f2)" \
+    || { echo "gen-certs: CRL does not list client-usg-revoked" >&2; exit 1; }
+
+rm -f ext.cnf crl.cnf ca.srl index.txt index.txt.* crlnumber crlnumber.old
 chmod 0644 ./*
 echo "gen-certs: wrote test PKI to $out"
 ls -1 "$out"

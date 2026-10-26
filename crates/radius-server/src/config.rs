@@ -263,6 +263,10 @@ pub struct RadSecConfig {
     /// CA bundle used to verify NAS client certificates (PEM). Always required —
     /// RadSec is mutually authenticated.
     pub client_ca_path: String,
+    /// CRL/OCSP revocation checking of NAS client certificates. Omitted ⇒ chain
+    /// validation only. Needs a binary built with the `revocation` feature.
+    #[serde(default)]
+    pub revocation: Option<RevocationConfig>,
 }
 
 /// Management API security configuration. Enforcement is *opt-in*: when an
@@ -317,10 +321,250 @@ pub struct EapTlsConfig {
     pub ca_path: Option<String>,
     #[serde(default)]
     pub require_client_cert: bool,
+    /// CRL/OCSP revocation checking of supplicant certificates. Requires
+    /// `require_client_cert` and `ca_path`. Omitted ⇒ chain validation only.
+    /// Needs a binary built with the `revocation` feature.
+    #[serde(default)]
+    pub revocation: Option<RevocationConfig>,
+}
+
+/// Certificate revocation checking for peer certificates (EAP-TLS supplicants
+/// under `eap.tls.revocation`, RadSec NAS clients under `radsec.revocation`).
+///
+/// Revocation is checked at TLS handshake time, after the certificate chain
+/// has been validated against the CA bundle. Fetches block the handshake for
+/// at most the configured timeout; prefer static CRL files (or short timeouts)
+/// where the RADIUS client's own timeout is tight.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevocationConfig {
+    /// Which sources to consult. Default `crl_only`.
+    #[serde(default)]
+    pub mode: RevocationMode,
+    /// What to do when the status cannot be determined (CRL/OCSP unreachable,
+    /// stale, unparseable, or no source covers the certificate). Default
+    /// `fail_closed`: reject the client. A positive "revoked" answer always
+    /// rejects, whatever this is set to.
+    #[serde(default)]
+    pub on_error: RevocationFailurePolicy,
+    /// CRL settings (used by `crl_only`, `prefer_ocsp` and `both`).
+    #[serde(default)]
+    pub crl: CrlSettings,
+    /// OCSP settings (used by `ocsp_only`, `prefer_ocsp` and `both`).
+    #[serde(default)]
+    pub ocsp: OcspSettings,
+}
+
+impl Default for RevocationConfig {
+    fn default() -> Self {
+        Self {
+            mode: RevocationMode::CrlOnly,
+            on_error: RevocationFailurePolicy::FailClosed,
+            crl: CrlSettings::default(),
+            ocsp: OcspSettings::default(),
+        }
+    }
+}
+
+/// Revocation sources to consult.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RevocationMode {
+    /// CRLs only: static files first, then the certificate's CRL Distribution
+    /// Points when `crl.fetch` is on.
+    #[default]
+    CrlOnly,
+    /// OCSP only, against the responder in the certificate's Authority
+    /// Information Access extension.
+    OcspOnly,
+    /// OCSP first; CRL when OCSP cannot answer.
+    PreferOcsp,
+    /// Both OCSP and CRL; revoked by either ⇒ rejected.
+    Both,
+}
+
+impl RevocationMode {
+    /// Whether this mode consults CRLs.
+    pub fn uses_crl(self) -> bool {
+        matches!(self, Self::CrlOnly | Self::PreferOcsp | Self::Both)
+    }
+
+    /// Whether this mode consults OCSP.
+    pub fn uses_ocsp(self) -> bool {
+        matches!(self, Self::OcspOnly | Self::PreferOcsp | Self::Both)
+    }
+}
+
+/// What to do when revocation status cannot be determined.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RevocationFailurePolicy {
+    /// Reject the client (secure default).
+    #[default]
+    FailClosed,
+    /// Accept the client and log a warning. Availability over security; only
+    /// for environments that accept the exposure.
+    FailOpen,
+}
+
+/// CRL source, fetch and cache settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CrlSettings {
+    /// CRL files (PEM or DER) loaded at startup and matched to certificates
+    /// by issuer. Suits air-gapped deployments; refresh them (and restart)
+    /// before `nextUpdate` or the check fails per `on_error`.
+    #[serde(default)]
+    pub static_files: Vec<String>,
+    /// Fetch CRLs over HTTP(S) from the certificate's CRL Distribution Points
+    /// when no current static CRL covers its issuer. Default true.
+    #[serde(default = "default_true")]
+    pub fetch: bool,
+    /// HTTP timeout per fetch, seconds. Default 5.
+    #[serde(default = "default_revocation_timeout_secs")]
+    pub fetch_timeout_secs: u64,
+    /// How long a fetched CRL is reused, seconds (also bounded by its
+    /// `nextUpdate`). Default 3600.
+    #[serde(default = "default_revocation_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// Maximum number of fetched CRLs kept in memory. Default 100.
+    #[serde(default = "default_revocation_cache_entries")]
+    pub max_cache_entries: usize,
+    /// Largest CRL accepted from a distribution point, bytes. Default 10 MiB.
+    #[serde(default = "default_crl_max_size_bytes")]
+    pub max_size_bytes: usize,
+}
+
+impl Default for CrlSettings {
+    fn default() -> Self {
+        Self {
+            static_files: Vec::new(),
+            fetch: true,
+            fetch_timeout_secs: default_revocation_timeout_secs(),
+            cache_ttl_secs: default_revocation_cache_ttl_secs(),
+            max_cache_entries: default_revocation_cache_entries(),
+            max_size_bytes: default_crl_max_size_bytes(),
+        }
+    }
+}
+
+/// OCSP fetch and cache settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OcspSettings {
+    /// HTTP timeout per responder query, seconds. Default 5.
+    #[serde(default = "default_revocation_timeout_secs")]
+    pub fetch_timeout_secs: u64,
+    /// Upper bound on how long a response is reused, seconds (also bounded by
+    /// its `nextUpdate`). Default 3600.
+    #[serde(default = "default_revocation_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// Maximum number of responses kept in memory. Default 100.
+    #[serde(default = "default_revocation_cache_entries")]
+    pub max_cache_entries: usize,
+    /// Send an RFC 8954 nonce and require the responder to echo it. Default
+    /// true.
+    #[serde(default = "default_true")]
+    pub nonce: bool,
+    /// Largest OCSP response accepted, bytes. Default 1 MiB.
+    #[serde(default = "default_ocsp_max_response_bytes")]
+    pub max_response_size_bytes: usize,
+}
+
+impl Default for OcspSettings {
+    fn default() -> Self {
+        Self {
+            fetch_timeout_secs: default_revocation_timeout_secs(),
+            cache_ttl_secs: default_revocation_cache_ttl_secs(),
+            max_cache_entries: default_revocation_cache_entries(),
+            nonce: true,
+            max_response_size_bytes: default_ocsp_max_response_bytes(),
+        }
+    }
+}
+
+impl RevocationConfig {
+    /// Validate the block; `at` names it in errors (`eap.tls.revocation`,
+    /// `radsec.revocation`).
+    ///
+    /// Without the `revocation` cargo feature any block is an error: a config
+    /// that asks for revocation checking must not start a binary that cannot
+    /// enforce it.
+    #[cfg(not(feature = "revocation"))]
+    pub fn validate(&self, at: &str) -> Result<(), ConfigError> {
+        Err(ConfigError::Invalid(format!(
+            "{at}: this binary was built without the `revocation` feature, so revocation \
+             checking cannot be enforced; rebuild with `--features revocation` or remove \
+             the block"
+        )))
+    }
+
+    /// Validate the block; `at` names it in errors (`eap.tls.revocation`,
+    /// `radsec.revocation`).
+    #[cfg(feature = "revocation")]
+    pub fn validate(&self, at: &str) -> Result<(), ConfigError> {
+        let invalid = |msg: &str| ConfigError::Invalid(format!("{at}: {msg}"));
+
+        if self.mode.uses_crl() {
+            if !self.crl.fetch && self.crl.static_files.is_empty() {
+                return Err(invalid(
+                    "crl.fetch is false and crl.static_files is empty: no CRL source \
+                     (mode uses CRLs)",
+                ));
+            }
+            if self.crl.static_files.iter().any(|p| p.trim().is_empty()) {
+                return Err(invalid("crl.static_files contains an empty path"));
+            }
+            if self.crl.fetch_timeout_secs == 0 {
+                return Err(invalid("crl.fetch_timeout_secs must be > 0"));
+            }
+            if self.crl.cache_ttl_secs == 0 {
+                return Err(invalid("crl.cache_ttl_secs must be > 0"));
+            }
+            if self.crl.max_cache_entries == 0 {
+                return Err(invalid("crl.max_cache_entries must be > 0"));
+            }
+            if self.crl.max_size_bytes == 0 {
+                return Err(invalid("crl.max_size_bytes must be > 0"));
+            }
+        }
+        if self.mode.uses_ocsp() {
+            if self.ocsp.fetch_timeout_secs == 0 {
+                return Err(invalid("ocsp.fetch_timeout_secs must be > 0"));
+            }
+            if self.ocsp.cache_ttl_secs == 0 {
+                return Err(invalid("ocsp.cache_ttl_secs must be > 0"));
+            }
+            if self.ocsp.max_cache_entries == 0 {
+                return Err(invalid("ocsp.max_cache_entries must be > 0"));
+            }
+            if self.ocsp.max_response_size_bytes == 0 {
+                return Err(invalid("ocsp.max_response_size_bytes must be > 0"));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_revocation_timeout_secs() -> u64 {
+    5
+}
+
+fn default_revocation_cache_ttl_secs() -> u64 {
+    3600
+}
+
+fn default_revocation_cache_entries() -> usize {
+    100
+}
+
+fn default_crl_max_size_bytes() -> usize {
+    10 * 1024 * 1024
+}
+
+fn default_ocsp_max_response_bytes() -> usize {
+    1024 * 1024
 }
 
 fn default_listen_address() -> String {
@@ -478,6 +722,25 @@ impl Config {
             }
         }
 
+        // Revocation checking is only meaningful for verified client certificates.
+        if let Some(eap) = &self.eap
+            && let Some(rev) = &eap.tls.revocation
+        {
+            if !eap.tls.require_client_cert || eap.tls.ca_path.is_none() {
+                return Err(ConfigError::Invalid(
+                    "eap.tls.revocation requires eap.tls.require_client_cert = true and \
+                     eap.tls.ca_path (there is no client certificate to check otherwise)"
+                        .to_string(),
+                ));
+            }
+            rev.validate("eap.tls.revocation")?;
+        }
+        if let Some(radsec) = &self.radsec
+            && let Some(rev) = &radsec.revocation
+        {
+            rev.validate("radsec.revocation")?;
+        }
+
         // Validate management API security config.
         if let Some(mgmt) = &self.mgmt {
             if let Some(tls) = &mgmt.tls
@@ -587,6 +850,7 @@ impl Config {
                 cert_path: "/etc/radius/radsec/server.pem".to_string(),
                 key_path: "/etc/radius/radsec/server.key".to_string(),
                 client_ca_path: "/etc/radius/radsec/nas-ca.pem".to_string(),
+                revocation: None,
             }),
         }
     }
@@ -610,6 +874,235 @@ mod tests {
 
         config.secret = "".to_string();
         assert!(config.validate().is_err());
+    }
+
+    /// Minimal config with an EAP-TLS block carrying the given `revocation` JSON
+    /// (or none when `None`).
+    fn eap_config_json(revocation: Option<&str>, require_client_cert: bool) -> String {
+        let rev = revocation
+            .map(|r| format!(", \"revocation\": {r}"))
+            .unwrap_or_default();
+        format!(
+            r#"{{
+                "secret": "s3cret",
+                "eap": {{
+                    "enable_tls": true,
+                    "enable_teap": false,
+                    "tls": {{
+                        "cert_path": "/certs/server.crt",
+                        "key_path": "/certs/server.key",
+                        "ca_path": "/certs/ca.crt",
+                        "require_client_cert": {require_client_cert}{rev}
+                    }}
+                }}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn revocation_block_is_optional_and_absent_by_default() {
+        let config: Config = serde_json::from_str(&eap_config_json(None, true)).unwrap();
+        assert!(config.eap.as_ref().unwrap().tls.revocation.is_none());
+        assert!(config.validate().is_ok());
+
+        let radsec: RadSecConfig =
+            serde_json::from_str(r#"{"cert_path": "c", "key_path": "k", "client_ca_path": "ca"}"#)
+                .unwrap();
+        assert!(radsec.revocation.is_none());
+    }
+
+    #[test]
+    fn revocation_block_defaults_to_crl_only_fail_closed_with_fetch() {
+        let config: Config = serde_json::from_str(&eap_config_json(Some("{}"), true)).unwrap();
+        let rev = config.eap.unwrap().tls.revocation.unwrap();
+        assert_eq!(rev, RevocationConfig::default());
+        assert_eq!(rev.mode, RevocationMode::CrlOnly);
+        assert_eq!(rev.on_error, RevocationFailurePolicy::FailClosed);
+        assert!(rev.crl.fetch);
+        assert!(rev.crl.static_files.is_empty());
+        assert_eq!(rev.crl.fetch_timeout_secs, 5);
+        assert_eq!(rev.crl.cache_ttl_secs, 3600);
+        assert_eq!(rev.crl.max_cache_entries, 100);
+        assert_eq!(rev.crl.max_size_bytes, 10 * 1024 * 1024);
+        assert_eq!(rev.ocsp.fetch_timeout_secs, 5);
+        assert!(rev.ocsp.nonce);
+        assert_eq!(rev.ocsp.max_response_size_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn revocation_block_parses_every_field_from_eap_and_radsec() {
+        let json = r#"{
+            "secret": "s3cret",
+            "transport": "radsec",
+            "eap": {
+                "enable_tls": true,
+                "tls": {
+                    "cert_path": "c", "key_path": "k", "ca_path": "ca",
+                    "require_client_cert": true,
+                    "revocation": {
+                        "mode": "crl_only",
+                        "on_error": "fail_closed",
+                        "crl": {
+                            "static_files": ["/etc/radius/crl/ca.crl", "/etc/radius/crl/sub.crl"],
+                            "fetch": false,
+                            "fetch_timeout_secs": 3,
+                            "cache_ttl_secs": 600,
+                            "max_cache_entries": 10,
+                            "max_size_bytes": 1048576
+                        }
+                    }
+                }
+            },
+            "radsec": {
+                "cert_path": "c", "key_path": "k", "client_ca_path": "ca",
+                "revocation": {
+                    "mode": "prefer_ocsp",
+                    "on_error": "fail_open",
+                    "ocsp": {
+                        "fetch_timeout_secs": 2,
+                        "cache_ttl_secs": 120,
+                        "max_cache_entries": 50,
+                        "nonce": false,
+                        "max_response_size_bytes": 4096
+                    }
+                }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        let eap = config
+            .eap
+            .as_ref()
+            .unwrap()
+            .tls
+            .revocation
+            .as_ref()
+            .unwrap();
+        assert_eq!(eap.mode, RevocationMode::CrlOnly);
+        assert_eq!(eap.on_error, RevocationFailurePolicy::FailClosed);
+        assert_eq!(
+            eap.crl.static_files,
+            vec!["/etc/radius/crl/ca.crl", "/etc/radius/crl/sub.crl"]
+        );
+        assert!(!eap.crl.fetch);
+        assert_eq!(eap.crl.fetch_timeout_secs, 3);
+        assert_eq!(eap.crl.cache_ttl_secs, 600);
+        assert_eq!(eap.crl.max_cache_entries, 10);
+        assert_eq!(eap.crl.max_size_bytes, 1_048_576);
+        // Untouched sub-block keeps its defaults.
+        assert_eq!(eap.ocsp, OcspSettings::default());
+
+        let radsec = config.radsec.as_ref().unwrap().revocation.as_ref().unwrap();
+        assert_eq!(radsec.mode, RevocationMode::PreferOcsp);
+        assert_eq!(radsec.on_error, RevocationFailurePolicy::FailOpen);
+        assert_eq!(radsec.ocsp.fetch_timeout_secs, 2);
+        assert_eq!(radsec.ocsp.cache_ttl_secs, 120);
+        assert_eq!(radsec.ocsp.max_cache_entries, 50);
+        assert!(!radsec.ocsp.nonce);
+        assert_eq!(radsec.ocsp.max_response_size_bytes, 4096);
+        assert_eq!(radsec.crl, CrlSettings::default());
+
+        // Round-trips through serde unchanged.
+        let again: Config = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(again.eap.unwrap().tls.revocation.unwrap(), *eap);
+        assert_eq!(again.radsec.unwrap().revocation.unwrap(), *radsec);
+
+        #[cfg(feature = "revocation")]
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
+    }
+
+    #[test]
+    fn revocation_mode_and_policy_reject_unknown_values() {
+        let bad_mode = eap_config_json(Some(r#"{"mode": "sometimes"}"#), true);
+        assert!(serde_json::from_str::<Config>(&bad_mode).is_err());
+        let bad_policy = eap_config_json(Some(r#"{"on_error": "shrug"}"#), true);
+        assert!(serde_json::from_str::<Config>(&bad_policy).is_err());
+    }
+
+    #[test]
+    fn revocation_mode_source_predicates() {
+        assert!(RevocationMode::CrlOnly.uses_crl());
+        assert!(!RevocationMode::CrlOnly.uses_ocsp());
+        assert!(!RevocationMode::OcspOnly.uses_crl());
+        assert!(RevocationMode::OcspOnly.uses_ocsp());
+        assert!(RevocationMode::PreferOcsp.uses_crl() && RevocationMode::PreferOcsp.uses_ocsp());
+        assert!(RevocationMode::Both.uses_crl() && RevocationMode::Both.uses_ocsp());
+    }
+
+    #[test]
+    fn revocation_requires_verified_client_certificates() {
+        // No client cert is ever presented, so there is nothing to revoke.
+        let config: Config = serde_json::from_str(&eap_config_json(Some("{}"), false)).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("require_client_cert"), "{err}");
+
+        // require_client_cert without a CA bundle is equally meaningless.
+        let json = r#"{
+            "secret": "s3cret",
+            "eap": {"enable_tls": true, "tls": {"cert_path": "c", "key_path": "k",
+                    "require_client_cert": true, "revocation": {}}}
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("ca_path"), "{err}");
+    }
+
+    #[cfg(feature = "revocation")]
+    #[test]
+    fn revocation_validation_rejects_crl_mode_without_a_crl_source() {
+        let rev = r#"{"mode": "crl_only", "crl": {"fetch": false}}"#;
+        let config: Config = serde_json::from_str(&eap_config_json(Some(rev), true)).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("eap.tls.revocation") && err.contains("no CRL source"),
+            "{err}"
+        );
+
+        // OCSP-only does not need a CRL source.
+        let rev = r#"{"mode": "ocsp_only", "crl": {"fetch": false}}"#;
+        let config: Config = serde_json::from_str(&eap_config_json(Some(rev), true)).unwrap();
+        assert!(config.validate().is_ok());
+    }
+
+    #[cfg(feature = "revocation")]
+    #[test]
+    fn revocation_validation_rejects_zero_limits_and_empty_paths() {
+        for rev in [
+            r#"{"crl": {"fetch_timeout_secs": 0}}"#,
+            r#"{"crl": {"cache_ttl_secs": 0}}"#,
+            r#"{"crl": {"max_cache_entries": 0}}"#,
+            r#"{"crl": {"max_size_bytes": 0}}"#,
+            r#"{"crl": {"fetch": false, "static_files": [""]}}"#,
+            r#"{"mode": "ocsp_only", "ocsp": {"fetch_timeout_secs": 0}}"#,
+            r#"{"mode": "both", "ocsp": {"cache_ttl_secs": 0}}"#,
+            r#"{"mode": "prefer_ocsp", "ocsp": {"max_cache_entries": 0}}"#,
+            r#"{"mode": "ocsp_only", "ocsp": {"max_response_size_bytes": 0}}"#,
+        ] {
+            let config: Config = serde_json::from_str(&eap_config_json(Some(rev), true)).unwrap();
+            assert!(config.validate().is_err(), "should reject {rev}");
+        }
+        // The same rules apply to the RadSec block, named as such.
+        let json = r#"{
+            "secret": "s3cret",
+            "radsec": {"cert_path": "c", "key_path": "k", "client_ca_path": "ca",
+                       "revocation": {"crl": {"fetch_timeout_secs": 0}}}
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.starts_with("Invalid configuration: radsec.revocation"),
+            "{err}"
+        );
+    }
+
+    #[cfg(not(feature = "revocation"))]
+    #[test]
+    fn revocation_block_is_rejected_when_the_feature_is_compiled_out() {
+        // Fail closed: a config that asks for revocation checking must not
+        // start a binary that cannot enforce it.
+        let config: Config = serde_json::from_str(&eap_config_json(Some("{}"), true)).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("revocation"), "{err}");
     }
 
     #[test]

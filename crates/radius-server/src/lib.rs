@@ -48,6 +48,8 @@ pub mod accounting;
 pub mod audit;
 pub mod buffer_pool;
 pub mod cache;
+#[cfg(feature = "tls")]
+pub mod client_verifier;
 pub mod coa;
 pub mod config;
 pub mod eap_auth;

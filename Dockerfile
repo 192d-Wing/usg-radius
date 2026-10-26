@@ -43,11 +43,12 @@ FROM chef AS builder
 ENV OPENSSL_STATIC=1
 COPY --from=planner /build/recipe.json recipe.json
 # Build the feature set we ship: observability (health + Prometheus metrics HTTP
-# servers) and tls (RadSec transport + EAP-TLS/TEAP via rustls + aws-lc-rs, which
-# is why the chef stage needs cmake + perl to compile aws-lc on musl).
-RUN cargo chef cook --release -p radius-server --no-default-features --features observability,tls --recipe-path recipe.json
+# servers), tls (RadSec transport + EAP-TLS/TEAP via rustls + aws-lc-rs, which
+# is why the chef stage needs cmake + perl to compile aws-lc on musl) and
+# revocation (CRL/OCSP checking of supplicant and NAS client certificates).
+RUN cargo chef cook --release -p radius-server --no-default-features --features observability,tls,revocation --recipe-path recipe.json
 COPY . .
-RUN cargo build --release -p radius-server --no-default-features --features observability,tls --bin usg-radius \
+RUN cargo build --release -p radius-server --no-default-features --features observability,tls,revocation --bin usg-radius \
     && strip target/release/usg-radius
 
 # ---- runtime: minimal Iron Bank Alpine, non-root ----
