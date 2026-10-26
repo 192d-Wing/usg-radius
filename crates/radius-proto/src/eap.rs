@@ -723,6 +723,13 @@ pub mod eap_tls {
     }
 
     impl TlsFragmentAssembler {
+        /// Upper bound on a reassembled inbound TLS message (the RFC 5216 §3.1
+        /// TLS Message Length and the sum of the fragments). The peer is
+        /// unauthenticated while it fragments, so the buffer must be bounded;
+        /// 64 KiB holds any realistic certificate chain (FreeRADIUS caps the
+        /// same buffer at 16 KiB).
+        pub const MAX_MESSAGE_LENGTH: usize = 64 * 1024;
+
         /// Create a new assembler
         pub fn new() -> Self {
             TlsFragmentAssembler {
@@ -733,8 +740,17 @@ pub mod eap_tls {
 
         /// Add a fragment
         ///
-        /// Returns Some(complete_data) when all fragments are received
+        /// Returns Some(complete_data) when all fragments are received. Any
+        /// error resets the assembler and must end the EAP conversation
+        /// (RFC 5216 §2.1.5 / §3.1, fail closed):
+        /// - the first fragment of a fragmented message must carry L and a
+        ///   non-zero TLS Message Length no larger than [`Self::MAX_MESSAGE_LENGTH`];
+        /// - a fragment may not carry the message past the announced length;
+        /// - a fragment with M set must carry data (otherwise the peer could
+        ///   hold the session open with ACK round trips that never progress).
         pub fn add_fragment(&mut self, packet: &EapTlsPacket) -> Result<Option<Vec<u8>>, EapError> {
+            self.check_fragment(packet).inspect_err(|_| self.reset())?;
+
             // Set expected length from first packet with L flag
             if packet.flags.length_included() && self.expected_length.is_none() {
                 self.expected_length = packet.tls_message_length;
@@ -749,7 +765,9 @@ pub mod eap_tls {
                 if let Some(expected) = self.expected_length
                     && self.fragments.len() != expected as usize
                 {
-                    return Err(EapError::InvalidLength(self.fragments.len()));
+                    let got = self.fragments.len();
+                    self.reset();
+                    return Err(EapError::InvalidLength(got));
                 }
 
                 // Take the assembled message and reset for the next inbound
@@ -763,6 +781,38 @@ pub mod eap_tls {
             } else {
                 Ok(None)
             }
+        }
+
+        /// Validate a fragment against the RFC 5216 §2.1.5 / §3.1 framing rules
+        /// and the reassembly bound before any byte of it is buffered.
+        fn check_fragment(&self, packet: &EapTlsPacket) -> Result<(), EapError> {
+            let first = self.fragments.is_empty() && self.expected_length.is_none();
+            if packet.flags.more_fragments() && packet.tls_data.is_empty() {
+                return Err(EapError::InvalidLength(0));
+            }
+            if first && packet.flags.more_fragments() && !packet.flags.length_included() {
+                // RFC 5216 §3.1: L MUST be set on the first fragment of a
+                // fragmented message. Without it nothing bounds the buffer.
+                return Err(EapError::InvalidLength(0));
+            }
+            if packet.flags.length_included() {
+                let announced = packet.tls_message_length.unwrap_or(0) as usize;
+                if announced == 0 || announced > Self::MAX_MESSAGE_LENGTH {
+                    return Err(EapError::InvalidLength(announced));
+                }
+            }
+            let limit = match self.expected_length {
+                Some(expected) => expected as usize,
+                None if first && packet.flags.length_included() => {
+                    packet.tls_message_length.unwrap_or(0) as usize
+                }
+                None => Self::MAX_MESSAGE_LENGTH,
+            };
+            let total = self.fragments.len() + packet.tls_data.len();
+            if total > limit {
+                return Err(EapError::InvalidLength(total));
+            }
+            Ok(())
         }
 
         /// Reset the assembler
@@ -1398,6 +1448,13 @@ pub mod eap_tls {
             &mut self,
             eap_tls_packet: &EapTlsPacket,
         ) -> Result<Option<Vec<u8>>, EapError> {
+            // RFC 5216 §3.2: the S bit is only meaningful in an EAP-TLS Start
+            // sent by the server. A peer that sets it would reset our
+            // reassembly state and, with M, be acknowledged forever.
+            if eap_tls_packet.flags.start() {
+                return Err(EapError::InvalidState);
+            }
+
             // Reassemble fragments if needed
             let tls_data = match self.context.process_incoming(eap_tls_packet)? {
                 Some(data) => data,
@@ -3305,6 +3362,110 @@ mod tests {
             );
             let result = assembler.add_fragment(&frag2);
             assert!(matches!(result, Err(EapError::InvalidLength(_))));
+        }
+
+        /// RFC 5216 §3.1: the first fragment of a fragmented message MUST
+        /// carry L and the TLS Message Length. Without it there is no bound.
+        #[test]
+        fn fragment_assembler_rejects_first_fragment_without_length() {
+            let mut assembler = TlsFragmentAssembler::new();
+            let frag = EapTlsPacket::new(TlsFlags::new(false, true, false), None, vec![1, 2, 3]);
+            assert!(matches!(
+                assembler.add_fragment(&frag),
+                Err(EapError::InvalidLength(0))
+            ));
+            // The assembler is clean afterwards: an unfragmented message works.
+            let whole = EapTlsPacket::new(TlsFlags::new(false, false, false), None, vec![9]);
+            assert_eq!(assembler.add_fragment(&whole).unwrap(), Some(vec![9]));
+        }
+
+        #[test]
+        fn fragment_assembler_rejects_absurd_or_zero_announced_length() {
+            let mut assembler = TlsFragmentAssembler::new();
+            let huge = EapTlsPacket::new(
+                TlsFlags::new(true, true, false),
+                Some(u32::MAX),
+                vec![1, 2, 3],
+            );
+            assert!(matches!(
+                assembler.add_fragment(&huge),
+                Err(EapError::InvalidLength(_))
+            ));
+            let over = EapTlsPacket::new(
+                TlsFlags::new(true, true, false),
+                Some(TlsFragmentAssembler::MAX_MESSAGE_LENGTH as u32 + 1),
+                vec![1, 2, 3],
+            );
+            assert!(matches!(
+                assembler.add_fragment(&over),
+                Err(EapError::InvalidLength(_))
+            ));
+            let zero = EapTlsPacket::new(TlsFlags::new(true, true, false), Some(0), vec![1]);
+            assert!(matches!(
+                assembler.add_fragment(&zero),
+                Err(EapError::InvalidLength(0))
+            ));
+            // Exactly the maximum is allowed.
+            let max = EapTlsPacket::new(
+                TlsFlags::new(true, true, false),
+                Some(TlsFragmentAssembler::MAX_MESSAGE_LENGTH as u32),
+                vec![0u8; 1000],
+            );
+            assert_eq!(assembler.add_fragment(&max).unwrap(), None);
+        }
+
+        /// A non-final fragment that carries the message past the announced
+        /// length is rejected at once, not when (if ever) M clears.
+        #[test]
+        fn fragment_assembler_rejects_overrun_before_final_fragment() {
+            let mut assembler = TlsFragmentAssembler::new();
+            let first = EapTlsPacket::new(TlsFlags::new(true, true, false), Some(5), vec![1, 2, 3]);
+            assert_eq!(assembler.add_fragment(&first).unwrap(), None);
+            let overrun = EapTlsPacket::new(TlsFlags::new(false, true, false), None, vec![4, 5, 6]);
+            assert!(matches!(
+                assembler.add_fragment(&overrun),
+                Err(EapError::InvalidLength(6))
+            ));
+            // Reset on error: the next message starts from scratch.
+            let whole = EapTlsPacket::new(TlsFlags::new(false, false, false), None, vec![7]);
+            assert_eq!(assembler.add_fragment(&whole).unwrap(), Some(vec![7]));
+        }
+
+        /// M set with no data would let a peer hold the session with ACK
+        /// round trips that never progress.
+        #[test]
+        fn fragment_assembler_rejects_empty_non_final_fragment() {
+            let mut assembler = TlsFragmentAssembler::new();
+            let first =
+                EapTlsPacket::new(TlsFlags::new(true, true, false), Some(10), vec![1, 2, 3]);
+            assert_eq!(assembler.add_fragment(&first).unwrap(), None);
+            let empty = EapTlsPacket::new(TlsFlags::new(false, true, false), None, Vec::new());
+            assert!(matches!(
+                assembler.add_fragment(&empty),
+                Err(EapError::InvalidLength(0))
+            ));
+            let empty_first = EapTlsPacket::new(TlsFlags::new(true, true, false), Some(10), vec![]);
+            assert!(matches!(
+                assembler.add_fragment(&empty_first),
+                Err(EapError::InvalidLength(0))
+            ));
+        }
+
+        /// An unfragmented message larger than the bound is rejected too
+        /// (nothing on the wire can exceed a 4096-byte RADIUS packet, but the
+        /// assembler should not rely on that).
+        #[test]
+        fn fragment_assembler_bounds_unfragmented_message() {
+            let mut assembler = TlsFragmentAssembler::new();
+            let big = EapTlsPacket::new(
+                TlsFlags::new(false, false, false),
+                None,
+                vec![0u8; TlsFragmentAssembler::MAX_MESSAGE_LENGTH + 1],
+            );
+            assert!(matches!(
+                assembler.add_fragment(&big),
+                Err(EapError::InvalidLength(_))
+            ));
         }
 
         #[test]
