@@ -136,7 +136,7 @@ path = "tools/radius_load_test.rs"
 default = ["observability", "tls"]
 tls = ["radius-proto/tls", "radius-server/tls"]
 observability = ["radius-server/observability"]
-revocation = ["radius-proto/revocation"]
+revocation = ["radius-proto/revocation", "radius-server/revocation"]
 
 [dev-dependencies]
 criterion.workspace = true

@@ -138,6 +138,53 @@ impl EapAuthHandler {
         Ok(())
     }
 
+    /// Configure EAP-TLS for a realm from an already-built rustls `ServerConfig`
+    /// (e.g. one whose client verifier checks revocation; see
+    /// [`Self::configure_from_config`]).
+    #[cfg(feature = "tls")]
+    pub fn configure_tls_with_server_config(
+        &mut self,
+        realm: &str,
+        server_config: StdArc<rustls::ServerConfig>,
+    ) {
+        let mut configs = self.tls_configs.write().unwrap();
+        configs.insert(realm.to_string(), server_config);
+    }
+
+    /// Configure EAP-TEAP for a realm from an already-built rustls `ServerConfig`.
+    #[cfg(feature = "tls")]
+    pub fn configure_teap_with_server_config(
+        &mut self,
+        realm: &str,
+        server_config: StdArc<rustls::ServerConfig>,
+    ) {
+        let mut configs = self.tls_configs.write().unwrap();
+        configs.insert(format!("teap_{}", realm), server_config);
+    }
+
+    /// Configure EAP-TLS and/or EAP-TEAP (default realm) from the server's
+    /// `eap` config block.
+    ///
+    /// Builds one rustls `ServerConfig` from `eap.tls`: server certificate and
+    /// key, a WebPKI client verifier over `ca_path` when `require_client_cert`
+    /// is set, wrapped in CRL/OCSP revocation checking when `eap.tls.revocation`
+    /// is present (see [`crate::client_verifier`]). The same config serves both
+    /// methods, as in [`Self::configure_tls`] / [`Self::configure_teap`].
+    #[cfg(feature = "tls")]
+    pub fn configure_from_config(
+        &mut self,
+        eap_cfg: &crate::config::EapConfig,
+    ) -> Result<(), String> {
+        let server_config = StdArc::new(build_eap_server_config(&eap_cfg.tls)?);
+        if eap_cfg.enable_teap {
+            self.configure_teap_with_server_config("", server_config.clone());
+        }
+        if eap_cfg.enable_tls {
+            self.configure_tls_with_server_config("", server_config);
+        }
+        Ok(())
+    }
+
     /// Configure EAP-TEAP for a specific realm or default
     ///
     /// # Arguments
@@ -761,6 +808,47 @@ impl EapAuthHandler {
     }
 }
 
+/// Build the rustls `ServerConfig` for the `eap.tls` block.
+///
+/// Client certificates are requested and verified only when
+/// `require_client_cert` is set (`ca_path` is then required); with
+/// `revocation` present the verifier also checks CRL/OCSP status. Returns the
+/// chosen verifier kind in the log line so operators can confirm it.
+#[cfg(feature = "tls")]
+pub fn build_eap_server_config(
+    tls: &crate::config::EapTlsConfig,
+) -> Result<rustls::ServerConfig, String> {
+    use radius_proto::eap::eap_tls::build_server_config_with_client_verifier;
+
+    let cert_config = TlsCertificateConfig::new(
+        tls.cert_path.clone(),
+        tls.key_path.clone(),
+        tls.ca_path.clone(),
+        tls.require_client_cert,
+    );
+    let client_verifier = if tls.require_client_cert {
+        let ca_path = tls.ca_path.as_deref().ok_or_else(|| {
+            "eap.tls.require_client_cert = true but eap.tls.ca_path is not set".to_string()
+        })?;
+        let verifier =
+            crate::client_verifier::build_client_verifier(ca_path, None, tls.revocation.as_ref())
+                .map_err(|e| e.to_string())?;
+        if verifier.checks_revocation() {
+            tracing::info!("EAP-TLS: supplicant certificates are checked for revocation");
+        }
+        Some(verifier.into_arc())
+    } else {
+        if tls.revocation.is_some() {
+            return Err(
+                "eap.tls.revocation requires eap.tls.require_client_cert = true".to_string(),
+            );
+        }
+        None
+    };
+    build_server_config_with_client_verifier(&cert_config, client_verifier)
+        .map_err(|e| format!("Failed to build TLS config: {:?}", e))
+}
+
 impl AuthHandler for EapAuthHandler {
     fn authenticate(&self, _username: &str, _password: &str) -> bool {
         // EAP doesn't use simple PAP authentication
@@ -1013,6 +1101,55 @@ mod eap_tls_mppe_tests {
             )
             .unwrap();
         handler
+    }
+
+    #[test]
+    fn configure_from_config_builds_tls_and_teap_from_the_eap_block() {
+        use crate::config::{EapConfig, EapTlsConfig};
+
+        let pki = gen_pki();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut handler = EapAuthHandler::new(Arc::new(SimpleAuthHandler::new()));
+        let cfg = EapConfig {
+            enable_tls: true,
+            enable_teap: true,
+            tls: EapTlsConfig {
+                cert_path: pki.cert_path.clone(),
+                key_path: pki.key_path.clone(),
+                ca_path: None,
+                require_client_cert: false,
+                revocation: None,
+            },
+        };
+        handler.configure_from_config(&cfg).unwrap();
+        let configs = handler.tls_configs.read().unwrap();
+        assert!(configs.contains_key(""), "EAP-TLS default realm configured");
+        assert!(
+            configs.contains_key("teap_"),
+            "EAP-TEAP default realm configured"
+        );
+    }
+
+    #[test]
+    fn configure_from_config_rejects_revocation_without_client_certs() {
+        use crate::config::{EapConfig, EapTlsConfig, RevocationConfig};
+
+        let pki = gen_pki();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut handler = EapAuthHandler::new(Arc::new(SimpleAuthHandler::new()));
+        let cfg = EapConfig {
+            enable_tls: true,
+            enable_teap: false,
+            tls: EapTlsConfig {
+                cert_path: pki.cert_path.clone(),
+                key_path: pki.key_path.clone(),
+                ca_path: None,
+                require_client_cert: false,
+                revocation: Some(RevocationConfig::default()),
+            },
+        };
+        let err = handler.configure_from_config(&cfg).unwrap_err();
+        assert!(err.contains("require_client_cert"), "{err}");
     }
 
     /// Minimal in-memory EAP-TLS peer (RFC 5216 §2.1.1 flow, server-only

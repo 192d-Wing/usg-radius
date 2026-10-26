@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Certificate revocation checking (CRL/OCSP) for EAP-TLS and RadSec.** The
+  `radius-proto` revocation module (CRL parsing, CRL Distribution Point
+  fetching with TTL cache, static CRL files, OCSP with RFC 8954 nonce, check
+  modes `crl_only` / `ocsp_only` / `prefer_ocsp` / `both`) is now wired into
+  the server behind a new `revocation` cargo feature of `radius-server`. An
+  optional `revocation` block under `eap.tls` (supplicant certificates) and
+  under `radsec` (NAS client certificates) selects the mode, the fail policy
+  (`on_error`: `fail_closed` by default, `fail_open` opt-in), static CRL files
+  and the CRL/OCSP fetch, timeout, cache and size limits; the rustls
+  `WebPkiClientVerifier` each listener already used is wrapped in
+  `RevocationCheckingVerifier`, and a listener without the block keeps the
+  plain verifier. Configuration is validated at startup (the block needs
+  `require_client_cert` + `ca_path`, a CRL mode needs a CRL source, zero limits
+  are rejected, and a binary built without the feature refuses a config that
+  asks for it). `examples/configs/eap-tls-revocation.json` documents every
+  field. The container image, the release binary and the interop image are
+  built with `observability,tls,revocation`; CI also runs the test suite with
+  `--all-features`. Closes the HIGH-priority revocation gap in
+  `docs/docs/protocol/RFC-COMPLIANCE.md`.
+- **Interop harness: revoked supplicant.** `tests/interop/gen-certs.sh` issues a
+  third client certificate (`revoked@usg.test`) and a CRL from the test CA that
+  revokes it; the usg-radius home server loads that CRL as a static file
+  (fail-closed), the proxy routes realm `usg.test` to it, and `run-tests.sh`
+  asserts that the revoked certificate's EAP-TLS fails with an EAP-Failure
+  while the valid one still succeeds, both straight at usg-radius and through
+  the proxy (24 assertions, up from 15).
 - **`/radius-workflow` multi-agent development skill** (`.claude/skills/radius-workflow/`)
   with eight specialist subagents in `.claude/agents/` (architect, coder, QA,
   security, crypto/FIPS, RFC conformance, docs scribe, release engineer),
@@ -16,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the interop harness) → parallel review → fix loop → docs → release gate. A
   root `CLAUDE.md` documents the workflow, the CI-equivalent commands and the
   project's rules of the road.
+- **Interop test in CI.** `.github/workflows/interop.yml` runs
 - **Interop test in CI.** `.github/workflows/interop.yml` runs
   `tests/interop/run.sh` (usg-radius as proxy and as EAP-TLS home server
   against FreeRADIUS 3.2 and eapol_test, 15 assertions) on `ubuntu-latest`:
@@ -62,6 +89,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **EAP Access-Rejects carried no EAP-Failure.** When an EAP method failed
+  inside the handler (TLS handshake error, certificate rejected), the generic
+  reject path returned a bare Access-Reject with no `EAP-Message`, so the
+  supplicant logged "could not extract EAP-Message" and gave up by timeout
+  rather than on a clean EAP-Failure. RFC 3579 §2.6.3 requires the
+  EAP-Failure; it is now attached (Identifier echoing the peer's last
+  EAP-Response) to every Access-Reject that ends an EAP conversation, and the
+  Message-Authenticator is computed over it as before. The policy-deny path
+  already did this.
+- **Revocation module: static CRL files were never loaded, and CRL serials with
+  the top bit set never matched.** `RevocationCheckingVerifier` ignored
+  `CrlConfig::static_crl_paths` and could only check CRLs fetched from a
+  Distribution Point; it now parses the files (PEM or DER) when built and
+  consults the one matching the certificate's issuer first, falling back to
+  the Distribution Points only when HTTP fetching is enabled, and fails at
+  startup on a missing or unparseable file. Revoked serials are now stored as
+  the minimal big-endian integer (as `X509Certificate::serial` is) rather than
+  the raw DER content octets, which carry a `0x00` pad for serials with the
+  high bit set. OCSP requests, which need the issuer certificate, now find it
+  among the handshake intermediates or the configured CA certificates instead
+  of returning "not yet implemented"; an inconclusive check surfaces as
+  `CertificateError::Other` with the reason rather than as "revoked". OCSP
+  response signatures are still not verified (documented in
+  RFC-COMPLIANCE.md).
 - **CI Docker Build failed on every Dependabot PR after the public-Alpine
   fallback (#66): `adduser: uid '999' in use`.** The Iron Bank Alpine image has
   uid/gid 999 free; the public `alpine:3.22` image already uses gid 999 for its

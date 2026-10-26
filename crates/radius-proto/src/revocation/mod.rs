@@ -12,8 +12,13 @@
 //! - **HTTP Fetching**: Automatic CRL download from certificate distribution points
 //! - **Thread-Safe Caching**: TTL-based caching with LRU eviction using DashMap
 //! - **Fail-Open/Fail-Closed**: Configurable error handling policy
-//! - **Static CRL Files**: Support for pre-loaded CRL files (air-gapped environments)
-//! - **rustls Integration**: Custom `ClientCertVerifier` for seamless TLS integration
+//! - **Static CRL Files**: Pre-loaded CRL files (PEM or DER), matched to the
+//!   certificate by issuer and consulted before any Distribution Point fetch
+//!   (air-gapped environments)
+//! - **rustls Integration**: Custom `ClientCertVerifier` that wraps the
+//!   deployment's `WebPkiClientVerifier` (`RevocationCheckingVerifier::with_webpki_verifier`);
+//!   `radius-server` plugs it into the EAP-TLS and RadSec listeners when a
+//!   `revocation` config block is present
 //! - **O(1) Revocation Lookup**: HashSet-based serial number checking
 //!
 //! # Quick Start
@@ -304,7 +309,7 @@ pub use error::RevocationError;
 pub use verifier::RevocationCheckingVerifier;
 
 /// Module version for tracking implementation progress
-pub const VERSION: &str = "0.6.0 (Phase 1: CRL Support Complete)";
+pub const VERSION: &str = "0.12.0 (CRL + OCSP, integrated into radius-server)";
 
 /// Ensure a process-level rustls [`CryptoProvider`](rustls::crypto::CryptoProvider)
 /// is installed before `reqwest` builds a TLS client.

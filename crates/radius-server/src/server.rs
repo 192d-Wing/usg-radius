@@ -1557,6 +1557,24 @@ impl RadiusServer {
                 // Create Access-Reject response
                 let mut response = Packet::new(Code::AccessReject, request.identifier, [0u8; 16]);
 
+                // RFC 3579 §2.6.3: an Access-Reject that ends an EAP conversation
+                // carries an EAP-Failure EAP-Message (Identifier = the peer's last
+                // EAP-Response), so the supplicant terminates the method cleanly
+                // instead of retrying or waiting for a timeout. The method may
+                // fail deep inside the TLS handshake (bad chain, revoked
+                // certificate), where the handler only returns `Reject`, so the
+                // EAP-Failure is attached here for every EAP reject.
+                if let Some(eap_id) = request
+                    .find_attribute(AttributeType::EapMessage as u8)
+                    .and_then(|a| a.value.get(1).copied())
+                    && let Ok(a) = Attribute::new(
+                        AttributeType::EapMessage as u8,
+                        radius_proto::eap::EapPacket::failure(eap_id).to_bytes(),
+                    )
+                {
+                    response.add_attribute(a);
+                }
+
                 // Add attributes from auth handler
                 for attr in config.auth_handler.get_reject_attributes(&username) {
                     response.add_attribute(attr);
@@ -2042,6 +2060,66 @@ mod tests {
             }
             other => panic!("expected Validation rejection, got {other:?}"),
         }
+    }
+
+    /// Encode an Access-Request with a valid Message-Authenticator over `attrs`
+    /// under `secret`.
+    fn signed_access_request_bytes(attrs: Vec<Attribute>, secret: &[u8]) -> Vec<u8> {
+        let mut attrs = attrs;
+        attrs.push(
+            Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]).unwrap(),
+        );
+        let mut bytes = access_request_bytes(attrs);
+        let ma = calculate_message_authenticator(&bytes, secret);
+        // Replace the zeroed Message-Authenticator value in place.
+        let needle = [
+            &[AttributeType::MessageAuthenticator as u8, 18][..],
+            &[0u8; 16],
+        ]
+        .concat();
+        let pos = bytes
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())
+            .expect("zeroed Message-Authenticator present");
+        bytes[pos + 2..pos + 18].copy_from_slice(&ma);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn eap_access_reject_carries_eap_failure() {
+        use rand::RngExt;
+        // A handler that cannot authenticate the EAP peer (the PAP handler
+        // knows no `alice`) ends the conversation with Access-Reject; RFC 3579
+        // §2.6.3 requires that reject to carry EAP-Failure with the peer's
+        // last EAP Identifier, signed by a Message-Authenticator.
+        // A fresh random shared secret: the test only needs both sides to agree.
+        let secret: Vec<u8> = rand::rng().random::<[u8; 16]>().to_vec();
+        let data = signed_access_request_bytes(
+            vec![
+                Attribute::string(AttributeType::UserName as u8, "alice").unwrap(),
+                eap_identity_attr(),
+            ],
+            &secret,
+        );
+        let cfg = msgauth_test_config();
+        let reply =
+            RadiusServer::process_request(&data, "10.0.0.1:1812".parse().unwrap(), &secret, &cfg)
+                .await
+                .expect("reject is a normal reply")
+                .expect("a reply is sent");
+        let reply = Packet::decode(&reply).unwrap();
+        assert_eq!(reply.code, Code::AccessReject);
+        let eap = reply
+            .find_attribute(AttributeType::EapMessage as u8)
+            .expect("EAP Access-Reject must carry EAP-Message");
+        // EAP-Failure: code 4, identifier 1 (the EAP-Response/Identity's), length 4.
+        assert_eq!(eap.value, vec![4, 1, 0, 4]);
+        assert!(
+            reply
+                .find_attribute(AttributeType::MessageAuthenticator as u8)
+                .is_some(),
+            "a reply carrying EAP-Message needs a Message-Authenticator"
+        );
     }
 
     #[tokio::test]

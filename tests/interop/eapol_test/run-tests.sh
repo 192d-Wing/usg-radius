@@ -87,7 +87,7 @@ check "control: NAS secret is not accepted by FreeRADIUS directly (secrets reall
     sh -c "! grep -q 'Received Access-Accept' '$LOG'"
 
 # ---------------------------------------------------------------------------
-section "4. EAP-TLS: eapol_test -> usg-radius as home server (no proxy, TLS 1.3)"
+section "4. EAP-TLS: eapol_test -> usg-radius as home server (no proxy, TLS 1.3, CRL-checked)"
 LOG=$LOGDIR/eap-tls-usg-home.log
 eapol_test -c /etc/eapol_test/eap-tls-usg.conf -a "$USG_HOME" -p 1812 \
     -s "$NAS_USGHOME_SECRET" -r 0 -t 15 -e >"$LOG" 2>&1
@@ -100,6 +100,42 @@ check "MS-MPPE keys from usg-radius match the supplicant MSK (RFC 9190 exporter)
     grep -q 'MPPE keys OK: 1  mismatch: 0' "$LOG"
 check "EAP-Key-Name from usg-radius matches the supplicant's Session-Id (Method-Id exporter)" \
     grep -q 'Locally derived EAP Session-Id matches EAP-Key-Name from server' "$LOG"
+# usg-home enforces certs/ca.crl (fail-closed), so this success also shows the
+# unrevoked certificate passes the CRL check; scenario 5 shows the revoked one fails.
+
+# ---------------------------------------------------------------------------
+section "5. EAP-TLS: revoked supplicant certificate -> usg-radius home server (CRL, fail-closed)"
+LOG=$LOGDIR/eap-tls-revoked-usg-home.log
+eapol_test -c /etc/eapol_test/eap-tls-usg-revoked.conf -a "$USG_HOME" -p 1812 \
+    -s "$NAS_USGHOME_SECRET" -r 0 -t 15 -e >"$LOG" 2>&1
+rc=$?
+summarize_eapol "$LOG"
+check "eapol_test exit status non-zero (rc=$rc)" test "$rc" -ne 0
+check "eapol_test printed FAILURE, not SUCCESS" sh -c "grep -qx 'FAILURE' '$LOG' && ! grep -qx 'SUCCESS' '$LOG'"
+check "EAP-Failure received (rejected, not timed out)" grep -q 'EAP: Status notification: completion (param=failure)' "$LOG"
+
+# ---------------------------------------------------------------------------
+section "6. EAP-TLS: eapol_test -> usg-radius proxy -> usg-radius home server (valid certificate)"
+LOG=$LOGDIR/eap-tls-usg-home-via-proxy.log
+eapol_test -c /etc/eapol_test/eap-tls-usg.conf -a "$PROXY" -p 1812 \
+    -s "$NAS_PROXY_SECRET" -r 0 -t 15 -e >"$LOG" 2>&1
+rc=$?
+summarize_eapol "$LOG"
+check "eapol_test exit status 0 (rc=$rc)" test "$rc" -eq 0
+check "eapol_test printed SUCCESS" grep -qx 'SUCCESS' "$LOG"
+check "MS-MPPE keys re-keyed by the proxy match the supplicant MSK (MPPE keys OK: 1  mismatch: 0)" \
+    grep -q 'MPPE keys OK: 1  mismatch: 0' "$LOG"
+
+# ---------------------------------------------------------------------------
+section "7. EAP-TLS: revoked supplicant certificate -> usg-radius proxy -> usg-radius home server"
+LOG=$LOGDIR/eap-tls-revoked-via-proxy.log
+eapol_test -c /etc/eapol_test/eap-tls-usg-revoked.conf -a "$PROXY" -p 1812 \
+    -s "$NAS_PROXY_SECRET" -r 0 -t 15 -e >"$LOG" 2>&1
+rc=$?
+summarize_eapol "$LOG"
+check "eapol_test exit status non-zero (rc=$rc)" test "$rc" -ne 0
+check "eapol_test printed FAILURE, not SUCCESS" sh -c "grep -qx 'FAILURE' '$LOG' && ! grep -qx 'SUCCESS' '$LOG'"
+check "EAP-Failure relayed through the proxy (rejected, not timed out)" grep -q 'EAP: Status notification: completion (param=failure)' "$LOG"
 
 # ---------------------------------------------------------------------------
 section "result"

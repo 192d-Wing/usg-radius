@@ -4,10 +4,10 @@ This document identifies gaps between the current USG RADIUS implementation and 
 
 ## Summary
 
-**Overall Status**: Production-ready for modern enterprise authentication with EAP-TLS over RadSec, server-originated CoA/Disconnect, comprehensive rate limiting, accounting, and security features. Reflects the code at **v0.11.1** (v0.11.0 plus the release-workflow fix).
+**Overall Status**: Production-ready for modern enterprise authentication with EAP-TLS over RadSec, server-originated CoA/Disconnect, certificate revocation checking, comprehensive rate limiting, accounting, and security features. Reflects the code at **v0.11.1 + unreleased main** (revocation integration).
 
-**Implemented**: Core RADIUS authentication (RFC 2865, PAP + CHAP), Accounting (RFC 2866), Message-Authenticator (RFC 2869 / RFC 3579), EAP-TLS (RFC 5216 / RFC 9190), MS-MPPE key delivery (RFC 2548), RadSec (RFC 6614), CoA/Disconnect (RFC 5176), RADIUS proxy with secret re-keying on both legs, Rate Limiting, DoS Protection
-**Partial**: EAP-TEAP (RFC 7170) inner methods, Status-Server (RFC 5997) edge cases, certificate revocation (implemented in `radius-proto`, not integrated into the server)
+**Implemented**: Core RADIUS authentication (RFC 2865, PAP + CHAP), Accounting (RFC 2866), Message-Authenticator (RFC 2869 / RFC 3579), EAP-TLS (RFC 5216 / RFC 9190), MS-MPPE key delivery (RFC 2548), RadSec (RFC 6614), CoA/Disconnect (RFC 5176), certificate revocation checking (RFC 5280 CRL, RFC 6960 OCSP) for EAP-TLS supplicant and RadSec NAS certificates, RADIUS proxy with secret re-keying on both legs, Rate Limiting, DoS Protection
+**Partial**: EAP-TEAP (RFC 7170) inner methods, Status-Server (RFC 5997) edge cases, OCSP response signature verification
 **Missing**: legacy tunneled EAP methods (TTLS/PEAP), DTLS transport, UDP-originated CoA
 
 **Major Milestones Completed**:
@@ -19,6 +19,7 @@ This document identifies gaps between the current USG RADIUS implementation and 
 - ✅ v0.5.0: EAP-TLS with production key extraction (RFC 5216)
 - ✅ v0.6.0: PostgreSQL and LDAP backends, health checks, Prometheus metrics
 - ✅ v0.7.x: RADIUS proxy, EAP-TEAP Phase 1+2, CRL/OCSP module (`revocation` feature)
+- ✅ Unreleased: CRL/OCSP revocation checking wired into EAP-TLS and RadSec client-certificate verification (`revocation` block, fail-closed default)
 - ✅ v0.9.0: Kubernetes-only deployment, management API mTLS + ABAC, live session index
 - ✅ v0.10.0: RadSec transport (RFC 6614), server-originated CoA/Disconnect (RFC 5176), Message-Authenticator required on EAP requests
 - ✅ v0.10.1: Container image built with the `tls` feature (RadSec / EAP-TLS fix)
@@ -645,29 +646,34 @@ Set `"audit_log_path": "stdout"` (or `"-"`) to emit JSON Lines on stdout for the
 
 ### ⚠️ Partial Implementation
 
-#### Certificate Revocation (CRL/OCSP) ⚠️ IMPLEMENTED, NOT INTEGRATED
+#### Certificate Revocation (CRL/OCSP) ✅ INTEGRATED
 
-**Status**: ⚠️ Module complete in `radius-proto`; not wired into the server
+**Status**: ✅ Wired into EAP-TLS and RadSec client-certificate verification (unreleased, after v0.11.1)
 **RFC**: RFC 5280 (CRL), RFC 6960 (OCSP), RFC 8954 (OCSP nonce)
 
-**Implemented** (behind the `revocation` cargo feature of `radius-proto`, v0.7.x):
+**Implemented** (`revocation` cargo feature of `radius-server`, which enables `radius-proto`'s; built into the container image, the release binary and the interop image):
 
-- ✅ CRL parsing (DER/PEM), HTTP fetching from distribution points, TTL cache, static CRL files
-- ✅ OCSP request building, HTTP POST, response parsing, nonce replay protection, response cache
-- ✅ Check modes: OcspOnly, CrlOnly, PreferOcsp, Both
-- ✅ rustls `ClientCertVerifier` integration
+- ✅ `revocation` config block under `eap.tls` (supplicant certificates) and under `radsec` (NAS client certificates): `mode` (`crl_only` default, `ocsp_only`, `prefer_ocsp`, `both`), `on_error` (`fail_closed` default, `fail_open`), `crl.static_files`, `crl.fetch` + timeout/TTL/cache/size limits, `ocsp` timeout/TTL/cache/nonce/size limits. Validated at startup; a binary without the feature rejects a config that asks for it.
+- ✅ The rustls `WebPkiClientVerifier` of each listener is wrapped in `RevocationCheckingVerifier` when the block is present (chain validation first, then revocation); without the block the plain verifier is used unchanged
+- ✅ Static CRL files (PEM/DER) loaded at startup and matched to the certificate's issuer; CRL Distribution Points fetched over HTTP(S) with TTL cache when enabled; `thisUpdate`/`nextUpdate` freshness enforced
+- ✅ OCSP request per RFC 6960 §4.1.1 (issuer taken from the handshake intermediates or the configured CA bundle), RFC 8954 nonce, response cache bounded by `nextUpdate`
+- ✅ Fail-closed by default: an undeterminable status (no source covers the issuer, fetch/parse/freshness error, responder unreachable) rejects the client; `fail_open` accepts and logs. A positive "revoked" always rejects
+- ✅ Access-Rejects that end an EAP conversation carry EAP-Failure (RFC 3579 §2.6.3), so a revoked supplicant fails promptly rather than by timeout
+- ✅ Tests: config parsing/validation, verifier selection, static-CRL rejection with an rcgen-generated CRL (EAP-TLS verifier and RadSec listener), and the interop harness (revoked `revoked@usg.test` fails with EAP-Failure, valid `eaptls@usg.test` succeeds, both directly and through the proxy; FreeRADIUS/eapol_test)
 
-**Not integrated**:
+**Limitations**:
 
-- ❌ `radius-server` does not depend on the `revocation` feature and `EapConfig` exposes no revocation settings, so EAP-TLS client certificates are **not** checked against a CRL or OCSP responder at runtime
-- ❌ The container image is built with `--features observability,tls` only
-- ❌ RadSec NAS client certificates are likewise not revocation-checked
-
-**Priority**: HIGH for deployments that must revoke compromised client certificates before expiry
+- ⚠️ CRL and OCSP response **signatures are not verified** by the module (a CRL fetched from a Distribution Point, or an OCSP response, is trusted as delivered). Static CRL files sit in the same trust position as the CA bundle; for fetched sources use HTTPS Distribution Points / responders on a trusted path, or prefer `crl.static_files`. OCSP mode logs a startup warning for this reason
+- ⚠️ CRL/OCSP fetches block the TLS handshake for up to the configured timeout (default 5 s); size the timeout against the NAS's RADIUS timeout
+- ⚠️ Only the end-entity certificate is checked (not intermediates); no delta CRLs; the CRL `nextUpdate` is enforced but `crlNumber` is not tracked
+- ⚠️ Static CRL files are read once at startup (no hot reload)
 
 **Files**:
 
-- [crates/radius-proto/src/revocation/](../../crates/radius-proto/src/revocation/) - CRL/OCSP module
+- [crates/radius-proto/src/revocation/](../../crates/radius-proto/src/revocation/) - CRL/OCSP module and `RevocationCheckingVerifier`
+- [crates/radius-server/src/client_verifier.rs](../../crates/radius-server/src/client_verifier.rs) - verifier selection for EAP-TLS and RadSec
+- [crates/radius-server/src/config.rs](../../crates/radius-server/src/config.rs) - `RevocationConfig` and validation
+- [examples/configs/eap-tls-revocation.json](../../examples/configs/eap-tls-revocation.json) - documented example
 - [docs/docs/development/CRL-IMPLEMENTATION-PLAN.md](../development/CRL-IMPLEMENTATION-PLAN.md) - Design notes
 
 ---
@@ -888,7 +894,7 @@ Total:         156+ tests
    pending
 4. ❌ **Hot Configuration Reload** - Deferred (only the mgmt access policy reloads on SIGHUP)
 5. ⚠️ **Health Monitoring** - Basic Status-Server implemented; Message-Authenticator not verified, always Access-Accept
-6. ⚠️ **Certificate Revocation (CRL/OCSP)** - Module implemented under the `revocation` feature, not integrated into `radius-server`
+6. ✅ **Certificate Revocation (CRL/OCSP)** - CRL (static files + Distribution Points) and OCSP checking of EAP-TLS supplicant and RadSec NAS certificates via the `revocation` block, fail-closed by default (unreleased); CRL/OCSP signature verification still pending
 7. ✅ **MS-MPPE Keys** - MS-MPPE-Send/Recv-Key (RFC 2548 §2.4) attached to EAP Access-Accepts (v0.11.0)
 
 ### Priority 4 (LOW) - ❌ NOT PLANNED
@@ -930,7 +936,7 @@ Total:         156+ tests
 | CoA/Disconnect | 5176 | ✅ RadSec only | v0.10.0 | MEDIUM | Server-originated via mgmt API; no UDP path |
 | NAS Identification | 2865 | ✅ Complete | v0.2.0 | MEDIUM | NAS-IP-Address or NAS-Identifier enforced |
 | Enumerated Values | 2865 | ✅ Strict mode | v0.2.0 | LOW | Lenient mode accepts unknown values |
-| Certificate Revocation | 5280 / 6960 | ⚠️ Not integrated | v0.7.x | HIGH | `revocation` feature in radius-proto only |
+| Certificate Revocation | 5280 / 6960 | ✅ Integrated | v0.7.x / unreleased | HIGH | `revocation` block for EAP-TLS + RadSec, fail-closed default; CRL/OCSP signatures not verified |
 | Accounting Port 1813 | 2866 | ⚠️ Not bound | - | MEDIUM | Single UDP socket on listen_port |
 | Proxy-State | 2865 | ⚠️ Echoed | v0.x | MEDIUM | Ordering tests pending |
 | Hot Reload | - | ❌ Deferred | - | MEDIUM | Only mgmt access policy reloads on SIGHUP |
@@ -1008,7 +1014,7 @@ The current implementation is **PRODUCTION-READY** for:
    - Server-originated over RadSec only; no UDP (port 3799) path
 
 4. **Certificate Revocation**
-   - CRL/OCSP module exists but is not wired into EAP-TLS or RadSec verification
+   - CRL and OCSP signatures are not verified; fetches block the handshake for up to the configured timeout
 
 ---
 
@@ -1072,7 +1078,8 @@ The current implementation is **PRODUCTION-READY** for:
    - ✅ Required attributes and enumerations validated (strict mode)
 
 3. **Certificate Lifecycle**
-   - ⚠️ No CRL/OCSP checking at runtime (module exists, not integrated)
+   - ✅ CRL/OCSP revocation checking of supplicant and NAS certificates at handshake time (`revocation` block, fail-closed default)
+   - ⚠️ CRL/OCSP signatures not verified; static CRL files read once at startup
    - ⚠️ No certificate hot-rotation for RadSec or EAP-TLS
 
 ---
@@ -1089,7 +1096,7 @@ The USG RADIUS server is **production-ready** for modern enterprise deployments 
 2. ✅ **RadSec transport and CoA/Disconnect** - TLS 1.3 / ML-KEM-1024 mutual TLS with server-originated session control
 3. ✅ **Comprehensive DoS protection** - Rate limiting, connection limits, bandwidth throttling
 4. ✅ **Full accounting support** - Database backend with exports and reporting
-5. ✅ **Strong security posture** - Client validation, replay protection, Message-Authenticator, audit logging
+5. ✅ **Strong security posture** - Client validation, replay protection, Message-Authenticator, certificate revocation checking, audit logging
 6. ✅ **Excellent test coverage** - 156+ tests with high pass rate
 7. ✅ **Comprehensive documentation** - 2,000+ lines of guides and examples
 
@@ -1104,16 +1111,15 @@ The USG RADIUS server is **production-ready** for modern enterprise deployments 
 **Not Recommended For** (without additional work):
 
 - ❌ Deployments requiring legacy EAP methods (TTLS, PEAP, MSCHAPv2)
-- ❌ Deployments that must revoke client certificates before expiry (CRL/OCSP not integrated)
 - ❌ Environments requiring hot configuration reload
 
 **Next Development Priorities**:
 
-1. Integrate the `revocation` module (CRL/OCSP) into EAP-TLS and RadSec client-certificate verification
+1. Verify CRL and OCSP response signatures against the issuing CA (the module trusts fetched data as delivered)
 2. EAP-TEAP inner methods with real keying material (EAP-MSCHAPv2)
 3. Status-Server Message-Authenticator verification and Accounting-Response reply (RFC 5997)
 4. Bind a dedicated accounting socket (1813/udp) or drop it from the deployment manifests
-5. Hot configuration reload
+5. Hot configuration reload (including static CRL files)
 
 ---
 
@@ -1131,8 +1137,9 @@ The USG RADIUS server is **production-ready** for modern enterprise deployments 
 - **v0.10.0**: **RadSec (RFC 6614)** transport, **CoA/Disconnect (RFC 5176)** over RadSec, Message-Authenticator required on EAP requests, NAS-IPv6-Address, Termination-Action
 - **v0.10.1**: Container image built with the `tls` feature
 - **v0.11.0**: **MS-MPPE-Send/Recv-Key (RFC 2548)** on EAP Access-Accepts, RFC 9190 TLS 1.3 exporter labels + EAP-Key-Name, EAP-TEAP IMCK/CMK (RFC 7170 §5.2) and MSK (§5.4), Vendor-Specific and Tunnel-Password codecs, proxy re-keying of User-Password / Message-Authenticator (request leg) and MS-MPPE / Tunnel-Password / Message-Authenticator (response leg), signed proxy timeout rejects
+- **Unreleased**: **Certificate revocation checking (RFC 5280 / RFC 6960)** wired into EAP-TLS and RadSec via the `revocation` block, fail-closed by default; EAP-Failure on every EAP Access-Reject (RFC 3579 §2.6.3)
 
 ---
 
-*Last Updated: 2026-10-18*
-*Document Version: 3.1 (Reconciled with the v0.11.0 code: MS-MPPE key delivery, RFC 9190 / RFC 7170 keying, proxy re-keying; revocation gap unchanged)*
+*Last Updated: 2026-10-25*
+*Document Version: 3.2 (Revocation integrated: CRL/OCSP checking of EAP-TLS and RadSec client certificates, EAP-Failure on EAP rejects)*

@@ -1,4 +1,4 @@
-# Interop test: usg-radius proxy and EAP-TLS home server vs FreeRADIUS and eapol_test
+# Interop test: usg-radius proxy and EAP-TLS home server (with CRL checking) vs FreeRADIUS and eapol_test
 
 ```bash
 tests/interop/run.sh
@@ -19,8 +19,8 @@ Layout:
 | Path | Role |
 |------|------|
 | `run.sh` | Host driver (docker, or a running Lima VM with docker) |
-| `gen-certs.sh` | Test PKI → `certs/` (git-ignored, regenerated on demand) |
+| `gen-certs.sh` | Test PKI → `certs/` (git-ignored, regenerated on demand), including `ca.crl`, which revokes `client-usg-revoked.crt` |
 | `compose.yaml` | Network 10.77.0.0/24: freeradius .10, usg-proxy .20, usg-home .30, nas .40 |
 | `freeradius/` | Dockerfile, `clients.conf`, `eap` (mods-available), `authorize` |
-| `usg-radius/` | Dockerfile (Debian build of this checkout), `proxy.json`, `home.json` |
+| `usg-radius/` | Dockerfile (Debian build of this checkout, features `observability,tls,revocation`), `proxy.json` (realms `freeradius.test` → FreeRADIUS, `usg.test` → usg-home), `home.json` (EAP-TLS with `eap.tls.revocation`, static CRL, fail-closed) |
 | `eapol_test/` | Dockerfile, wpa_supplicant `config`, supplicant `*.conf`, `run-tests.sh` (the assertions) |

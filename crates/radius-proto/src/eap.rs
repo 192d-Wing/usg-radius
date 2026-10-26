@@ -1248,6 +1248,59 @@ pub mod eap_tls {
     pub fn build_server_config(
         cert_config: &TlsCertificateConfig,
     ) -> Result<rustls::ServerConfig, EapError> {
+        if !cert_config.require_client_cert {
+            return build_server_config_with_client_verifier(cert_config, None);
+        }
+        // Load CA certificates for client verification
+        let Some(ca_path) = &cert_config.ca_cert_path else {
+            return Err(EapError::CertificateError(
+                "Client certificate verification required but no CA certificate path provided"
+                    .to_string(),
+            ));
+        };
+        let verifier = build_client_cert_verifier(ca_path)?;
+        build_server_config_with_client_verifier(cert_config, Some(verifier))
+    }
+
+    /// Load a PEM CA bundle into a rustls [`RootCertStore`](rustls::RootCertStore).
+    #[cfg(feature = "tls")]
+    pub fn load_root_store(ca_path: &str) -> Result<rustls::RootCertStore, EapError> {
+        use pki_types::CertificateDer;
+
+        let ca_cert_ders = load_certificates_from_pem(ca_path)?;
+        let mut root_store = rustls::RootCertStore::empty();
+        for ca_cert in ca_cert_ders.into_iter().map(CertificateDer::from) {
+            root_store.add(ca_cert).map_err(|e| {
+                EapError::CertificateError(format!("Failed to add CA certificate: {}", e))
+            })?;
+        }
+        Ok(root_store)
+    }
+
+    /// Build the standard WebPKI client-certificate verifier for the CA bundle
+    /// at `ca_path` (what [`build_server_config`] uses when client certificates
+    /// are required).
+    #[cfg(feature = "tls")]
+    pub fn build_client_cert_verifier(
+        ca_path: &str,
+    ) -> Result<std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier>, EapError> {
+        let root_store = load_root_store(ca_path)?;
+        rustls::server::WebPkiClientVerifier::builder(root_store.into())
+            .build()
+            .map_err(|e| EapError::TlsError(format!("Failed to build client verifier: {}", e)))
+    }
+
+    /// Build a rustls `ServerConfig` from the server certificate and key in
+    /// `cert_config`, with the given client-certificate verifier.
+    ///
+    /// `None` configures server-only authentication (no client certificate is
+    /// requested). This is the hook for verifiers that do more than chain
+    /// validation, such as CRL/OCSP revocation checking.
+    #[cfg(feature = "tls")]
+    pub fn build_server_config_with_client_verifier(
+        cert_config: &TlsCertificateConfig,
+        client_verifier: Option<std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    ) -> Result<rustls::ServerConfig, EapError> {
         use pki_types::{CertificateDer, PrivateKeyDer};
         use rustls::ServerConfig;
 
@@ -1269,37 +1322,9 @@ pub mod eap_tls {
         let config = ServerConfig::builder();
 
         // Configure client certificate requirements
-        let config = if cert_config.require_client_cert {
-            // Load CA certificates for client verification
-            if let Some(ca_path) = &cert_config.ca_cert_path {
-                let ca_cert_ders = load_certificates_from_pem(ca_path)?;
-                let ca_certs: Vec<CertificateDer> =
-                    ca_cert_ders.into_iter().map(CertificateDer::from).collect();
-
-                // Create root certificate store
-                let mut root_store = rustls::RootCertStore::empty();
-                for ca_cert in ca_certs {
-                    root_store.add(ca_cert).map_err(|e| {
-                        EapError::CertificateError(format!("Failed to add CA certificate: {}", e))
-                    })?;
-                }
-
-                // Create client certificate verifier
-                let verifier = rustls::server::WebPkiClientVerifier::builder(root_store.into())
-                    .build()
-                    .map_err(|e| {
-                        EapError::TlsError(format!("Failed to build client verifier: {}", e))
-                    })?;
-
-                config.with_client_cert_verifier(verifier)
-            } else {
-                return Err(EapError::CertificateError(
-                    "Client certificate verification required but no CA certificate path provided"
-                        .to_string(),
-                ));
-            }
-        } else {
-            config.with_no_client_auth()
+        let config = match client_verifier {
+            Some(verifier) => config.with_client_cert_verifier(verifier),
+            None => config.with_no_client_auth(),
         };
 
         // Set server certificate and key

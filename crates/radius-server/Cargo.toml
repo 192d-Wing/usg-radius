@@ -66,3 +66,8 @@ tls = [
     "dep:x509-parser",
 ]
 observability = ["dep:axum", "dep:tower", "dep:tower-http"]
+# CRL/OCSP revocation checking of EAP-TLS supplicant and RadSec NAS client
+# certificates (the `revocation` config block). Pulls radius-proto's module,
+# which brings reqwest (rustls backend without its own CryptoProvider, so the
+# process keeps a single aws-lc-rs provider).
+revocation = ["tls", "radius-proto/revocation"]

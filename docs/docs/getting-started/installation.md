@@ -85,6 +85,15 @@ Prometheus metrics (`/metrics` on TCP 3812):
 cargo build --release --features observability
 ```
 
+The `revocation` feature adds CRL/OCSP revocation checking of EAP-TLS
+supplicant and RadSec NAS certificates (the `revocation` config block; see
+`examples/configs/eap-tls-revocation.json`). The container image and the
+release binaries are built with all three:
+
+```bash
+cargo build --release --features observability,tls,revocation
+```
+
 ## Verification
 
 Verify the installation by checking the version:
