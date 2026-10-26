@@ -183,6 +183,22 @@ The same configuration through the proxy to usg-home: `SUCCESS`, and the
 MS-MPPE keys re-encrypted by the proxy match the supplicant's MSK, so the ACK
 round trips survive the proxy hop.
 
+### Not covered: EAP-TEAP
+
+The `nas` image builds eapol_test with `CONFIG_EAP_TEAP=y`, so the harness
+*could* drive TEAP. It does not yet, because usg-radius's TEAP wire format is
+not interoperable with wpa_supplicant's: the Crypto-Binding TLV is encoded as
+68 octets with one 32-octet HMAC-SHA256 compound MAC, while RFC 7170 §4.2.13
+requires 76 octets with separate 20-octet EMSK and MSK Compound MACs over the
+§5.3 BUFFER, the server does not set the version bits (§4.1) and sends no
+Intermediate-Result TLV (§3.3.2). eapol_test would fail at the Crypto-Binding
+TLV before fragmentation could be observed, so a TEAP fragmentation scenario
+would only prove that. TEAP fragmentation (RFC 7170 §3.1, both phases and
+directions) is covered by the unit tests in
+`crates/radius-server/src/eap_auth.rs` against an in-memory rustls TEAP peer
+that fragments and reassembles; add the eapol_test scenario once the
+Crypto-Binding TLV format lands.
+
 ### Server fixes this test drove out
 
 All were invisible to the unit tests (which drive rustls against a rustls

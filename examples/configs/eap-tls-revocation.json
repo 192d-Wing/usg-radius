@@ -35,6 +35,8 @@
   "eap": {
     "enable_tls": true,
     "enable_teap": false,
+    "session_idle_timeout_secs": 120,
+    "max_sessions": 4096,
     "tls": {
       "cert_path": "/etc/radius/eap/server.pem",
       "key_path": "/etc/radius/eap/server.key",

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bounded EAP session store.** `EapAuthHandler` evicts an EAP conversation
+  (its EAP session plus its EAP-TLS / EAP-TEAP TLS state) after
+  `eap.session_idle_timeout_secs` without a packet from the peer (default 120)
+  and keeps at most `eap.max_sessions` live conversations (default 4096),
+  evicting the least recently used one when full; both are validated to be at
+  least 1. Conversations are also released as soon as they reach Access-Accept
+  or Access-Reject. An evicted or finished conversation fails closed: the next
+  Access-Request carrying its State is answered with Access-Reject +
+  EAP-Failure and allocates nothing, so stale or forged State cannot churn the
+  store. Evictions are logged at debug level and counted in a new
+  `radius_eap_sessions_evicted_total{reason="idle"|"capacity"}` counter on
+  `/metrics`. The defaults bound the EAP state to a few hundred MiB in the
+  worst case (4096 × a rustls connection plus at most 64 KiB of reassembly)
+  under the default per-client (100 req/s) and global (1000 req/s) rate
+  limits.
+
 - **Certificate revocation checking (CRL/OCSP) for EAP-TLS and RadSec.** The
   `radius-proto` revocation module (CRL parsing, CRL Distribution Point
   fetching with TTL cache, static CRL files, OCSP with RFC 8954 nonce, check
@@ -56,6 +72,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Inbound EAP-TLS / EAP-TEAP fragment reassembly is bounded and fails
+  closed.** With non-final fragments now acknowledged (see Fixed), an
+  unauthenticated supplicant could otherwise have fed fragments forever.
+  `TlsFragmentAssembler` now requires the L bit and a TLS Message Length on the
+  first fragment of a fragmented message (RFC 5216 §3.1), rejects an announced
+  length of zero or above 64 KiB (`MAX_MESSAGE_LENGTH`; FreeRADIUS caps the
+  same buffer at 16 KiB), rejects a fragment that would carry the message past
+  the announced length before buffering it, rejects a non-final fragment with
+  no data, resets on every error, and the server rejects a peer packet with
+  the S bit set (RFC 5216 §3.2). Every error ends the conversation with
+  Access-Reject + EAP-Failure. EAP-TEAP uses the same assembler in Phase 1
+  and Phase 2.
+
 - Updated transitive dependencies to clear `cargo audit` findings published
   2026-10-19 to 2026-10-23 against an unchanged lockfile: `rustls-webpki`
   0.103.15→0.103.16 and `webpki-roots` 1.0.7→1.0.11 (RUSTSEC-2026-0382 /
@@ -88,6 +117,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `working-directory: ui/bff`, so the job fails on any future advisory there.
 
 ### Fixed
+
+- **EAP-TLS: non-final supplicant fragments are acknowledged (PR #79,
+  @cynix).** The server rejected every supplicant whose TLS flight spanned
+  more than one EAP fragment (RSA or chained client certificates, hybrid
+  ML-KEM ClientHellos, small Framed-MTU): the reassembler asked for more and
+  the handler answered Access-Reject (`continue_eap_tls: no outbound TLS,
+  handshake incomplete`). A Response with M set is now answered with an
+  EAP-TLS Request carrying no data (RFC 5216 §2.1.5), with a new Identifier.
+  Interop scenarios 8 and 9 (`eapol_test` with `fragment_size=300`, direct and
+  through the proxy) are the regression test; the harness now has 33
+  assertions.
+- **EAP-TEAP (RFC 7170) fragmentation in both phases and directions.**
+  Phase 1 acknowledges non-final peer fragments like EAP-TLS does; Phase 2
+  reassembles the peer's encrypted TLV message through the same bounded
+  assembler instead of feeding each fragment to rustls on its own, and
+  acknowledges its non-final fragments. Outbound, every TLS message the TEAP
+  server produces (handshake flight or encrypted TLVs) is queued and sent in
+  fragments of at most the EAP MTU (1020 bytes), one per peer ACK; previously
+  only the first fragment was ever sent and the peer's ACK was fed to rustls
+  as data. A peer that sends data while server fragments are pending is
+  rejected (RFC 7170 §3.1).
+- **EAP-TEAP conversations now complete through the handler.** The TEAP TLS
+  connection was never initialized by `start_eap_teap`, so the first TEAP
+  packet failed with `InvalidState`; the first Phase 2 TLV (Identity-Type)
+  now rides in the same TLS message as the end of the handshake flight (RFC
+  7170 §3.3); the server's Result TLV is followed by a wait for the peer's
+  Result TLV acknowledgement (RFC 7170 §3.3.3, new `TeapPhase::Phase2ResultSent`)
+  instead of treating that acknowledgement as an invalid state; the MSK is
+  released only when both Results were Success; a Result TLV from the peer
+  before the server's is rejected; and the Crypto-Binding history covers
+  every TLV of a received message, not only those before the one answered.
+- **EAP-TEAP EAP-Success echoes the Identifier of the peer's last
+  EAP-Response (RFC 3748 §4.2)** instead of allocating a new one, as EAP-TLS
+  already did.
+- **EAP session IDs collide no more** when one user starts several
+  conversations within the same millisecond (a per-handler sequence number is
+  appended).
 
 - **EAP Access-Rejects carried no EAP-Failure.** When an EAP method failed
   inside the handler (TLS handshake error, certificate rejected), the generic

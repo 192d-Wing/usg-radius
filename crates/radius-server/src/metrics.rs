@@ -54,6 +54,27 @@ impl PrometheusMetrics {
         self.content.push_str(&format!("{} {}\n", name, value));
     }
 
+    /// Add a counter metric with labels; `series` is one `(labels, value)` per line.
+    fn add_counter_with_labels(
+        &mut self,
+        name: &str,
+        series: &[(&[(&str, &str)], u64)],
+        help: &str,
+    ) {
+        self.content
+            .push_str(&format!("# HELP {} {}\n", name, help));
+        self.content.push_str(&format!("# TYPE {} counter\n", name));
+        for (labels, value) in series {
+            let label_str = labels
+                .iter()
+                .map(|(k, v)| format!("{}=\"{}\"", k, v))
+                .collect::<Vec<_>>()
+                .join(",");
+            self.content
+                .push_str(&format!("{}{{{}}} {}\n", name, label_str, value));
+        }
+    }
+
     /// Add a metric with labels
     fn add_metric_with_labels(
         &mut self,
@@ -115,7 +136,26 @@ impl MetricsState {
         // Uptime metric
         self.collect_uptime_metrics(&mut metrics);
 
+        // EAP session store evictions
+        Self::collect_eap_session_metrics(&mut metrics);
+
         metrics
+    }
+
+    /// EAP conversations evicted from the session store (idle timeout or
+    /// capacity), process-wide counters kept by `eap_auth`.
+    fn collect_eap_session_metrics(metrics: &mut PrometheusMetrics) {
+        use std::sync::atomic::Ordering;
+        let idle = crate::eap_auth::EAP_SESSIONS_EVICTED_IDLE.load(Ordering::Relaxed);
+        let capacity = crate::eap_auth::EAP_SESSIONS_EVICTED_CAPACITY.load(Ordering::Relaxed);
+        metrics.add_counter_with_labels(
+            "radius_eap_sessions_evicted_total",
+            &[
+                (&[("reason", "idle")], idle),
+                (&[("reason", "capacity")], capacity),
+            ],
+            "EAP conversations evicted from the session store, by reason",
+        );
     }
 
     /// Collect backend health metrics
@@ -211,6 +251,27 @@ mod tests {
         assert!(metrics.content.contains("# HELP test_metric A test metric"));
         assert!(metrics.content.contains("# TYPE test_metric gauge"));
         assert!(metrics.content.contains("test_metric 42"));
+    }
+
+    #[test]
+    fn eap_eviction_counters_are_exported_by_reason() {
+        let mut metrics = PrometheusMetrics::new();
+        MetricsState::collect_eap_session_metrics(&mut metrics);
+        assert!(
+            metrics
+                .content
+                .contains("# TYPE radius_eap_sessions_evicted_total counter")
+        );
+        assert!(
+            metrics
+                .content
+                .contains("radius_eap_sessions_evicted_total{reason=\"idle\"} ")
+        );
+        assert!(
+            metrics
+                .content
+                .contains("radius_eap_sessions_evicted_total{reason=\"capacity\"} ")
+        );
     }
 
     #[test]
