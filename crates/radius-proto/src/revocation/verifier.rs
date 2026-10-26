@@ -269,8 +269,10 @@ impl RevocationCheckingVerifier {
                 match self.check_ocsp(cert_der, intermediates) {
                     Ok(()) => Ok(()),
                     Err(e @ RevocationError::CertificateRevoked(_)) => Err(e),
-                    Err(e) => {
-                        eprintln!("OCSP check inconclusive ({}), trying CRL", e);
+                    Err(_) => {
+                        // The reason is not logged: it can carry certificate
+                        // identifiers; the CRL outcome decides.
+                        eprintln!("OCSP check inconclusive, trying CRL");
                         self.check_crl(cert_der)
                     }
                 }
@@ -297,8 +299,8 @@ impl RevocationCheckingVerifier {
                     // CRL failed under fail-closed: reject.
                     (_, Err(e)) => Err(e),
                     // OCSP inconclusive but CRL answered: the CRL answer stands.
-                    (Err(e), Ok(())) => {
-                        eprintln!("OCSP check inconclusive ({}), CRL check passed", e);
+                    (Err(_), Ok(())) => {
+                        eprintln!("OCSP check inconclusive, CRL check passed");
                         Ok(())
                     }
                 }
@@ -397,8 +399,7 @@ impl RevocationCheckingVerifier {
         let mut request_builder = OcspRequestBuilder::new(cert_der, issuer_der)?;
         let nonce = if self.config.ocsp_config.enable_nonce {
             use rand::RngExt;
-            let mut nonce = vec![0u8; OCSP_NONCE_LEN];
-            rand::rng().fill(&mut nonce[..]);
+            let nonce = rand::rng().random::<[u8; OCSP_NONCE_LEN]>().to_vec();
             request_builder = request_builder.with_nonce(nonce.clone());
             Some(nonce)
         } else {

@@ -2063,14 +2063,14 @@ mod tests {
     }
 
     /// Encode an Access-Request with a valid Message-Authenticator over `attrs`
-    /// (secret `s3cret`, as `process` uses).
-    fn signed_access_request_bytes(attrs: Vec<Attribute>) -> Vec<u8> {
+    /// under `secret`.
+    fn signed_access_request_bytes(attrs: Vec<Attribute>, secret: &[u8]) -> Vec<u8> {
         let mut attrs = attrs;
         attrs.push(
             Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]).unwrap(),
         );
         let mut bytes = access_request_bytes(attrs);
-        let ma = calculate_message_authenticator(&bytes, b"s3cret");
+        let ma = calculate_message_authenticator(&bytes, secret);
         // Replace the zeroed Message-Authenticator value in place.
         let needle = [
             &[AttributeType::MessageAuthenticator as u8, 18][..],
@@ -2087,18 +2087,26 @@ mod tests {
 
     #[tokio::test]
     async fn eap_access_reject_carries_eap_failure() {
+        use rand::RngExt;
         // A handler that cannot authenticate the EAP peer (the PAP handler
         // knows no `alice`) ends the conversation with Access-Reject; RFC 3579
         // §2.6.3 requires that reject to carry EAP-Failure with the peer's
         // last EAP Identifier, signed by a Message-Authenticator.
-        let data = signed_access_request_bytes(vec![
-            Attribute::string(AttributeType::UserName as u8, "alice").unwrap(),
-            eap_identity_attr(),
-        ]);
-        let reply = process(&data)
-            .await
-            .expect("reject is a normal reply")
-            .expect("a reply is sent");
+        // A fresh random shared secret: the test only needs both sides to agree.
+        let secret: Vec<u8> = rand::rng().random::<[u8; 16]>().to_vec();
+        let data = signed_access_request_bytes(
+            vec![
+                Attribute::string(AttributeType::UserName as u8, "alice").unwrap(),
+                eap_identity_attr(),
+            ],
+            &secret,
+        );
+        let cfg = msgauth_test_config();
+        let reply =
+            RadiusServer::process_request(&data, "10.0.0.1:1812".parse().unwrap(), &secret, &cfg)
+                .await
+                .expect("reject is a normal reply")
+                .expect("a reply is sent");
         let reply = Packet::decode(&reply).unwrap();
         assert_eq!(reply.code, Code::AccessReject);
         let eap = reply
