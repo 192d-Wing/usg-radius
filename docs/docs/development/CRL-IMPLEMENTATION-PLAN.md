@@ -4,8 +4,12 @@
 
 Implement production-grade Certificate Revocation List (CRL) checking for EAP-TLS mutual authentication. This is Phase 1 of the complete Certificate Revocation implementation (v0.6.0).
 
-**Status**: Phase 1 (CRL Only)
-**Estimated Effort**: 3-4 weeks
+**Status**: Implemented and integrated. The module (CRL + OCSP) lives in
+`crates/radius-proto/src/revocation/`; `radius-server` wires it into EAP-TLS
+and RadSec client-certificate verification through the `revocation` config
+block (`crates/radius-server/src/client_verifier.rs`, feature `revocation`).
+This document is the original design plan; where it differs from the code, the
+code and `docs/docs/protocol/RFC-COMPLIANCE.md` are authoritative.
 **Priority**: HIGH (required for production compliance)
 
 ## Architecture

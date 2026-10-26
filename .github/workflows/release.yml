@@ -64,7 +64,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
-        run: cargo build --release -p radius-server --bin usg-radius --features observability
+        # Same feature set as the container image (Dockerfile): health/metrics,
+        # RadSec + EAP-TLS, and CRL/OCSP revocation checking.
+        run: cargo build --release -p radius-server --bin usg-radius --features observability,tls,revocation
 
       - name: Strip binary
         run: strip target/release/usg-radius

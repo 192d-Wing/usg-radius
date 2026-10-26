@@ -51,6 +51,12 @@ jobs:
       - name: Run unit tests
         run: cargo test --workspace --all-targets
 
+      # The optional `revocation` feature (CRL/OCSP client-certificate checks)
+      # has its own tests and is what the container image and release binary
+      # ship with; clippy below already runs with --all-features.
+      - name: Run unit tests (all features)
+        run: cargo test --workspace --all-targets --all-features
+
       - name: Run integration tests
         run: cargo test --test '*'
 

@@ -20,7 +20,8 @@
 //!
 //! # Example
 //!
-//! ```no_run
+//! (`ignore`: this module is crate-private; the example is illustrative)
+//! ```ignore
 //! use radius_proto::revocation::cache::CrlCache;
 //! use std::time::Duration;
 //! use std::sync::Arc;
@@ -77,7 +78,8 @@ impl CachedCrl {
 ///
 /// # Example
 ///
-/// ```no_run
+/// (`ignore`: this module is crate-private; the example is illustrative)
+/// ```ignore
 /// use radius_proto::revocation::cache::CrlCache;
 /// use std::time::Duration;
 ///

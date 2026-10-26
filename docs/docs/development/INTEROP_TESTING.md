@@ -30,7 +30,7 @@ Requirements: `docker` with the compose plugin, or (as on a Mac without Docker
 Desktop) a running [Lima](https://lima-vm.io) VM that has docker; `run.sh`
 finds it and runs `docker` through `limactl shell`. OpenSSL on the host for the
 test PKI. The first run builds three images, the usg-radius one from this
-checkout (a Debian build with the `observability,tls` features, cached across
+checkout (a Debian build with the `observability,tls,revocation` features, cached across
 runs). Exit status 0 means every check passed; on failure the script prints the
 tail of each eapol_test / radclient log and the three servers' logs.
 
@@ -80,7 +80,7 @@ image build (default 2).
 
 ## What is checked
 
-Fifteen assertions across four scenarios. All pass on the current tree (run
+Twenty-four assertions across seven scenarios. All pass on the current tree (run
 `tests/interop/run.sh`).
 
 ### 1 & 2 — EAP-TLS through the proxy to FreeRADIUS
@@ -112,7 +112,10 @@ under the NAS↔proxy secret (RFC 2548). Proven:
 ### 4 — EAP-TLS directly against usg-radius as the home server
 
 eapol_test authenticates as `eaptls@usg.test` straight to usg-radius (no proxy),
-validating usg-radius's own EAP endpoint:
+validating usg-radius's own EAP endpoint. `home.json` enables
+`eap.tls.revocation` (mode `crl_only`, `on_error` `fail_closed`, static CRL
+`certs/ca.crl`, no fetching), so this success also shows that an unrevoked
+certificate passes the CRL check:
 
 - eapol_test exits 0 and prints `SUCCESS`; TLS 1.3 is negotiated.
 - `MPPE keys OK: 1  mismatch: 0` — usg-radius's MS-MPPE keys match the peer's
@@ -122,9 +125,41 @@ validating usg-radius's own EAP endpoint:
   Session-Id, validating the RFC 9190 §2.5 Method-Id exporter
   (`EXPORTER_EAP_TLS_Method-Id`).
 
+### 5 — Revoked supplicant certificate directly against usg-radius
+
+`gen-certs.sh` issues `client-usg-revoked.crt` (CN `revoked@usg.test`) and a
+CRL from the test CA that revokes it (`openssl ca -revoke` / `-gencrl`; the
+script checks the CRL lists the certificate's serial). eapol_test authenticates
+with it straight to usg-radius:
+
+- eapol_test exits non-zero and prints `FAILURE`, never `SUCCESS`: rustls
+  completes chain validation, `RevocationCheckingVerifier` finds the serial in
+  the static CRL and the handshake is aborted with
+  `invalid peer certificate: Revoked`.
+- `EAP: Status notification: completion (param=failure)`: the Access-Reject
+  carries an EAP-Failure (RFC 3579 §2.6.3), so the supplicant terminates the
+  method on the reject rather than by timeout.
+
+### 6 — EAP-TLS through the proxy to usg-radius as the home server
+
+`proxy.json` routes realm `usg.test` to usg-home (secret
+`proxy-usghome-secret-4`; usg-home lists the proxy as a client). The valid
+`eaptls@usg.test` goes through the proxy:
+
+- eapol_test exits 0 and prints `SUCCESS`.
+- `MPPE keys OK: 1  mismatch: 0` — the MS-MPPE keys usg-home emitted were
+  re-encrypted by the proxy under the NAS secret (usg-radius on both legs).
+
+### 7 — Revoked supplicant certificate through the proxy
+
+The same revoked identity through the proxy: `FAILURE`, non-zero exit, and the
+EAP-Failure relayed by the proxy (`completion (param=failure)`). Together with
+scenario 6 this shows the CRL check is enforced by the home server regardless
+of the path the request took.
+
 ### Server fixes this test drove out
 
-Both were invisible to the unit tests (which drive rustls against a rustls
+All were invisible to the unit tests (which drive rustls against a rustls
 supplicant) and only appeared against OpenSSL-based peers:
 
 1. **RFC 9190 §2.5 commitment message.** usg-radius's EAP-TLS 1.3 server sent
@@ -143,6 +178,14 @@ supplicant) and only appeared against OpenSSL-based peers:
    the NAS sent to. A NAS whose RADIUS socket is `connect()`ed to the proxy
    (eapol_test, most embedded NASes) drops those datagrams. The proxy now
    replies from its listening socket, with unit tests.
+3. **EAP Access-Rejects carried no EAP-Failure.** When an EAP method failed in
+   the handler (here: the revoked certificate aborting the TLS handshake), the
+   generic reject path sent a bare Access-Reject; eapol_test logged
+   `could not extract EAP-Message from RADIUS message` and scenarios 5/7 could
+   only be asserted by exit status. RFC 3579 §2.6.3 requires the EAP-Failure;
+   `crates/radius-server/src/server.rs` now attaches it (Identifier echoing the
+   peer's last EAP-Response) to every Access-Reject that ends an EAP
+   conversation, with a unit test.
 
 ## Debugging a failure
 
