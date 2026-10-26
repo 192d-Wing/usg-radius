@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/radius-workflow` multi-agent development skill** (`.claude/skills/radius-workflow/`)
+  with eight specialist subagents in `.claude/agents/` (architect, coder, QA,
+  security, crypto/FIPS, RFC conformance, docs scribe, release engineer),
+  adapted from OstrichPKI's `ostrich-workflow`: plan → build → test (including
+  the interop harness) → parallel review → fix loop → docs → release gate. A
+  root `CLAUDE.md` documents the workflow, the CI-equivalent commands and the
+  project's rules of the road.
 - **Interop test in CI.** `.github/workflows/interop.yml` runs
   `tests/interop/run.sh` (usg-radius as proxy and as EAP-TLS home server
   against FreeRADIUS 3.2 and eapol_test, 15 assertions) on `ubuntu-latest`:
