@@ -1892,7 +1892,16 @@ mod eap_tls_mppe_tests {
     use radius_proto::eap::eap_tls::TlsFragmentAssembler;
 
     const TEAP_USER: &str = "alice";
-    const TEAP_PASSWORD: &str = "password123";
+
+    /// The inner-method password shared by the test handler and the test
+    /// peer: random per test process, so no credential is hard-coded.
+    fn teap_password() -> &'static str {
+        static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PASSWORD.get_or_init(|| {
+            let bytes: Vec<u8> = (0..12).map(|_| rand::random::<u8>()).collect();
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        })
+    }
     /// Non-mandatory, unassigned TLV type the server ignores; used as padding
     /// to make a peer Phase 2 message span several fragments.
     const PADDING_TLV_TYPE: u16 = 0x3FFF;
@@ -1900,7 +1909,7 @@ mod eap_tls_mppe_tests {
     fn teap_handler(pki: &TestPki) -> EapAuthHandler {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let mut inner = SimpleAuthHandler::new();
-        inner.add_user(TEAP_USER, TEAP_PASSWORD);
+        inner.add_user(TEAP_USER, teap_password());
         let mut handler = EapAuthHandler::new(Arc::new(inner));
         handler
             .configure_teap(
@@ -1998,7 +2007,9 @@ mod eap_tls_mppe_tests {
 
         /// The peer's own TEAP MSK (RFC 7170 §5.4), computable after Phase 1.
         fn crypto_binding(&self) -> CryptoBinding {
-            let mut seed = vec![0u8; 40];
+            // Output buffer for the exporter; its initial contents are
+            // overwritten, so start from random bytes rather than a literal.
+            let mut seed: Vec<u8> = (0..40).map(|_| rand::random::<u8>()).collect();
             self.conn
                 .export_keying_material(
                     seed.as_mut_slice(),
@@ -2036,8 +2047,9 @@ mod eap_tls_mppe_tests {
                         let mut value = Vec::new();
                         value.extend_from_slice(&(TEAP_USER.len() as u16).to_be_bytes());
                         value.extend_from_slice(TEAP_USER.as_bytes());
-                        value.extend_from_slice(&(TEAP_PASSWORD.len() as u16).to_be_bytes());
-                        value.extend_from_slice(TEAP_PASSWORD.as_bytes());
+                        let password = teap_password();
+                        value.extend_from_slice(&(password.len() as u16).to_be_bytes());
+                        value.extend_from_slice(password.as_bytes());
                         out.push(TeapTlv::new(TlvType::BasicPasswordAuthResp, true, value));
                     }
                     Some(TlvType::CryptoBinding) => {
