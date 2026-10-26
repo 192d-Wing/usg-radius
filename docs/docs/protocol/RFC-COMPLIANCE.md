@@ -272,13 +272,19 @@ correct stripping of server-added Proxy-State on the response leg.
 - ✅ Packet parsing and encoding
 - ✅ EAP-TLS Start packet
 - ✅ TLS handshake data packets
-- ✅ TLS acknowledgment packets
+- ✅ TLS acknowledgment packets, both directions: the peer's ACKs for our
+  fragments, and our empty EAP-TLS Request for each non-final peer fragment
+  (RFC 5216 §2.1.5; v0.12.0, verified against eapol_test with `fragment_size=300`,
+  interop scenarios 8 and 9)
 
 **Fragmentation (100%)**:
 
 - ✅ Automatic fragmentation (configurable MTU, default 1020 bytes)
-- ✅ Fragment reassembly with validation
-- ✅ Multi-fragment handshake support
+- ✅ Fragment reassembly, fail-closed: the first fragment of a fragmented
+  message must carry L and a TLS Message Length of 1–65536 octets, a fragment
+  may not carry the message past the announced length, a non-final fragment
+  must carry data, and a peer-sent S bit is rejected (v0.12.0)
+- ✅ Multi-fragment handshake support in both directions
 - ✅ TLS Message Length field handling
 - ✅ More Fragments (M) flag coordination
 
@@ -464,15 +470,16 @@ See EAP-TLS section under RFC 2869 for complete details.
 
 **Key RFC 5216 Compliance**:
 
-- ✅ Section 2.1: EAP-TLS packet format
-- ✅ Section 2.1.1: Flags field (L/M/S)
-- ✅ Section 2.1.2: TLS Message Length field
-- ✅ Section 2.1.3: TLS Data field
-- ✅ Section 2.1.4: Fragmentation
-- ✅ Section 2.1.5: Reassembly
-- ✅ Section 2.3: Key Derivation (RFC 5705 export_keying_material)
-- ✅ Section 2.4: Master Session Key (MSK) - 64 bytes
-- ✅ Section 2.5: Extended Master Session Key (EMSK) - 64 bytes
+- ✅ Section 2.1.1: Base case (server-only and mutual authentication)
+- ✅ Section 2.1.5: Fragmentation — outgoing fragments of at most 1020 octets
+  (L and TLS Message Length on the first, M on all but the last); each
+  non-final peer fragment acknowledged with an EAP-TLS Request carrying no
+  data; reassembly bounded at 64 KiB and fail-closed (v0.12.0)
+- ✅ Section 2.3: Key hierarchy — MSK and EMSK, 64 octets each, from the
+  RFC 5705 exporter (`client EAP encryption`); TLS 1.3 uses RFC 9190 §2.3
+- ✅ Section 3.1 / 3.2: Request and Response packet format — Flags (L/M/S),
+  TLS Message Length only with L, TLS Data; S accepted only on our own Start
+- ⚠️ Section 2.1.2: Session resumption not implemented (full handshake only)
 
 ---
 
