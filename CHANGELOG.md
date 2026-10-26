@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/radius-workflow` multi-agent development skill** (`.claude/skills/radius-workflow/`)
+  with eight specialist subagents in `.claude/agents/` (architect, coder, QA,
+  security, crypto/FIPS, RFC conformance, docs scribe, release engineer),
+  adapted from OstrichPKI's `ostrich-workflow`: plan → build → test (including
+  the interop harness) → parallel review → fix loop → docs → release gate. A
+  root `CLAUDE.md` documents the workflow, the CI-equivalent commands and the
+  project's rules of the road.
 - **Interop test in CI.** `.github/workflows/interop.yml` runs
   `tests/interop/run.sh` (usg-radius as proxy and as EAP-TLS home server
   against FreeRADIUS 3.2 and eapol_test, 15 assertions) on `ubuntu-latest`:
@@ -19,6 +26,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dir of the in-image build and the image layers are cached across runs;
   `compose.yaml` now passes `CARGO_BUILD_JOBS` through to the usg-radius image
   build (default 2, CI uses 4).
+
+### Security
+
+- Updated transitive dependencies to clear `cargo audit` findings published
+  2026-10-19 to 2026-10-23 against an unchanged lockfile: `rustls-webpki`
+  0.103.15→0.103.16 and `webpki-roots` 1.0.7→1.0.11 (RUSTSEC-2026-0382 /
+  -0381, CVE-2026-111943: distrusted emSign intermediates accepted),
+  `ctutils` 0.4.3→0.4.6 (RUSTSEC-2026-0385, non-constant-time mask
+  generation), and `tokio` 1.52.3→1.54.1 (RUSTSEC-2026-0386, `AsyncFd`
+  I/O-safety unsoundness, informational). The same `rustls-webpki`,
+  `webpki-roots` and `tokio` bumps are applied to `ui/bff/Cargo.lock`.
+
+- **Operator UI BFF (`ui/bff`) now audits clean, and CI gates it.** `ui/bff` is
+  its own crate with its own `Cargo.lock` (not a workspace member), so the
+  Security Audit job only ever scanned the root lockfile and these advisories
+  went unnoticed:
+  - RUSTSEC-2026-0118 and RUSTSEC-2026-0119 (`hickory-proto` 0.25.2: DNSSEC
+    NSEC3 unbounded loop; O(n²) name compression CPU exhaustion), fixed in
+    `hickory-proto` ≥ 0.26.1. `reqwest` 0.12 pins `hickory-resolver` 0.25, so
+    `reqwest` 0.12.28 → 0.13.5 (`hickory-proto` 0.26.3). Default build is
+    unchanged (HTTP only, no TLS crates in the tree). The optional `mtls`
+    feature maps to reqwest 0.13's renamed `rustls` feature: the client now
+    uses rustls with `aws-lc-rs` (the one CryptoProvider used across this
+    repository) instead of `ring`, and verifies the mgmt API through
+    `rustls-platform-verifier` with `RADIUS_API_CA` added as an extra root.
+  - RUSTSEC-2026-0204 (`crossbeam-epoch` 0.9.18 → 0.9.21).
+  - RUSTSEC-2026-0190 (`anyhow` 1.0.102 → 1.0.104, unsound `downcast_mut`).
+  - RUSTSEC-2026-0381 (`webpki-roots` 1.0.7 → 1.0.11, then dropped from the
+    tree), RUSTSEC-2026-0382 (`rustls-webpki` 0.103.15 → 0.103.16) and
+    RUSTSEC-2026-0386 (`tokio` 1.52.3 → 1.54.1), the bumps noted above.
+
+  `.github/workflows/ci.yml` runs a second `rustsec/audit-check` step with
+  `working-directory: ui/bff`, so the job fails on any future advisory there.
 
 ### Fixed
 
@@ -41,32 +81,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an `Issuer`). No wire-format or key-derivation change; the existing
   known-answer tests cover every affected primitive. `pbkdf2`, `argon2` and
   `sqlx` still carry the previous `digest` 0.10 generation internally.
-
-### Security
-
-- **Operator UI BFF (`ui/bff`) now audits clean, and CI gates it.** `ui/bff` is
-  its own crate with its own `Cargo.lock` (not a workspace member), so the
-  Security Audit job only ever scanned the root lockfile and these advisories
-  went unnoticed:
-  - RUSTSEC-2026-0118 and RUSTSEC-2026-0119 (`hickory-proto` 0.25.2: DNSSEC
-    NSEC3 unbounded loop; O(n²) name compression CPU exhaustion), fixed in
-    `hickory-proto` ≥ 0.26.1. `reqwest` 0.12 pins `hickory-resolver` 0.25, so
-    `reqwest` 0.12.28 → 0.13.5 (`hickory-proto` 0.26.3). Default build is
-    unchanged (HTTP only, no TLS crates in the tree). The optional `mtls`
-    feature maps to reqwest 0.13's renamed `rustls` feature: the client now
-    uses rustls with `aws-lc-rs` (the one CryptoProvider used across this
-    repository) instead of `ring`, and verifies the mgmt API through
-    `rustls-platform-verifier` with `RADIUS_API_CA` added as an extra root.
-  - RUSTSEC-2026-0204 (`crossbeam-epoch` 0.9.18 → 0.9.21).
-  - RUSTSEC-2026-0190 (`anyhow` 1.0.102 → 1.0.104, unsound `downcast_mut`).
-  - RUSTSEC-2026-0381 (`webpki-roots` 1.0.7 → 1.0.11, then dropped from the
-    tree), RUSTSEC-2026-0382 (`rustls-webpki` 0.103.15 → 0.103.16) and
-    RUSTSEC-2026-0386 (`tokio` 1.52.3 → 1.54.1). The root lockfile takes the
-    same three bumps plus RUSTSEC-2026-0385 (`ctutils` 0.4.3 → 0.4.6), so
-    both lockfiles audit clean.
-
-  `.github/workflows/ci.yml` runs a second `rustsec/audit-check` step with
-  `working-directory: ui/bff`, so the job fails on any future advisory there.
 
 ## [0.11.1] - 2026-10-18
 
