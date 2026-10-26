@@ -80,7 +80,7 @@ image build (default 2).
 
 ## What is checked
 
-Twenty-four assertions across seven scenarios. All pass on the current tree (run
+Thirty-three assertions across nine scenarios. All pass on the current tree (run
 `tests/interop/run.sh`).
 
 ### 1 & 2 — EAP-TLS through the proxy to FreeRADIUS
@@ -156,6 +156,32 @@ The same revoked identity through the proxy: `FAILURE`, non-zero exit, and the
 EAP-Failure relayed by the proxy (`completion (param=failure)`). Together with
 scenario 6 this shows the CRL check is enforced by the home server regardless
 of the path the request took.
+
+### 8 — Supplicant-side EAP-TLS fragmentation against usg-radius
+
+`eapol_test/eap-tls-usg-frag.conf` is scenario 4's configuration with
+`fragment_size=300`, so wpa_supplicant splits its TLS flights across several
+EAP-TLS Responses: the first carries the L and M bits and the TLS Message
+Length, the rest the M bit, the last neither (RFC 5216 §2.1.5 / §3.1). The
+client Certificate/CertificateVerify/Finished flight (about 1.2 KB with the
+P-256 test certificate) becomes five fragments, four of which the server must
+acknowledge with an EAP-TLS Request carrying no data before the peer sends the
+next one:
+
+- Control: the eapol_test log contains `more fragments will follow`, so the
+  supplicant really fragmented (the count of such lines is printed).
+- eapol_test exits 0 and prints `SUCCESS`; TLS 1.3 is negotiated.
+- `MPPE keys OK: 1  mismatch: 0` after the fragmented flight.
+
+Without the fragment ACK (PR 79) the server answered the first fragment with
+Access-Reject + EAP-Failure (`continue_eap_tls: no outbound TLS, handshake
+incomplete`); this scenario is the regression test for that.
+
+### 9 — Supplicant-side fragmentation through the proxy
+
+The same configuration through the proxy to usg-home: `SUCCESS`, and the
+MS-MPPE keys re-encrypted by the proxy match the supplicant's MSK, so the ACK
+round trips survive the proxy hop.
 
 ### Server fixes this test drove out
 
