@@ -150,6 +150,15 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      # ui/bff is its own crate with its own Cargo.lock (not a workspace
+      # member), so the step above never sees it: four advisories sat in that
+      # lockfile unnoticed. Audit it too.
+      - name: Run cargo-audit (ui/bff)
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: ui/bff
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
