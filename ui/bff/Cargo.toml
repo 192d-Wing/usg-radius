@@ -20,9 +20,11 @@ tower-http = { version = "0.6", features = ["fs", "trace"] }
 # HTTP only by default (in-cluster http://) — no TLS backend, keeps the musl build
 # free of aws-lc-sys/ring. The optional `mtls` feature adds a rustls TLS backend so
 # the BFF can present a client certificate to the mgmt API.
+# reqwest 0.13: its `hickory-dns` feature is the only route to hickory-proto 0.26
+# (RUSTSEC-2026-0118 / -0119 are fixed in >= 0.26.1; reqwest 0.12 pins 0.25).
 # `hickory-dns` replaces the system getaddrinfo with a pure-Rust async resolver, so
 # DNS doesn't depend on musl's resolver (which mishandles dual-stack A+AAAA answers).
-reqwest = { version = "0.12", default-features = false, features = [
+reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "hickory-dns",
 ] }
@@ -34,7 +36,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
 # Present a client certificate to the mgmt API (RADIUS_API_CLIENT_CERT/_KEY/_CA).
-mtls = ["reqwest/rustls-tls"]
+# reqwest 0.13 renamed `rustls-tls` to `rustls` (rustls + aws-lc-rs, the one
+# CryptoProvider used across this repository; roots via rustls-platform-verifier).
+mtls = ["reqwest/rustls"]
 
 [profile.release]
 strip = "debuginfo"

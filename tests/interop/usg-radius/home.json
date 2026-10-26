@@ -1,11 +1,12 @@
 {
-  "_comment": "usg-radius as an EAP-TLS home server (no proxy): validates its own MS-MPPE key emission and the TLS 1.3 exporter labels against eapol_test.",
+  "_comment": "usg-radius as an EAP-TLS home server, reached directly by the NAS and (for the usg.test realm) through the usg-radius proxy: validates its own MS-MPPE key emission, the TLS 1.3 exporter labels, and CRL revocation checking of supplicant certificates (certs/ca.crl revokes client-usg-revoked) against eapol_test.",
   "listen_address": "0.0.0.0",
   "listen_port": 1812,
   "transport": "udp-insecure",
   "secret": "unused-default-secret",
   "clients": [
-    { "name": "nas (eapol_test)", "address": "10.77.0.40/32", "secret": "nas-usghome-secret-3" }
+    { "name": "nas (eapol_test)", "address": "10.77.0.40/32", "secret": "nas-usghome-secret-3" },
+    { "name": "usg-proxy", "address": "10.77.0.20/32", "secret": "proxy-usghome-secret-4" }
   ],
   "users": [],
   "verbose": true,
@@ -18,7 +19,15 @@
       "cert_path": "/certs/usg-home-server.crt",
       "key_path": "/certs/usg-home-server.key",
       "ca_path": "/certs/ca.crt",
-      "require_client_cert": true
+      "require_client_cert": true,
+      "revocation": {
+        "mode": "crl_only",
+        "on_error": "fail_closed",
+        "crl": {
+          "static_files": ["/certs/ca.crl"],
+          "fetch": false
+        }
+      }
     }
   }
 }

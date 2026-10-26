@@ -1,0 +1,88 @@
+{
+  "_comment": "USG RADIUS - EAP-TLS and RadSec with certificate revocation checking (CRL/OCSP)",
+  "_description": "Supplicant certificates (EAP-TLS) and NAS certificates (RadSec) are checked against a CRL and/or OCSP at TLS handshake time, after chain validation against the CA bundle. Needs a binary built with the `revocation` cargo feature (the container image and release binary are).",
+  "_revocation_notes": [
+    "mode: crl_only (default) | ocsp_only | prefer_ocsp | both",
+    "on_error: fail_closed (default) rejects the client when the status cannot be determined (CRL/OCSP unreachable, stale, unparseable, or nothing covers the certificate's issuer); fail_open accepts and logs a warning. A positive 'revoked' answer always rejects.",
+    "crl.static_files: CRL files (PEM or DER) loaded at startup and matched to certificates by issuer; refresh them and restart before nextUpdate, or the check fails per on_error. Recommended for air-gapped sites.",
+    "crl.fetch: follow the certificate's CRL Distribution Points over HTTP(S) when no current static CRL covers its issuer. The fetch blocks that handshake for up to crl.fetch_timeout_secs, so keep it short relative to the NAS's RADIUS timeout. Fetched CRLs are cached for crl.cache_ttl_secs (and never past their nextUpdate).",
+    "ocsp.*: responder URL comes from the certificate's Authority Information Access extension; the issuer certificate is taken from the CA bundle. A nonce (RFC 8954) is sent and must be echoed when ocsp.nonce is true. OCSP response signatures are not verified in this release, so prefer crl_only unless the responder path is trusted.",
+    "eap.tls.revocation requires eap.tls.require_client_cert = true and eap.tls.ca_path; radsec.revocation applies to the NAS client certificates RadSec always verifies.",
+    "Every field under crl and ocsp is optional; the values below are the defaults except where noted."
+  ],
+
+  "listen_address": "::",
+  "listen_port": 1812,
+  "secret": "${RADIUS_DEFAULT_SECRET}",
+  "transport": "radsec",
+
+  "clients": [
+    {
+      "address": "10.10.0.0/16",
+      "secret": "${RADIUS_CAMPUS_WIRELESS_SECRET}",
+      "name": "Campus Wireless Controllers",
+      "enabled": true
+    }
+  ],
+
+  "users": [],
+
+  "verbose": false,
+  "log_level": "info",
+  "audit_log_path": "/var/log/radius/audit.log",
+  "strict_rfc_compliance": true,
+
+  "eap": {
+    "enable_tls": true,
+    "enable_teap": false,
+    "tls": {
+      "cert_path": "/etc/radius/eap/server.pem",
+      "key_path": "/etc/radius/eap/server.key",
+      "ca_path": "/etc/radius/eap/supplicant-ca.pem",
+      "require_client_cert": true,
+      "revocation": {
+        "mode": "crl_only",
+        "on_error": "fail_closed",
+        "crl": {
+          "static_files": ["/etc/radius/crl/supplicant-ca.crl"],
+          "fetch": true,
+          "fetch_timeout_secs": 5,
+          "cache_ttl_secs": 3600,
+          "max_cache_entries": 100,
+          "max_size_bytes": 10485760
+        }
+      }
+    }
+  },
+
+  "radsec": {
+    "listen_address": "::",
+    "listen_port": 2083,
+    "cert_path": "/etc/radius/radsec/server.pem",
+    "key_path": "/etc/radius/radsec/server.key",
+    "client_ca_path": "/etc/radius/radsec/nas-ca.pem",
+    "revocation": {
+      "mode": "crl_only",
+      "on_error": "fail_closed",
+      "crl": {
+        "static_files": ["/etc/radius/crl/nas-ca.crl"],
+        "fetch": false
+      }
+    }
+  },
+
+  "_ocsp_example": {
+    "mode": "prefer_ocsp",
+    "on_error": "fail_closed",
+    "ocsp": {
+      "fetch_timeout_secs": 3,
+      "cache_ttl_secs": 600,
+      "max_cache_entries": 1000,
+      "nonce": true,
+      "max_response_size_bytes": 1048576
+    },
+    "crl": {
+      "fetch": true
+    }
+  }
+}

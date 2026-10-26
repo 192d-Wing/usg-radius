@@ -51,6 +51,12 @@ jobs:
       - name: Run unit tests
         run: cargo test --workspace --all-targets
 
+      # The optional `revocation` feature (CRL/OCSP client-certificate checks)
+      # has its own tests and is what the container image and release binary
+      # ship with; clippy below already runs with --all-features.
+      - name: Run unit tests (all features)
+        run: cargo test --workspace --all-targets --all-features
+
       - name: Run integration tests
         run: cargo test --test '*'
 
@@ -149,6 +155,15 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ui/bff is its own crate with its own Cargo.lock (not a workspace
+      # member), so the step above never sees it: four advisories sat in that
+      # lockfile unnoticed. Audit it too.
+      - name: Run cargo-audit (ui/bff)
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: ui/bff
 
   coverage:
     name: Code Coverage
