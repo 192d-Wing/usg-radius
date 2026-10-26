@@ -16,7 +16,7 @@ use crate::server::{AuthHandler, AuthResult};
 
 #[cfg(feature = "tls")]
 use radius_proto::eap::eap_tls::{
-    EapTlsPacket, EapTlsServer, TlsCertificateConfig, build_server_config,
+    EapTlsPacket, EapTlsServer, TlsCertificateConfig, TlsFlags, build_server_config,
 };
 
 #[cfg(feature = "tls")]
@@ -566,6 +566,22 @@ impl EapAuthHandler {
             // No outbound handshake data. Either the handshake just
             // finished, or rustls is still waiting for more from the peer.
             Ok(None) => {
+                // RFC 5216 §2.1.5: a Response with the M bit set is answered
+                // with an EAP-Request of Type EAP-TLS carrying no data (flags
+                // 0x00, no TLS Message Length), so the peer sends the next
+                // fragment. The reassembler has already bounded the buffer.
+                if tls_packet.flags.more_fragments() {
+                    let ack =
+                        EapTlsPacket::new(TlsFlags::new(false, false, false), None, Vec::new());
+                    let id = next_id();
+                    debug!(
+                        session_id,
+                        identifier = id,
+                        "continue_eap_tls: ACKing non-final peer fragment"
+                    );
+                    return make_challenge(ack, id).unwrap_or(AuthResult::Reject);
+                }
+
                 if !tls_server.is_handshake_complete() {
                     // Mid-handshake with nothing to send back is wrong — peer
                     // sent us nothing we could act on.
@@ -1370,6 +1386,92 @@ mod eap_tls_mppe_tests {
                 .find_vendor_attributes(MICROSOFT_VENDOR_ID, MS_MPPE_SEND_KEY)
                 .is_empty()
         );
+    }
+
+    /// The peer can split ClientHello across EAP-TLS Responses. Every
+    /// non-final fragment must receive an empty EAP-TLS Request/ACK.
+    #[test]
+    fn eap_tls_acknowledges_fragmented_client_hello() {
+        let pki = gen_pki();
+        let handler = eap_handler(&pki);
+        let mut peer = Supplicant::new(&pki);
+
+        let (state, attributes) = match handler.authenticate_request(&identity_request(), SECRET) {
+            AuthResult::Challenge {
+                state, attributes, ..
+            } => (state, attributes),
+            _ => panic!("expected EAP-TLS Start"),
+        };
+
+        let start = packet_with(Code::AccessChallenge, 1, attributes);
+        let start_eap = eap_from_radius_packet(&start).unwrap().unwrap();
+        assert!(
+            EapTlsPacket::from_eap_data(&start_eap.data)
+                .unwrap()
+                .flags
+                .start()
+        );
+
+        let client_hello = peer.pending_tls();
+        let split = client_hello.len() / 2;
+        assert!(split > 0);
+
+        let first = EapTlsPacket::new(
+            TlsFlags::new(true, true, false),
+            Some(client_hello.len() as u32),
+            client_hello[..split].to_vec(),
+        )
+        .to_eap_response(start_eap.identifier);
+        let request = access_request(2, &first, Some(&state));
+        let (state, attributes) = match handler.authenticate_request(&request, SECRET) {
+            AuthResult::Challenge {
+                state, attributes, ..
+            } => (state, attributes),
+            AuthResult::Reject => panic!("server rejected a non-final ClientHello fragment"),
+            AuthResult::Accept { .. } => panic!("server accepted an incomplete ClientHello"),
+        };
+
+        let ack_packet = packet_with(Code::AccessChallenge, request.identifier, attributes);
+        let ack_eap = eap_from_radius_packet(&ack_packet).unwrap().unwrap();
+        assert_eq!(ack_eap.code, EapCode::Request);
+        assert_eq!(ack_eap.eap_type, Some(EapType::Tls));
+        // RFC 3748 §4.1: the ACK is a new Request, so its Identifier differs
+        // from the Start's; reusing it would read as a retransmitted Start and
+        // make the peer resend its first fragment forever.
+        assert_ne!(ack_eap.identifier, start_eap.identifier);
+
+        let ack_tls = EapTlsPacket::from_eap_data(&ack_eap.data).unwrap();
+        assert_eq!(ack_tls.flags.as_u8(), 0);
+        assert_eq!(ack_tls.tls_message_length, None);
+        assert!(ack_tls.tls_data.is_empty());
+
+        // Send the final ClientHello fragment and finish the handshake.
+        let last = EapTlsPacket::new(
+            TlsFlags::new(false, false, false),
+            None,
+            client_hello[split..].to_vec(),
+        )
+        .to_eap_response(ack_eap.identifier);
+        let mut request = access_request(3, &last, Some(&state));
+        for _ in 0..64 {
+            match handler.authenticate_request(&request, SECRET) {
+                AuthResult::Challenge {
+                    state, attributes, ..
+                } => {
+                    let mut challenge =
+                        packet_with(Code::AccessChallenge, request.identifier, attributes);
+                    challenge
+                        .add_attribute(Attribute::new(AttributeType::State as u8, state).unwrap());
+                    request = answer_challenge(&mut peer, &challenge);
+                }
+                AuthResult::Accept { msk, .. } => {
+                    assert_eq!(msk.expect("missing MSK"), peer.msk());
+                    return;
+                }
+                AuthResult::Reject => panic!("EAP-TLS rejected at id {}", request.identifier),
+            }
+        }
+        panic!("fragmented EAP-TLS conversation did not complete");
     }
 
     /// RFC 9190 §2.5 regression (interop with wpa_supplicant / FreeRADIUS over

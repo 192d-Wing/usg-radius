@@ -56,6 +56,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Bounded EAP-TLS fragment reassembly.** With the fragment ACK below, an
+  unauthenticated supplicant behind any NAS can keep an EAP-TLS conversation
+  open with non-final fragments, and `TlsFragmentAssembler` had no size limit:
+  it accepted any TLS Message Length, buffered every fragment and compared the
+  total only on a final fragment the peer never has to send. The reassembler
+  now requires L and a TLS Message Length on the first fragment of a
+  fragmented message (RFC 5216 §3.1), rejects an announced length of zero or
+  above 64 KiB, rejects a fragment that would carry the message past the
+  announced length before buffering it, rejects a non-final fragment with no
+  data, resets itself on every error, and the server rejects a peer packet
+  with the S bit set. Every rejection ends the conversation with
+  Access-Reject + EAP-Failure. Five negative unit tests.
 - Updated transitive dependencies to clear `cargo audit` findings published
   2026-10-19 to 2026-10-23 against an unchanged lockfile: `rustls-webpki`
   0.103.15→0.103.16 and `webpki-roots` 1.0.7→1.0.11 (RUSTSEC-2026-0382 /
@@ -89,6 +101,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **EAP-TLS rejected any supplicant whose TLS flight spanned more than one EAP
+  fragment.** When a peer's EAP-Response/TLS arrived with the M (more
+  fragments) bit set, the server treated the reassembler's "need more" as a
+  stalled handshake and sent Access-Reject instead of the empty EAP-TLS Request
+  that RFC 5216 §2.1.5 requires as the acknowledgement. Any client certificate
+  chain, RSA certificate, hybrid ML-KEM ClientHello or small NAS MTU that
+  pushed a flight past the fragment size failed to authenticate. Found and
+  fixed by @cynix in [#79](https://github.com/192d-Wing/usg-radius/pull/79)
+  (this release carries that commit): each non-final peer fragment is now
+  answered with an EAP-TLS Request carrying no data and a fresh Identifier.
+  Interop scenarios 8 and 9 (`tests/interop`, eapol_test with
+  `fragment_size=300`, direct and through the proxy; 33 assertions in all)
+  fail on the previous release and pass now.
 - **EAP Access-Rejects carried no EAP-Failure.** When an EAP method failed
   inside the handler (TLS handshake error, certificate rejected), the generic
   reject path returned a bare Access-Reject with no `EAP-Message`, so the
