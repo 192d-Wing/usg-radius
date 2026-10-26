@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asserts that the revoked certificate's EAP-TLS fails with an EAP-Failure
   while the valid one still succeeds, both straight at usg-radius and through
   the proxy (24 assertions, up from 15).
+- **`/radius-workflow` multi-agent development skill** (`.claude/skills/radius-workflow/`)
+  with eight specialist subagents in `.claude/agents/` (architect, coder, QA,
+  security, crypto/FIPS, RFC conformance, docs scribe, release engineer),
+  adapted from OstrichPKI's `ostrich-workflow`: plan → build → test (including
+  the interop harness) → parallel review → fix loop → docs → release gate. A
+  root `CLAUDE.md` documents the workflow, the CI-equivalent commands and the
+  project's rules of the road.
 - **Interop test in CI.** `.github/workflows/interop.yml` runs
 - **Interop test in CI.** `.github/workflows/interop.yml` runs
   `tests/interop/run.sh` (usg-radius as proxy and as EAP-TLS home server
@@ -46,6 +53,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dir of the in-image build and the image layers are cached across runs;
   `compose.yaml` now passes `CARGO_BUILD_JOBS` through to the usg-radius image
   build (default 2, CI uses 4).
+
+### Security
+
+- Updated transitive dependencies to clear `cargo audit` findings published
+  2026-10-19 to 2026-10-23 against an unchanged lockfile: `rustls-webpki`
+  0.103.15→0.103.16 and `webpki-roots` 1.0.7→1.0.11 (RUSTSEC-2026-0382 /
+  -0381, CVE-2026-111943: distrusted emSign intermediates accepted),
+  `ctutils` 0.4.3→0.4.6 (RUSTSEC-2026-0385, non-constant-time mask
+  generation), and `tokio` 1.52.3→1.54.1 (RUSTSEC-2026-0386, `AsyncFd`
+  I/O-safety unsoundness, informational). The same `rustls-webpki`,
+  `webpki-roots` and `tokio` bumps are applied to `ui/bff/Cargo.lock`.
 
 ### Fixed
 
