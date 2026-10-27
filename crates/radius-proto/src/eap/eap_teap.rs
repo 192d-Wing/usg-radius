@@ -2744,7 +2744,10 @@ mod tests {
     /// IMCK / CMK never appear in `Debug` output.
     #[test]
     fn crypto_binding_debug_prints_key_lengths_only() {
-        let binding = CryptoBinding::new(&[0x01; 32], &[0x02; 32]);
+        // Random inputs: nothing here is a real key, and nothing is hard-coded.
+        let session_key_seed: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+        let imsk: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+        let binding = CryptoBinding::new(&session_key_seed, &imsk);
         let printed = format!("{binding:?}");
         assert!(printed.contains("imck_len: 60"), "{printed}");
         assert!(printed.contains("cmk_len: 20"), "{printed}");
