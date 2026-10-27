@@ -828,7 +828,27 @@ pub mod eap_tls {
         }
     }
 
-    /// Fragment a large TLS message into EAP-TLS packets
+    /// When the L flag (and the four-octet TLS Message Length) goes on the
+    /// first packet of an outbound TLS message.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum LengthFlagPolicy {
+        /// L on the first packet of every message, fragmented or not. This
+        /// is what EAP-TLS sends: RFC 5216 §2.1.5 requires L on the first
+        /// fragment of a fragmented message and does not forbid it elsewhere,
+        /// and it is the behaviour the interop suite was validated against.
+        #[default]
+        Always,
+        /// L only on the first fragment of a message that is actually split.
+        /// RFC 7170 §3.7 (EAP-TEAP): L "MUST be set for the first fragment of
+        /// a fragmented TLS message or set of messages. It MUST NOT be present
+        /// for any other message."
+        FragmentedOnly,
+    }
+
+    /// Fragment a large TLS message into EAP-TLS packets, with the L flag on
+    /// the first packet of every message ([`LengthFlagPolicy::Always`], the
+    /// EAP-TLS behaviour). EAP-TEAP uses
+    /// [`fragment_tls_message_with`] and [`LengthFlagPolicy::FragmentedOnly`].
     ///
     /// # Arguments
     /// * `tls_data` - Complete TLS message to fragment
@@ -837,13 +857,38 @@ pub mod eap_tls {
     /// # Returns
     /// Vector of EAP-TLS packets
     pub fn fragment_tls_message(tls_data: &[u8], max_fragment_size: usize) -> Vec<EapTlsPacket> {
+        fragment_tls_message_with(tls_data, max_fragment_size, LengthFlagPolicy::Always)
+    }
+
+    /// [`fragment_tls_message`] with an explicit [`LengthFlagPolicy`].
+    ///
+    /// Under [`LengthFlagPolicy::FragmentedOnly`] a message that fits in one
+    /// packet (at most `max_fragment_size - 1` octets after the flags byte)
+    /// is sent without L and without a TLS Message Length; a message that
+    /// needs more than one packet carries L and the length on its first
+    /// fragment only, exactly as under [`LengthFlagPolicy::Always`].
+    pub fn fragment_tls_message_with(
+        tls_data: &[u8],
+        max_fragment_size: usize,
+        policy: LengthFlagPolicy,
+    ) -> Vec<EapTlsPacket> {
         let mut packets = Vec::new();
         let total_length = tls_data.len() as u32;
         let mut offset = 0;
 
-        // Account for flags byte (1) and length field (4) in first packet
-        let first_fragment_size = max_fragment_size.saturating_sub(5);
+        // Does the first packet carry L and the four-octet length field?
         let subsequent_fragment_size = max_fragment_size.saturating_sub(1);
+        let length_on_first = match policy {
+            LengthFlagPolicy::Always => true,
+            LengthFlagPolicy::FragmentedOnly => tls_data.len() > subsequent_fragment_size,
+        };
+        // Account for flags byte (1) and, when present, length field (4) in
+        // the first packet
+        let first_fragment_size = if length_on_first {
+            max_fragment_size.saturating_sub(5)
+        } else {
+            subsequent_fragment_size
+        };
 
         while offset < tls_data.len() {
             let is_first = offset == 0;
@@ -857,7 +902,7 @@ pub mod eap_tls {
             let more_fragments = offset + fragment_size < tls_data.len();
             let fragment_data = tls_data[offset..offset + fragment_size].to_vec();
 
-            let packet = if is_first {
+            let packet = if is_first && length_on_first {
                 // First packet has L flag and total length
                 EapTlsPacket::new(
                     TlsFlags::new(true, more_fragments, false),
@@ -960,7 +1005,6 @@ pub mod eap_tls {
     /// EAP-TLS session context
     ///
     /// Manages the TLS handshake state and buffering for a single EAP-TLS session
-    #[derive(Debug)]
     pub struct EapTlsContext {
         /// Current handshake state
         pub handshake_state: TlsHandshakeState,
@@ -970,6 +1014,10 @@ pub mod eap_tls {
         pub outgoing_fragments: Vec<EapTlsPacket>,
         /// Current fragment index being sent
         pub current_fragment_index: usize,
+        /// Where the L flag goes on outbound messages (see
+        /// [`LengthFlagPolicy`]); EAP-TLS keeps the default, EAP-TEAP sets
+        /// [`LengthFlagPolicy::FragmentedOnly`].
+        pub length_flag_policy: LengthFlagPolicy,
         /// Client random from TLS handshake (for key derivation)
         pub client_random: Option<[u8; 32]>,
         /// Server random from TLS handshake (for key derivation)
@@ -982,6 +1030,28 @@ pub mod eap_tls {
         pub emsk: Option<[u8; 64]>,
     }
 
+    impl std::fmt::Debug for EapTlsContext {
+        /// Never print key material: the master secret, MSK and EMSK appear
+        /// as lengths only.
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("EapTlsContext")
+                .field("handshake_state", &self.handshake_state)
+                .field("assembler", &self.assembler)
+                .field("outgoing_fragments", &self.outgoing_fragments.len())
+                .field("current_fragment_index", &self.current_fragment_index)
+                .field("length_flag_policy", &self.length_flag_policy)
+                .field("client_random", &self.client_random.is_some())
+                .field("server_random", &self.server_random.is_some())
+                .field(
+                    "master_secret_len",
+                    &self.master_secret.as_ref().map_or(0, Vec::len),
+                )
+                .field("msk_len", &self.msk.as_ref().map_or(0, |k| k.len()))
+                .field("emsk_len", &self.emsk.as_ref().map_or(0, |k| k.len()))
+                .finish()
+        }
+    }
+
     impl EapTlsContext {
         /// Create a new EAP-TLS context
         pub fn new() -> Self {
@@ -990,6 +1060,7 @@ pub mod eap_tls {
                 assembler: TlsFragmentAssembler::new(),
                 outgoing_fragments: Vec::new(),
                 current_fragment_index: 0,
+                length_flag_policy: LengthFlagPolicy::Always,
                 client_random: None,
                 server_random: None,
                 master_secret: None,
@@ -1027,9 +1098,11 @@ pub mod eap_tls {
             }
         }
 
-        /// Queue TLS data for sending, fragmenting if necessary
+        /// Queue TLS data for sending, fragmenting if necessary (L flag per
+        /// [`Self::length_flag_policy`]).
         pub fn queue_tls_data(&mut self, tls_data: Vec<u8>, max_fragment_size: usize) {
-            self.outgoing_fragments = fragment_tls_message(&tls_data, max_fragment_size);
+            self.outgoing_fragments =
+                fragment_tls_message_with(&tls_data, max_fragment_size, self.length_flag_policy);
             self.current_fragment_index = 0;
         }
 
@@ -1561,6 +1634,13 @@ pub mod eap_tls {
             self.context.queue_tls_data(tls_data, max_fragment_size);
         }
 
+        /// Choose where the L flag goes on outbound messages. EAP-TLS keeps
+        /// the default ([`LengthFlagPolicy::Always`]); EAP-TEAP must use
+        /// [`LengthFlagPolicy::FragmentedOnly`] (RFC 7170 §3.7).
+        pub fn set_length_flag_policy(&mut self, policy: LengthFlagPolicy) {
+            self.context.length_flag_policy = policy;
+        }
+
         /// Extract keys after successful handshake
         ///
         /// Uses RFC 5705 Keying Material Exporter to derive MSK and EMSK
@@ -1991,6 +2071,18 @@ impl EapSession {
         Ok(())
     }
 
+    /// Seed the Identifier sequence from the peer's EAP-Response/Identity.
+    ///
+    /// The NAS chose the Identifier of its EAP-Request/Identity and the peer
+    /// echoed it in the Response; RFC 3748 §4.1 requires every new Request to
+    /// carry an Identifier different from the previous one, so the first
+    /// Request this server sends must not reuse it. After this call
+    /// [`next_identifier`](Self::next_identifier) yields
+    /// `response_identifier + 1` (mod 256).
+    pub fn seed_identifier_after(&mut self, response_identifier: u8) {
+        self.current_identifier = response_identifier.wrapping_add(1);
+    }
+
     /// Get next identifier and increment
     pub fn next_identifier(&mut self) -> u8 {
         let id = self.current_identifier;
@@ -2201,26 +2293,7 @@ impl EapSessionManager {
     /// recently used ones. Returns the evicted session IDs with the reason,
     /// so the caller can drop whatever it keeps per session.
     pub fn evict_at(&mut self, now_secs: u64) -> Vec<(String, EvictionReason)> {
-        let timeout = self.default_timeout;
-        let mut evicted = Vec::new();
-
-        // Idle sessions sit at the old end of the LRU order (a session's
-        // activity time only moves when it is touched), so stop at the first
-        // live one.
-        let mut stale = Vec::new();
-        for (seq, id) in &self.lru {
-            match self.sessions.get(id) {
-                Some(s) if s.is_timed_out_at(now_secs, timeout) => stale.push((*seq, id.clone())),
-                Some(_) => break,
-                None => stale.push((*seq, id.clone())), // dangling index entry
-            }
-        }
-        for (seq, id) in stale {
-            self.lru.remove(&seq);
-            if self.sessions.remove(&id).is_some() {
-                evicted.push((id, EvictionReason::Idle));
-            }
-        }
+        let mut evicted = self.evict_idle_at(now_secs);
 
         while self.sessions.len() >= self.max_sessions {
             let Some((_, id)) = self.lru.pop_first() else {
@@ -2244,6 +2317,36 @@ impl EapSessionManager {
     /// [`Self::evict_at`] as of the current time.
     pub fn evict(&mut self) -> Vec<(String, EvictionReason)> {
         self.evict_at(unix_now_secs())
+    }
+
+    /// Evict every session idle for longer than the timeout as of
+    /// `now_secs`, and nothing else: unlike [`Self::evict_at`] this never
+    /// displaces a live session for capacity, so it is safe to run on every
+    /// incoming packet. Returns the evicted session IDs (reason always
+    /// [`EvictionReason::Idle`]).
+    pub fn evict_idle_at(&mut self, now_secs: u64) -> Vec<(String, EvictionReason)> {
+        let timeout = self.default_timeout;
+        let mut evicted = Vec::new();
+
+        // Idle sessions sit at the old end of the LRU order (a session's
+        // activity time only moves when it is touched), so stop at the first
+        // live one.
+        let mut stale = Vec::new();
+        for (seq, id) in &self.lru {
+            match self.sessions.get(id) {
+                Some(s) if s.is_timed_out_at(now_secs, timeout) => stale.push((*seq, id.clone())),
+                Some(_) => break,
+                None => stale.push((*seq, id.clone())), // dangling index entry
+            }
+        }
+        for (seq, id) in stale {
+            self.lru.remove(&seq);
+            if self.sessions.remove(&id).is_some() {
+                evicted.push((id, EvictionReason::Idle));
+            }
+        }
+
+        evicted
     }
 
     /// Clean up timed out sessions
@@ -2784,6 +2887,26 @@ mod tests {
         assert_eq!(session.current_identifier, 0); // Wrapped around
     }
 
+    /// RFC 3748 §4.1: the first Request after the peer's Identity Response
+    /// follows the NAS's Identifier instead of starting at 0.
+    #[test]
+    fn seed_identifier_after_identity_response() {
+        let mut session = EapSession::new("test".to_string());
+        session.seed_identifier_after(0x2A);
+        assert_eq!(session.next_identifier(), 0x2B);
+        assert_eq!(session.next_identifier(), 0x2C);
+
+        session.seed_identifier_after(255);
+        assert_eq!(session.next_identifier(), 0); // wraps
+        assert_eq!(session.next_identifier(), 1);
+
+        // Every seed yields a first Request that differs from the Response.
+        for id in 0..=255u8 {
+            session.seed_identifier_after(id);
+            assert_ne!(session.next_identifier(), id);
+        }
+    }
+
     #[test]
     fn test_eap_session_timeout_check() {
         let mut session = EapSession::new("test".to_string());
@@ -3044,6 +3167,34 @@ mod tests {
         let evicted = manager.evict_at(now);
         assert_eq!(evicted, vec![("stale".to_string(), EvictionReason::Idle)]);
         assert!(manager.get_session("live").is_some());
+    }
+
+    /// `evict_idle_at` drops idle sessions only; a full store is left alone
+    /// (capacity eviction is for making room before a create, not for every
+    /// packet).
+    #[test]
+    fn session_manager_evict_idle_at_never_evicts_for_capacity() {
+        let mut manager = EapSessionManager::with_config(10, 3);
+        manager.set_max_sessions(2);
+        manager.create_session("stale".to_string());
+        manager.create_session("live".to_string());
+        let now = manager.get_session("live").unwrap().last_activity;
+        manager.sessions.get_mut("stale").unwrap().last_activity = now - 60;
+        assert_eq!(manager.session_count(), manager.max_sessions());
+
+        let evicted = manager.evict_idle_at(now);
+        assert_eq!(evicted, vec![("stale".to_string(), EvictionReason::Idle)]);
+        assert!(manager.get_session("live").is_some());
+        assert_eq!(manager.lru.len(), 1);
+
+        // Full again, nothing idle: evict_idle_at is a no-op where evict_at
+        // would displace the least recently used session.
+        manager.create_session("other".to_string());
+        assert_eq!(manager.session_count(), 2);
+        assert!(manager.evict_idle_at(now).is_empty());
+        assert_eq!(manager.session_count(), 2);
+        assert_eq!(manager.evict_at(now).len(), 1);
+        assert_eq!(manager.session_count(), 1);
     }
 
     #[test]
@@ -3733,6 +3884,105 @@ mod tests {
             assert!(!fragments[0].flags.more_fragments());
             assert_eq!(fragments[0].tls_message_length, Some(5));
             assert_eq!(fragments[0].tls_data, data);
+        }
+
+        /// RFC 7170 §3.7: under `FragmentedOnly` an unfragmented message
+        /// carries neither L nor a TLS Message Length, and it may use the
+        /// four octets the length field would have taken.
+        #[test]
+        fn fragmented_only_policy_omits_length_on_unfragmented_message() {
+            let data = vec![1, 2, 3, 4, 5];
+            let fragments =
+                fragment_tls_message_with(&data, 1000, LengthFlagPolicy::FragmentedOnly);
+            assert_eq!(fragments.len(), 1);
+            assert!(!fragments[0].flags.length_included());
+            assert!(!fragments[0].flags.more_fragments());
+            assert!(!fragments[0].flags.start());
+            assert_eq!(fragments[0].tls_message_length, None);
+            assert_eq!(fragments[0].tls_data, data);
+
+            // Exactly max_fragment_size - 1 octets still fits in one packet.
+            let edge = vec![0x42u8; 999];
+            let fragments =
+                fragment_tls_message_with(&edge, 1000, LengthFlagPolicy::FragmentedOnly);
+            assert_eq!(fragments.len(), 1);
+            assert!(!fragments[0].flags.length_included());
+            assert_eq!(fragments[0].tls_data, edge);
+            assert!(fragments[0].to_eap_data().len() <= 1000);
+
+            // Empty message: nothing to send under either policy.
+            assert!(
+                fragment_tls_message_with(&[], 1000, LengthFlagPolicy::FragmentedOnly).is_empty()
+            );
+            assert!(fragment_tls_message(&[], 1000).is_empty());
+        }
+
+        /// RFC 7170 §3.7: L (and the length) on the first fragment of a
+        /// fragmented message only; the split is the same as for EAP-TLS.
+        #[test]
+        fn fragmented_only_policy_sets_length_on_first_fragment_only() {
+            let data = vec![0x42u8; 2500];
+            let fragments =
+                fragment_tls_message_with(&data, 1000, LengthFlagPolicy::FragmentedOnly);
+            assert_eq!(fragments.len(), 3);
+            assert!(fragments[0].flags.length_included());
+            assert!(fragments[0].flags.more_fragments());
+            assert_eq!(fragments[0].tls_message_length, Some(2500));
+            assert_eq!(fragments[0].tls_data.len(), 995);
+            for fragment in &fragments[1..] {
+                assert!(!fragment.flags.length_included());
+                assert!(fragment.tls_message_length.is_none());
+            }
+            assert!(fragments[1].flags.more_fragments());
+            assert!(!fragments[2].flags.more_fragments());
+            assert_eq!(fragments, fragment_tls_message(&data, 1000));
+
+            let mut assembler = TlsFragmentAssembler::new();
+            let mut out = None;
+            for fragment in &fragments {
+                out = assembler.add_fragment(fragment).unwrap();
+            }
+            assert_eq!(out, Some(data));
+        }
+
+        /// EAP-TLS behaviour is unchanged: the default policy keeps L on the
+        /// first packet of every message, and a server context created with
+        /// `new()` uses it.
+        #[test]
+        fn default_policy_is_always_and_matches_eap_tls_context() {
+            assert_eq!(LengthFlagPolicy::default(), LengthFlagPolicy::Always);
+            let mut context = EapTlsContext::new();
+            assert_eq!(context.length_flag_policy, LengthFlagPolicy::Always);
+            context.queue_tls_data(vec![9, 9, 9], 1000);
+            let first = context.get_next_fragment().unwrap();
+            assert!(first.flags.length_included());
+            assert_eq!(first.tls_message_length, Some(3));
+
+            let mut context = EapTlsContext::new();
+            context.length_flag_policy = LengthFlagPolicy::FragmentedOnly;
+            context.queue_tls_data(vec![9, 9, 9], 1000);
+            let first = context.get_next_fragment().unwrap();
+            assert!(!first.flags.length_included());
+            assert_eq!(first.tls_message_length, None);
+        }
+
+        /// The master secret, MSK and EMSK never appear in `Debug` output.
+        #[test]
+        fn eap_tls_context_debug_prints_key_lengths_only() {
+            let mut context = EapTlsContext::new();
+            context.master_secret = Some(vec![0xA5; 48]);
+            context.msk = Some([0x5A; 64]);
+            context.emsk = Some([0xC3; 64]);
+            let printed = format!("{context:?}");
+            assert!(printed.contains("master_secret_len: 48"), "{printed}");
+            assert!(printed.contains("msk_len: 64"), "{printed}");
+            assert!(printed.contains("emsk_len: 64"), "{printed}");
+            for octet in ["a5", "A5", "5a", "5A", "c3", "C3", "165", "90", "195"] {
+                assert!(
+                    !printed.contains(&format!("{octet}, {octet}")),
+                    "key bytes leaked: {printed}"
+                );
+            }
         }
 
         #[test]
