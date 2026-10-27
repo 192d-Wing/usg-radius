@@ -16,8 +16,11 @@ use tracing::{debug, error, warn};
 use crate::server::{AuthHandler, AuthResult};
 
 #[cfg(feature = "tls")]
+use radius_proto::eap::eap_teap::TeapPacket;
+#[cfg(feature = "tls")]
 use radius_proto::eap::eap_tls::{
-    EapTlsPacket, EapTlsServer, TlsCertificateConfig, TlsFlags, build_server_config,
+    EapTlsPacket, EapTlsServer, TlsCertificateConfig, TlsFlags, TlsHandshakeState,
+    build_server_config,
 };
 
 #[cfg(feature = "tls")]
@@ -31,7 +34,7 @@ pub static EAP_SESSIONS_EVICTED_IDLE: AtomicU64 = AtomicU64::new(0);
 pub static EAP_SESSIONS_EVICTED_CAPACITY: AtomicU64 = AtomicU64::new(0);
 
 /// Largest EAP-TLS / EAP-TEAP fragment the server sends, in bytes of
-/// EAP-TLS Type-Data (RFC 5216 §2.1.5 / RFC 7170 §3.7). 1020 keeps a fragment
+/// EAP-TLS Type-Data (RFC 5216 §2.1.5 / RFC 9930 §3.3). 1020 keeps a fragment
 /// plus the EAP and RADIUS framing inside a 1500-byte Ethernet MTU.
 pub const DEFAULT_MAX_FRAGMENT_SIZE: usize = 1020;
 
@@ -338,7 +341,8 @@ impl EapAuthHandler {
     /// key, a WebPKI client verifier over `ca_path` when `require_client_cert`
     /// is set, wrapped in CRL/OCSP revocation checking when `eap.tls.revocation`
     /// is present (see [`crate::client_verifier`]). The same config serves both
-    /// methods, as in [`Self::configure_tls`] / [`Self::configure_teap`].
+    /// methods, as in [`Self::configure_tls`] / [`Self::configure_teap`], unless
+    /// `eap.teap_tls` gives the TEAP tunnel its own TLS configuration.
     #[cfg(feature = "tls")]
     pub fn configure_from_config(
         &mut self,
@@ -346,7 +350,11 @@ impl EapAuthHandler {
     ) -> Result<(), String> {
         let server_config = StdArc::new(build_eap_server_config(&eap_cfg.tls)?);
         if eap_cfg.enable_teap {
-            self.configure_teap_with_server_config("", server_config.clone());
+            let teap_config = match &eap_cfg.teap_tls {
+                Some(teap_tls) => StdArc::new(build_eap_server_config(teap_tls)?),
+                None => server_config.clone(),
+            };
+            self.configure_teap_with_server_config("", teap_config);
         }
         if eap_cfg.enable_tls {
             self.configure_tls_with_server_config("", server_config);
@@ -494,6 +502,113 @@ impl EapAuthHandler {
         }
     }
 
+    /// EAP-Nak (RFC 3748 §5.3.1): the peer declined the method proposed in
+    /// our last Request and lists, in the Type-Data, the Types it would
+    /// accept (a single 0 means none). Switch to the first listed method
+    /// that is configured here and differs from the one declined, discarding
+    /// the declined method's state, so a server with both EAP-TEAP and
+    /// EAP-TLS enabled serves supplicants of either kind. A Nak is honoured
+    /// only as the peer's first answer to a method proposal (no method data
+    /// processed yet) and at most once per conversation; anything else ends
+    /// the conversation with a Reject (fail closed).
+    #[cfg(feature = "tls")]
+    fn handle_nak(&self, username: &str, session_id: &str, nak: &EapPacket) -> AuthResult {
+        // The method just proposed, and whether it has processed any peer data.
+        let (declined, method_started) = {
+            let manager = self.session_manager.read().unwrap();
+            let Some(session) = manager.get_session(session_id) else {
+                return AuthResult::Reject;
+            };
+            if session.attempt_count > 0 {
+                warn!(
+                    username,
+                    session_id, "EAP-Nak after a method was already renegotiated; rejecting"
+                );
+                return AuthResult::Reject;
+            }
+            let started = match session.eap_method {
+                Some(EapType::Teap) => self
+                    .teap_sessions
+                    .read()
+                    .unwrap()
+                    .get(session_id)
+                    .is_none_or(|t| t.negotiated_version().is_some()),
+                Some(EapType::Tls) => self
+                    .tls_sessions
+                    .read()
+                    .unwrap()
+                    .get(session_id)
+                    .is_none_or(|t| {
+                        !matches!(
+                            t.context().handshake_state,
+                            TlsHandshakeState::Initial | TlsHandshakeState::Started
+                        )
+                    }),
+                _ => true,
+            };
+            (session.eap_method, started)
+        };
+        if method_started {
+            warn!(
+                username,
+                session_id,
+                method = ?declined,
+                "EAP-Nak after the method had started; rejecting"
+            );
+            return AuthResult::Reject;
+        }
+
+        let (tls_enabled, teap_enabled) = {
+            let configs = self.tls_configs.read().unwrap();
+            (
+                configs.contains_key(""),
+                configs.keys().any(|k| k.starts_with("teap_")),
+            )
+        };
+        let next = nak
+            .data
+            .iter()
+            .filter_map(|t| EapType::from_u8(*t))
+            .find(|t| match t {
+                EapType::Tls => tls_enabled && declined != Some(EapType::Tls),
+                EapType::Teap => teap_enabled && declined != Some(EapType::Teap),
+                _ => false,
+            });
+        let Some(next) = next else {
+            warn!(
+                username,
+                session_id,
+                declined = ?declined,
+                desired = ?nak.data,
+                "EAP-Nak: peer accepts no method configured here; rejecting"
+            );
+            return AuthResult::Reject;
+        };
+
+        // Discard the declined method's state and propose the next one.
+        self.drop_method_state(std::iter::once(session_id));
+        {
+            let mut manager = self.session_manager.write().unwrap();
+            let Some(session) = manager.get_session_mut(session_id) else {
+                return AuthResult::Reject;
+            };
+            session.attempt_count += 1;
+            session.eap_method = Some(next);
+        }
+        debug!(
+            username,
+            session_id,
+            declined = ?declined,
+            next = ?next,
+            "EAP-Nak: switching method (RFC 3748 §5.3.1)"
+        );
+        match next {
+            EapType::Tls => self.start_eap_tls(username, session_id),
+            EapType::Teap => self.start_eap_teap(username, session_id),
+            _ => AuthResult::Reject,
+        }
+    }
+
     /// Start EAP-MD5 Challenge authentication
     #[allow(dead_code)]
     fn start_eap_md5(&self, _username: &str, _session_id: &str) -> AuthResult {
@@ -599,8 +714,8 @@ impl EapAuthHandler {
             let mut teap_sessions = self.teap_sessions.write().unwrap();
             teap_sessions.insert(session_id.to_string(), teap_server);
 
-            // Create EAP-TEAP Start packet (uses EAP-TLS packet format)
-            let start_packet = EapTlsPacket::start();
+            // Create the TEAP/Start packet (RFC 9930 §3.2: S bit, version 1).
+            let start_packet = TeapPacket::start();
             let identifier = {
                 let mut manager = self.session_manager.write().unwrap();
                 if let Some(session) = manager.get_session_mut(session_id) {
@@ -906,12 +1021,12 @@ impl EapAuthHandler {
         }
     }
 
-    /// Continue EAP-TEAP authentication (RFC 7170).
+    /// Continue EAP-TEAP authentication (RFC 9930).
     ///
     /// Same shape as [`Self::continue_eap_tls`]: the peer's packet is either
     /// an ACK for a server fragment still queued from the previous round
     /// (send the next one), a fragment of a larger message (ACK it and wait,
-    /// RFC 7170 §3.7), or a complete message for the TEAP state machine
+    /// RFC 9930 §3.3), or a complete message for the TEAP state machine
     /// (Phase 1 handshake data or Phase 2 encrypted TLVs). Every outbound
     /// TLS message, in either phase, is fragmented to the EAP MTU.
     #[cfg(feature = "tls")]
@@ -938,9 +1053,9 @@ impl EapAuthHandler {
                 .unwrap_or_else(|| eap_response.identifier.wrapping_add(1))
         };
 
-        // Wrap one outgoing EAP-TEAP fragment (EAP-TLS packet format, Type 55)
+        // Wrap one outgoing EAP-TEAP fragment (RFC 9930 §4.1 header, Type 55)
         // into an Access-Challenge result.
-        let make_challenge = |frag: EapTlsPacket, id: u8| -> Option<AuthResult> {
+        let make_challenge = |frag: TeapPacket, id: u8| -> Option<AuthResult> {
             let eap_packet = EapPacket::new(
                 EapCode::Request,
                 id,
@@ -960,7 +1075,7 @@ impl EapAuthHandler {
             }
         };
 
-        let tls_packet = match EapTlsPacket::from_eap_data(&eap_response.data) {
+        let teap_packet = match TeapPacket::from_eap_data(&eap_response.data) {
             Ok(p) => p,
             Err(e) => {
                 error!(session_id, error = ?e, "continue_eap_teap: malformed EAP-TEAP packet");
@@ -970,9 +1085,9 @@ impl EapAuthHandler {
 
         // 1) Peer-ACK path: server fragments queued from the previous round.
         if teap_server.has_pending_fragments() {
-            if !tls_packet.tls_data.is_empty() || tls_packet.flags.more_fragments() {
+            if !teap_packet.tls.tls_data.is_empty() || teap_packet.tls.flags.more_fragments() {
                 // The peer may only acknowledge while we are mid-message
-                // (RFC 7170 §3.7); data here is out of order. Fail closed.
+                // (RFC 9930 §3.3); data here is out of order. Fail closed.
                 warn!(
                     session_id,
                     "continue_eap_teap: peer sent data while server fragments were pending"
@@ -993,7 +1108,7 @@ impl EapAuthHandler {
         }
 
         // 2) Feed the TEAP state machine (reassembly happens inside).
-        match teap_server.process_client_message(&tls_packet) {
+        match teap_server.process_client_message(&teap_packet) {
             Ok(Some(response_data)) => {
                 teap_server.queue_outgoing_tls(response_data, self.max_fragment_size);
                 let Some(frag) = teap_server.next_outgoing_fragment() else {
@@ -1011,11 +1126,10 @@ impl EapAuthHandler {
             }
 
             Ok(None) => {
-                // RFC 7170 §3.7 (via RFC 5216 §2.1.5): a non-final peer
+                // RFC 9930 §3.3 (via RFC 5216 §2.1.5): a non-final peer
                 // fragment is answered with an empty EAP-TEAP Request (ACK).
-                if tls_packet.flags.more_fragments() {
-                    let ack =
-                        EapTlsPacket::new(TlsFlags::new(false, false, false), None, Vec::new());
+                if teap_packet.tls.flags.more_fragments() {
+                    let ack = TeapPacket::ack();
                     let id = next_id();
                     debug!(
                         session_id,
@@ -1035,7 +1149,7 @@ impl EapAuthHandler {
                     return AuthResult::Reject;
                 }
 
-                // RFC 7170 §5.4 MSK, present only when the inner method
+                // RFC 9930 §6.4 MSK, present only when the inner method
                 // succeeded, the Crypto-Binding verified and the peer
                 // acknowledged Result=Success. A "complete" TEAP conversation
                 // without key material did not authenticate the peer.
@@ -1240,19 +1354,9 @@ impl AuthHandler for EapAuthHandler {
             Some(EapType::Identity) => self.handle_identity(&username, &session_id),
             Some(EapType::Tls) => self.continue_eap_tls(&username, &session_id, &eap_packet),
             Some(EapType::Teap) => self.continue_eap_teap(&username, &session_id, &eap_packet),
-            // RFC 3748 §5.3.1: EAP-Nak (legacy=type 3 / expanded=254)
-            // means the peer rejected our proposed method and suggests
-            // alternatives in the data payload. TODO: honor the
-            // suggestion; for now reject with a logged reason so the
-            // failure is debuggable instead of silent.
-            Some(EapType::Nak) => {
-                warn!(
-                    username, session_id,
-                    proposed = ?eap_packet.data,
-                    "EAP-Nak received from peer; method negotiation not yet implemented"
-                );
-                AuthResult::Reject
-            }
+            // RFC 3748 §5.3.1: the peer rejected the proposed method and
+            // lists the Types it would accept.
+            Some(EapType::Nak) => self.handle_nak(&username, &session_id, &eap_packet),
             other => {
                 warn!(
                     username, session_id, eap_type = ?other,
@@ -1435,6 +1539,7 @@ mod eap_tls_mppe_tests {
                 require_client_cert: false,
                 revocation: None,
             },
+            teap_tls: None,
         };
         handler.configure_from_config(&cfg).unwrap();
         let configs = handler.tls_configs.read().unwrap();
@@ -1465,6 +1570,7 @@ mod eap_tls_mppe_tests {
                 require_client_cert: false,
                 revocation: Some(RevocationConfig::default()),
             },
+            teap_tls: None,
         };
         let err = handler.configure_from_config(&cfg).unwrap_err();
         assert!(err.contains("require_client_cert"), "{err}");
@@ -1635,6 +1741,147 @@ mod eap_tls_mppe_tests {
             p.add_attribute(a);
         }
         p
+    }
+
+    /// A server with EAP-TEAP and EAP-TLS enabled proposes TEAP first; an
+    /// EAP-TLS supplicant answers the TEAP/Start with an EAP-Nak listing
+    /// Type 13 (RFC 3748 §5.3.1) and must then get an EAP-TLS conversation
+    /// through to Access-Accept. A second Nak, a Nak for nothing we offer, or
+    /// a Nak once the method has started ends the conversation.
+    #[test]
+    fn eap_nak_switches_from_teap_to_tls_once() {
+        let pki = gen_pki();
+        let mut handler = eap_handler(&pki);
+        handler
+            .configure_teap(
+                "",
+                TlsCertificateConfig::simple(pki.cert_path.clone(), pki.key_path.clone()),
+            )
+            .unwrap();
+
+        let nak = |id: u8, types: &[u8]| {
+            EapPacket::new(EapCode::Response, id, Some(EapType::Nak), types.to_vec())
+        };
+        let challenge_of = |request: &Packet, result: AuthResult| -> Packet {
+            match result {
+                AuthResult::Challenge {
+                    state, attributes, ..
+                } => {
+                    let mut c = packet_with(Code::AccessChallenge, request.identifier, attributes);
+                    c.add_attribute(Attribute::new(AttributeType::State as u8, state).unwrap());
+                    c
+                }
+                other => panic!("expected Challenge, got {other:?}"),
+            }
+        };
+        let eap_of = |challenge: &Packet| eap_from_radius_packet(challenge).unwrap().unwrap();
+        let state_of = |challenge: &Packet| {
+            challenge
+                .find_attribute(AttributeType::State as u8)
+                .unwrap()
+                .value
+                .clone()
+        };
+
+        // Identity → TEAP/Start.
+        let request = identity_request();
+        let start = challenge_of(&request, handler.authenticate_request(&request, SECRET));
+        let start_eap = eap_of(&start);
+        assert_eq!(start_eap.eap_type, Some(EapType::Teap));
+
+        // Nak(13) → EAP-TLS/Start, and the TEAP state is gone.
+        let request = access_request(
+            2,
+            &nak(start_eap.identifier, &[13]),
+            Some(&state_of(&start)),
+        );
+        let tls_start = challenge_of(&request, handler.authenticate_request(&request, SECRET));
+        let tls_start_eap = eap_of(&tls_start);
+        assert_eq!(tls_start_eap.eap_type, Some(EapType::Tls));
+        assert!(
+            EapTlsPacket::from_eap_data(&tls_start_eap.data)
+                .unwrap()
+                .flags
+                .start()
+        );
+        assert!(handler.teap_sessions.read().unwrap().is_empty());
+        assert_eq!(handler.tls_sessions.read().unwrap().len(), 1);
+
+        // The EAP-TLS conversation then completes with the peer's MSK.
+        let mut peer = Supplicant::new(&pki);
+        let mut request = answer_challenge(&mut peer, &tls_start);
+        let msk = loop {
+            assert!(
+                request.identifier < 64,
+                "EAP-TLS did not converge after the Nak"
+            );
+            match handler.authenticate_request(&request, SECRET) {
+                AuthResult::Challenge {
+                    state, attributes, ..
+                } => {
+                    let mut c = packet_with(Code::AccessChallenge, request.identifier, attributes);
+                    c.add_attribute(Attribute::new(AttributeType::State as u8, state).unwrap());
+                    request = answer_challenge(&mut peer, &c);
+                }
+                AuthResult::Accept { msk, .. } => break msk.expect("MSK"),
+                AuthResult::Reject => panic!("EAP-TLS rejected after the Nak"),
+            }
+        };
+        assert_eq!(msk, peer.msk());
+
+        // A second Nak in the same conversation is rejected.
+        let request = identity_request();
+        let start = challenge_of(&request, handler.authenticate_request(&request, SECRET));
+        let request = access_request(
+            2,
+            &nak(eap_of(&start).identifier, &[13]),
+            Some(&state_of(&start)),
+        );
+        let tls_start = challenge_of(&request, handler.authenticate_request(&request, SECRET));
+        let request = access_request(
+            3,
+            &nak(eap_of(&tls_start).identifier, &[55]),
+            Some(&state_of(&tls_start)),
+        );
+        assert!(matches!(
+            handler.authenticate_request(&request, SECRET),
+            AuthResult::Reject
+        ));
+
+        // A Nak for methods we do not offer (none / MD5 / PEAP) is rejected.
+        for desired in [&[0u8][..], &[4u8], &[25u8, 21u8]] {
+            let request = identity_request();
+            let start = challenge_of(&request, handler.authenticate_request(&request, SECRET));
+            let request = access_request(
+                2,
+                &nak(eap_of(&start).identifier, desired),
+                Some(&state_of(&start)),
+            );
+            assert!(
+                matches!(
+                    handler.authenticate_request(&request, SECRET),
+                    AuthResult::Reject
+                ),
+                "Nak {desired:?} must be rejected"
+            );
+        }
+
+        // A Nak once the method has started (after the ClientHello) is rejected.
+        let mut peer = TeapPeer::new(&pki, 4096);
+        let request = identity_request();
+        let start = challenge_of(&request, handler.authenticate_request(&request, SECRET));
+        let hello = peer.respond(&eap_of(&start));
+        let request = access_request(2, &hello, Some(&state_of(&start)));
+        let flight = challenge_of(&request, handler.authenticate_request(&request, SECRET));
+        let request = access_request(
+            3,
+            &nak(eap_of(&flight).identifier, &[13]),
+            Some(&state_of(&flight)),
+        );
+        assert!(matches!(
+            handler.authenticate_request(&request, SECRET),
+            AuthResult::Reject
+        ));
     }
 
     #[test]
@@ -1927,12 +2174,13 @@ mod eap_tls_mppe_tests {
     }
 
     // =====================================================================
-    // EAP-TEAP (RFC 7170) through the handler: fragmentation in both phases
+    // EAP-TEAP (RFC 9930) through the handler: fragmentation in both phases
     // and directions, EAP-Success Identifier, fail-closed negative cases.
     // =====================================================================
 
     use radius_proto::eap::eap_teap::{
-        CryptoBinding, CryptoBindingTlv, IdentityType, TeapResult, TeapTlv, TlvType,
+        CryptoBinding, CryptoBindingTlv, IdentityType, TeapHash, TeapPacket, TeapResult, TeapTlv,
+        TlvType,
     };
     use radius_proto::eap::eap_tls::TlsFragmentAssembler;
 
@@ -1966,7 +2214,7 @@ mod eap_tls_mppe_tests {
     }
 
     /// In-memory TEAP peer: rustls client for Phase 1, Basic-Password-Auth
-    /// inner method and crypto-binding for Phase 2, with RFC 7170 §3.7
+    /// inner method and crypto-binding for Phase 2, with RFC 9930 §3.3
     /// fragmentation of its own messages and reassembly of the server's.
     struct TeapPeer {
         conn: ClientConnection,
@@ -1976,9 +2224,7 @@ mod eap_tls_mppe_tests {
         out_queue: std::collections::VecDeque<EapTlsPacket>,
         /// Reassembly of a fragmented server message.
         reassembly: Vec<u8>,
-        /// Encoded Phase 2 TLVs in conversation order (RFC 7170 §5.3 BUFFER prefix).
-        history: Vec<u8>,
-        /// Extra non-mandatory TLV bytes appended to the Identity-Type
+        /// Extra non-mandatory TLV bytes appended to the Basic-Password-Auth
         /// response, to make it span fragments.
         identity_padding: usize,
         /// Counts, for assertions.
@@ -2010,7 +2256,6 @@ mod eap_tls_mppe_tests {
                 fragment_size,
                 out_queue: Default::default(),
                 reassembly: Vec::new(),
-                history: Vec::new(),
                 identity_padding: 0,
                 acks_received: 0,
                 acks_sent: 0,
@@ -2031,7 +2276,7 @@ mod eap_tls_mppe_tests {
                 EapCode::Response,
                 identifier,
                 Some(EapType::Teap),
-                pkt.to_eap_data(),
+                TeapPacket::new(pkt.clone()).to_eap_data(),
             )
         }
 
@@ -2042,7 +2287,7 @@ mod eap_tls_mppe_tests {
             )
         }
 
-        /// Queue `data` as RFC 7170 §3.7 fragments and send the first.
+        /// Queue `data` as RFC 9930 §3.3 fragments and send the first.
         fn send_message(&mut self, identifier: u8, data: Vec<u8>) -> EapPacket {
             let frags = radius_proto::eap::eap_tls::fragment_tls_message(&data, self.fragment_size);
             self.out_queue = frags.into_iter().collect();
@@ -2050,7 +2295,8 @@ mod eap_tls_mppe_tests {
             Self::teap_response(identifier, &first)
         }
 
-        /// The peer's own TEAP MSK (RFC 7170 §5.4), computable after Phase 1.
+        /// The peer's own TEAP keys (RFC 9930 §6.2, zero IMSK of
+        /// Basic-Password-Auth), computable after Phase 1.
         fn crypto_binding(&self) -> CryptoBinding {
             // Output buffer for the exporter; its initial contents are
             // overwritten, so start from random bytes rather than a literal.
@@ -2062,84 +2308,113 @@ mod eap_tls_mppe_tests {
                     None,
                 )
                 .unwrap();
-            CryptoBinding::new(&seed, &[0u8; 32])
+            let hash = TeapHash::from_cipher_suite(self.conn.negotiated_cipher_suite().unwrap());
+            CryptoBinding::new(hash, &seed, &[0u8; 32])
         }
 
         fn msk(&self) -> Vec<u8> {
             self.crypto_binding().derive_msk()
         }
 
-        /// Answer one server TLV message with the peer's TLVs.
+        /// Answer one server TLV message with the peer's TLVs (RFC 9930
+        /// Appendix C.1, TLVs in wpa_supplicant's order).
         fn answer_tlvs(&mut self, tlvs: &[TeapTlv]) -> Vec<TeapTlv> {
-            let mut out = Vec::new();
-            for tlv in tlvs {
-                // Every server TLV, including its Crypto-Binding request
-                // (with MAC), is part of the BUFFER; the peer's own
-                // Crypto-Binding response is not.
-                self.history.extend_from_slice(&tlv.to_bytes());
-                match tlv.get_type() {
-                    Some(TlvType::IdentityType) => {
-                        out.push(IdentityType::User.to_tlv());
-                        if self.identity_padding > 0 {
-                            out.push(TeapTlv::new_raw(
-                                PADDING_TLV_TYPE,
-                                false,
-                                vec![0xAB; self.identity_padding],
-                            ));
-                        }
-                    }
-                    Some(TlvType::BasicPasswordAuthReq) => {
-                        let mut value = Vec::new();
-                        value.extend_from_slice(&(TEAP_USER.len() as u16).to_be_bytes());
-                        value.extend_from_slice(TEAP_USER.as_bytes());
-                        let password = teap_password();
-                        value.extend_from_slice(&(password.len() as u16).to_be_bytes());
-                        value.extend_from_slice(password.as_bytes());
-                        out.push(TeapTlv::new(TlvType::BasicPasswordAuthResp, true, value));
-                    }
-                    Some(TlvType::CryptoBinding) => {
-                        let request = CryptoBindingTlv::from_tlv(tlv).unwrap();
-                        assert_eq!(request.sub_type, CryptoBindingTlv::SUBTYPE_REQUEST);
-                        let template = CryptoBindingTlv {
-                            version: CryptoBindingTlv::VERSION,
-                            received_version: request.version,
-                            sub_type: CryptoBindingTlv::SUBTYPE_RESPONSE,
-                            nonce: [0x42u8; 32],
-                            compound_mac: vec![0u8; 32],
-                        };
-                        let mut buffer = self.history.clone();
-                        buffer.extend_from_slice(&template.to_tlv().to_bytes());
-                        let cmk = self.crypto_binding().cmk;
-                        let compound_mac = CryptoBinding::calculate_compound_mac(&cmk, &buffer);
-                        let response = CryptoBindingTlv {
-                            compound_mac,
-                            ..template
-                        }
-                        .to_tlv();
-                        // Not part of the history: the server verifies the
-                        // response against the history *without* it.
-                        return vec![response];
-                    }
-                    Some(TlvType::Result) => {
-                        let result = TeapResult::from_result_tlv(tlv).unwrap();
-                        assert_eq!(result, TeapResult::Success, "server Result TLV");
-                        self.peer_result_sent = true;
-                        out.push(TeapResult::Success.to_result_tlv());
-                    }
-                    other => panic!("unexpected server TLV {other:?}"),
+            let find = |t: TlvType| tlvs.iter().find(|tlv| tlv.get_type() == Some(t));
+            let types: Vec<_> = tlvs.iter().map(TeapTlv::get_type).collect();
+
+            if find(TlvType::BasicPasswordAuthReq).is_some() {
+                // Opening message: Basic-Password-Auth-Req + Identity-Type.
+                assert!(
+                    find(TlvType::IdentityType).is_some(),
+                    "Identity-Type accompanies the request: {types:?}"
+                );
+                // RFC 9930 §4.2.15: one-octet Userlen / Passlen.
+                let mut value = vec![TEAP_USER.len() as u8];
+                value.extend_from_slice(TEAP_USER.as_bytes());
+                let password = teap_password();
+                value.push(password.len() as u8);
+                value.extend_from_slice(password.as_bytes());
+                let mut out = vec![
+                    TeapTlv::new(TlvType::BasicPasswordAuthResp, true, value),
+                    IdentityType::User.to_tlv(),
+                ];
+                if self.identity_padding > 0 {
+                    out.push(TeapTlv::new_raw(
+                        PADDING_TLV_TYPE,
+                        false,
+                        vec![0xAB; self.identity_padding],
+                    ));
                 }
+                return out;
             }
-            for tlv in &out {
-                self.history.extend_from_slice(&tlv.to_bytes());
+
+            if let Some(cb_tlv) = find(TlvType::CryptoBinding) {
+                // Binding message: Intermediate-Result, Result, Crypto-Binding.
+                let iresult = find(TlvType::IntermediateResult)
+                    .expect("Intermediate-Result accompanies the Crypto-Binding");
+                assert_eq!(
+                    TeapResult::from_intermediate_result_tlv(iresult).unwrap(),
+                    TeapResult::Success
+                );
+                let result = find(TlvType::Result).expect("Result accompanies the Crypto-Binding");
+                assert_eq!(
+                    TeapResult::from_result_tlv(result).unwrap(),
+                    TeapResult::Success
+                );
+
+                let request = CryptoBindingTlv::from_tlv(cb_tlv).unwrap();
+                assert_eq!(request.sub_type, CryptoBindingTlv::SUBTYPE_REQUEST);
+                assert_eq!(request.version, 1);
+                assert_eq!(request.received_version, 1, "the version we negotiated");
+                assert_eq!(request.flags, CryptoBindingTlv::FLAGS_MSK);
+                assert_eq!(request.nonce[31] & 1, 0, "request nonce LSB is 0");
+                assert_eq!(request.emsk_compound_mac, [0u8; 20]);
+
+                // Verify the server's MSK Compound-MAC with our own CMK, then
+                // answer with ours over the response nonce.
+                let keys = self.crypto_binding();
+                assert!(
+                    CryptoBinding::verify_compound_mac(
+                        keys.hash,
+                        &keys.cmk,
+                        &request.mac_buffer(&[], &[]),
+                        &request.msk_compound_mac
+                    ),
+                    "server Compound-MAC verifies with the peer's CMK"
+                );
+                let mut response = CryptoBindingTlv::new(
+                    CryptoBindingTlv::SUBTYPE_RESPONSE,
+                    CryptoBindingTlv::FLAGS_MSK,
+                    request.version,
+                    CryptoBinding::response_nonce(&request.nonce),
+                );
+                response.msk_compound_mac = CryptoBinding::compound_mac(
+                    keys.hash,
+                    &keys.cmk,
+                    &response.mac_buffer(&[], &[]),
+                );
+                self.peer_result_sent = true;
+                return vec![
+                    TeapResult::Success.to_intermediate_result_tlv(),
+                    response.to_tlv(),
+                    TeapResult::Success.to_result_tlv(),
+                ];
             }
-            out
+
+            panic!("unexpected server TLVs {types:?}");
         }
 
         /// Answer one EAP-Request/TEAP with the peer's EAP-Response/TEAP.
         fn respond(&mut self, request: &EapPacket) -> EapPacket {
             assert_eq!(request.code, EapCode::Request);
             assert_eq!(request.eap_type, Some(EapType::Teap), "unexpected EAP type");
-            let pkt = EapTlsPacket::from_eap_data(&request.data).unwrap();
+            let teap = TeapPacket::from_eap_data(&request.data).unwrap();
+            assert_eq!(
+                teap.version, 1,
+                "server packets carry TEAP version 1 (RFC 9930 §3.1)"
+            );
+            assert!(teap.outer_tlvs.is_empty());
+            let pkt = teap.tls;
 
             if pkt.flags.start() {
                 let client_hello = self.pending_tls();
@@ -2257,7 +2532,7 @@ mod eap_tls_mppe_tests {
             AuthResult::Accept { attributes, msk } => (attributes, msk),
             other => panic!("expected Accept, got {other:?}"),
         };
-        assert_eq!(msk.expect("MSK"), peer.msk(), "RFC 7170 §5.4 MSK agrees");
+        assert_eq!(msk.expect("MSK"), peer.msk(), "RFC 9930 §6.4 MSK agrees");
         // RFC 3748 §4.2: EAP-Success echoes the peer's last Response.
         assert_eq!(eap_success_identifier(&attributes), last_id);
         assert!(peer.peer_result_sent, "peer acknowledged the Result TLV");
@@ -2310,12 +2585,9 @@ mod eap_tls_mppe_tests {
         let start = packet_with(Code::AccessChallenge, 1, attributes);
         let start_eap = eap_from_radius_packet(&start).unwrap().unwrap();
         assert_eq!(start_eap.eap_type, Some(EapType::Teap));
-        assert!(
-            EapTlsPacket::from_eap_data(&start_eap.data)
-                .unwrap()
-                .flags
-                .start()
-        );
+        let start_pkt = TeapPacket::from_eap_data(&start_eap.data).unwrap();
+        assert!(start_pkt.tls.flags.start());
+        assert_eq!(start_pkt.version, 1, "TEAP/Start carries version 1");
         (state, start_eap)
     }
 

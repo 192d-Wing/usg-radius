@@ -1,5 +1,5 @@
 {
-  "_comment": "usg-radius as an EAP-TLS home server, reached directly by the NAS and (for the usg.test realm) through the usg-radius proxy: validates its own MS-MPPE key emission, the TLS 1.3 exporter labels, and CRL revocation checking of supplicant certificates (certs/ca.crl revokes client-usg-revoked) against eapol_test.",
+  "_comment": "usg-radius as an EAP home server, reached directly by the NAS and (for the usg.test realm) through the usg-radius proxy. EAP-TLS: validates its own MS-MPPE key emission, the TLS 1.3 exporter labels, and CRL revocation checking of supplicant certificates (certs/ca.crl revokes client-usg-revoked) against eapol_test. EAP-TEAP (RFC 9930): the same server certificate through eap.teap_tls without a client certificate; the peer authenticates with Basic-Password-Auth inside the tunnel (user teapuser@usg.test), which proves the Crypto-Binding TLV, the IMCK/CMK/MSK key schedule and the MS-MPPE keys against eapol_test.",
   "listen_address": "0.0.0.0",
   "listen_port": 1812,
   "transport": "udp-insecure",
@@ -8,13 +8,15 @@
     { "name": "nas (eapol_test)", "address": "10.77.0.40/32", "secret": "nas-usghome-secret-3" },
     { "name": "usg-proxy", "address": "10.77.0.20/32", "secret": "proxy-usghome-secret-4" }
   ],
-  "users": [],
+  "users": [
+    { "username": "teapuser@usg.test", "password": "teap-password-456" }
+  ],
   "verbose": true,
   "log_level": "debug",
   "strict_rfc_compliance": true,
   "eap": {
     "enable_tls": true,
-    "enable_teap": false,
+    "enable_teap": true,
     "tls": {
       "cert_path": "/certs/usg-home-server.crt",
       "key_path": "/certs/usg-home-server.key",
@@ -28,6 +30,11 @@
           "fetch": false
         }
       }
+    },
+    "teap_tls": {
+      "cert_path": "/certs/usg-home-server.crt",
+      "key_path": "/certs/usg-home-server.key",
+      "require_client_cert": false
     }
   }
 }

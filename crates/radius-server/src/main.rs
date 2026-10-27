@@ -407,7 +407,16 @@ async fn main() {
                     process::exit(1);
                 }
                 if eap_cfg.enable_teap {
-                    info!("EAP-TEAP enabled (cert: {})", eap_cfg.tls.cert_path);
+                    let teap_tls = eap_cfg.teap_tls.as_ref().unwrap_or(&eap_cfg.tls);
+                    info!(
+                        "EAP-TEAP enabled (cert: {}, client certificate {})",
+                        teap_tls.cert_path,
+                        if teap_tls.require_client_cert {
+                            "required"
+                        } else {
+                            "not required"
+                        }
+                    );
                 }
                 if eap_cfg.enable_tls {
                     info!("EAP-TLS enabled (cert: {})", eap_cfg.tls.cert_path);

@@ -1,6 +1,9 @@
-# NAS + supplicant for the interop test: eapol_test from wpa_supplicant 2.11
+# NAS + supplicant for the interop test: eapol_test from wpa_supplicant 2.12
 # (w1.fi), plus radclient from freeradius-utils for the PAP checks and the
-# Status-Server readiness probes. Debian bookworm's OpenSSL 3.0 does not add a
+# Status-Server readiness probes. 2.12 is the first release whose EAP-TEAP
+# follows RFC 9930 (its ChangeLog: "protocol changes based on RFC 9930"); 2.11
+# derived the Basic-Password-Auth MSK from S-IMCK[0] instead of S-IMCK[1] and
+# would report an MS-MPPE key mismatch against an RFC 9930 server. Debian bookworm's OpenSSL 3.0 does not add a
 # hybrid ML-KEM key share, so the TLS 1.3 ClientHello fits in one EAP fragment.
 FROM debian:bookworm-slim AS build
 ENV DEBIAN_FRONTEND=noninteractive
@@ -9,8 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-ARG WPA_VERSION=2.11
-ARG WPA_SHA256=912ea06f74e30a8e36fbb68064d6cdff218d8d591db0fc5d75dee6c81ac7fc0a
+ARG WPA_VERSION=2.12
+ARG WPA_SHA256=08e23937e16d0155e55cab2b51f51fbe10d80a1aa91c4e15442645059b737ef6
 RUN curl -fsSL -o wpa.tar.gz "https://w1.fi/releases/wpa_supplicant-${WPA_VERSION}.tar.gz" \
     && echo "${WPA_SHA256}  wpa.tar.gz" | sha256sum -c - \
     && tar xzf wpa.tar.gz --strip-components=1 && rm wpa.tar.gz

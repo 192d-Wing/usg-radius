@@ -302,12 +302,20 @@ pub struct MgmtTlsConfig {
 /// EAP configuration block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EapConfig {
-    /// TLS certificate configuration shared by EAP-TLS and EAP-TEAP.
+    /// TLS certificate configuration for EAP-TLS, and for the EAP-TEAP
+    /// tunnel unless `teap_tls` is set.
     pub tls: EapTlsConfig,
+    /// TLS configuration of the EAP-TEAP Phase 1 tunnel (RFC 9930 §3.2) when
+    /// it differs from `tls`: typically the same certificate without
+    /// `require_client_cert`, so that TEAP peers authenticate with the inner
+    /// Basic-Password-Auth method instead of a client certificate. Omitted ⇒
+    /// TEAP uses `tls`.
+    #[serde(default)]
+    pub teap_tls: Option<EapTlsConfig>,
     /// Enable EAP-TLS (Type 13). Default: false.
     #[serde(default)]
     pub enable_tls: bool,
-    /// Enable EAP-TEAP (Type 55, RFC 7170). Default: true.
+    /// Enable EAP-TEAP (Type 55, RFC 9930). Default: true.
     #[serde(default = "default_true")]
     pub enable_teap: bool,
     /// Seconds an EAP conversation may sit without a packet from the peer
@@ -757,17 +765,21 @@ impl Config {
         }
 
         // Revocation checking is only meaningful for verified client certificates.
-        if let Some(eap) = &self.eap
-            && let Some(rev) = &eap.tls.revocation
-        {
-            if !eap.tls.require_client_cert || eap.tls.ca_path.is_none() {
-                return Err(ConfigError::Invalid(
-                    "eap.tls.revocation requires eap.tls.require_client_cert = true and \
-                     eap.tls.ca_path (there is no client certificate to check otherwise)"
-                        .to_string(),
-                ));
+        if let Some(eap) = &self.eap {
+            let blocks = [("eap.tls", &eap.tls)]
+                .into_iter()
+                .chain(eap.teap_tls.as_ref().map(|t| ("eap.teap_tls", t)));
+            for (at, tls) in blocks {
+                if let Some(rev) = &tls.revocation {
+                    if !tls.require_client_cert || tls.ca_path.is_none() {
+                        return Err(ConfigError::Invalid(format!(
+                            "{at}.revocation requires {at}.require_client_cert = true and \
+                             {at}.ca_path (there is no client certificate to check otherwise)"
+                        )));
+                    }
+                    rev.validate(&format!("{at}.revocation"))?;
+                }
             }
-            rev.validate("eap.tls.revocation")?;
         }
         if let Some(radsec) = &self.radsec
             && let Some(rev) = &radsec.revocation

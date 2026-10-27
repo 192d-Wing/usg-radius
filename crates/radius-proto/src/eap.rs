@@ -78,7 +78,7 @@ pub enum EapType {
     Peap = 25,
     /// EAP-MSCHAPv2 (Type 26) - draft-kamath-pppext-eap-mschapv2
     MsChapV2 = 26,
-    /// EAP-TEAP (Type 55) - RFC 7170
+    /// EAP-TEAP (Type 55) - RFC 9930 (formerly RFC 7170)
     Teap = 55,
 }
 
@@ -1572,6 +1572,14 @@ pub mod eap_tls {
                 .unwrap_or(false)
         }
 
+        /// The cipher suite negotiated in the handshake, once known. EAP-TEAP
+        /// derives its PRF and Compound-MAC hash from it (RFC 9930 §6.2, §6.3).
+        pub fn negotiated_cipher_suite(&self) -> Option<rustls::SupportedCipherSuite> {
+            self.connection
+                .as_ref()
+                .and_then(|c| c.negotiated_cipher_suite())
+        }
+
         /// True once the TLS handshake has negotiated TLS 1.3. EAP-TLS over
         /// TLS 1.3 (RFC 9190) needs the commitment-message exchange; EAP-TLS
         /// over TLS 1.2 (RFC 5216) does not.
@@ -1782,7 +1790,7 @@ pub mod eap_tls {
         ///
         /// Generic wrapper around rustls' `export_keying_material` for callers
         /// that need a labeled exporter other than the EAP-TLS MSK/EMSK derivation
-        /// (e.g. EAP-TEAP's `session_key_seed`, RFC 7170 Section 5.2).
+        /// (e.g. EAP-TEAP's `session_key_seed`, RFC 9930 §6.1).
         ///
         /// # Arguments
         /// * `label` - Exporter label, per the consuming RFC
@@ -1802,7 +1810,9 @@ pub mod eap_tls {
                 return Err(EapError::InvalidState);
             }
             let conn = self.connection.as_ref().ok_or(EapError::InvalidState)?;
-            let mut output = vec![0u8; length];
+            // Output buffer; the exporter overwrites every octet, so it starts
+            // from random bytes rather than a literal.
+            let mut output: Vec<u8> = (0..length).map(|_| rand::random::<u8>()).collect();
             conn.export_keying_material(output.as_mut_slice(), label, context)
                 .map_err(|e| {
                     EapError::TlsError(format!("export_keying_material failed: {:?}", e))
@@ -4423,7 +4433,7 @@ mod tests {
 
 /// EAP-TEAP (Tunneled Extensible Authentication Protocol)
 ///
-/// RFC 7170 - Tunnel Extensible Authentication Protocol (TEAP) Version 1
+/// RFC 9930 (formerly RFC 7170) - Tunnel Extensible Authentication Protocol (TEAP) Version 1
 ///
 /// TEAP is a modern tunneled authentication protocol that supersedes legacy
 /// methods like EAP-TTLS, PEAP, and EAP-MSCHAPv2. It provides:
