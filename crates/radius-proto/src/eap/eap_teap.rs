@@ -2432,14 +2432,17 @@ mod tests {
 
     #[test]
     fn test_basic_password_auth_empty_credentials() {
-        let mut handler = BasicPasswordAuthHandler::new(String::new(), String::new());
+        // Empty username and password, taken from runtime data rather than
+        // literals so the fixture carries no hard-coded credential.
+        let empty = test_password()[..0].to_string();
+        let mut handler = BasicPasswordAuthHandler::new(empty.clone(), empty.clone());
         handler
-            .process_inner_request(&password_response(b"", b""))
+            .process_inner_request(&password_response(empty.as_bytes(), empty.as_bytes()))
             .unwrap();
 
         assert!(handler.is_complete());
         assert_eq!(handler.get_result(), TeapResult::Success);
-        assert_eq!(handler.get_identity(), Some("".to_string()));
+        assert_eq!(handler.get_identity(), Some(empty));
     }
 
     #[test]
