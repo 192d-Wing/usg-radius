@@ -310,6 +310,26 @@ pub struct EapConfig {
     /// Enable EAP-TEAP (Type 55, RFC 7170). Default: true.
     #[serde(default = "default_true")]
     pub enable_teap: bool,
+    /// Seconds an EAP conversation may sit without a packet from the peer
+    /// before its state (EAP session plus TLS/TEAP context) is evicted.
+    /// Default 120. An evicted conversation fails closed: the next packet
+    /// carrying its State is rejected.
+    #[serde(default = "default_eap_session_idle_timeout_secs")]
+    pub session_idle_timeout_secs: u64,
+    /// Maximum number of live EAP conversations. When reached, the least
+    /// recently used one is evicted to make room. Default 4096, which bounds
+    /// the EAP state to a few hundred MiB in the worst case under the default
+    /// rate limits.
+    #[serde(default = "default_eap_max_sessions")]
+    pub max_sessions: usize,
+}
+
+fn default_eap_session_idle_timeout_secs() -> u64 {
+    radius_proto::eap::EapSessionManager::DEFAULT_IDLE_TIMEOUT_SECS
+}
+
+fn default_eap_max_sessions() -> usize {
+    radius_proto::eap::EapSessionManager::DEFAULT_MAX_SESSIONS
 }
 
 /// TLS certificate paths for EAP-TLS / EAP-TEAP.
@@ -722,6 +742,20 @@ impl Config {
             }
         }
 
+        // EAP session bounds: zero would evict every conversation at once.
+        if let Some(eap) = &self.eap {
+            if eap.session_idle_timeout_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "eap.session_idle_timeout_secs must be at least 1".to_string(),
+                ));
+            }
+            if eap.max_sessions == 0 {
+                return Err(ConfigError::Invalid(
+                    "eap.max_sessions must be at least 1".to_string(),
+                ));
+            }
+        }
+
         // Revocation checking is only meaningful for verified client certificates.
         if let Some(eap) = &self.eap
             && let Some(rev) = &eap.tls.revocation
@@ -909,6 +943,39 @@ mod tests {
             serde_json::from_str(r#"{"cert_path": "c", "key_path": "k", "client_ca_path": "ca"}"#)
                 .unwrap();
         assert!(radsec.revocation.is_none());
+    }
+
+    #[test]
+    fn eap_session_limits_default_and_reject_zero() {
+        let config: Config = serde_json::from_str(&eap_config_json(None, true)).unwrap();
+        let eap = config.eap.as_ref().unwrap();
+        assert_eq!(
+            eap.session_idle_timeout_secs,
+            radius_proto::eap::EapSessionManager::DEFAULT_IDLE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            eap.max_sessions,
+            radius_proto::eap::EapSessionManager::DEFAULT_MAX_SESSIONS
+        );
+
+        let mut zero_timeout = config.clone();
+        zero_timeout.eap.as_mut().unwrap().session_idle_timeout_secs = 0;
+        let err = zero_timeout.validate().unwrap_err().to_string();
+        assert!(err.contains("session_idle_timeout_secs"), "{err}");
+
+        let mut zero_sessions = config.clone();
+        zero_sessions.eap.as_mut().unwrap().max_sessions = 0;
+        let err = zero_sessions.validate().unwrap_err().to_string();
+        assert!(err.contains("max_sessions"), "{err}");
+
+        let explicit: Config = serde_json::from_str(
+            r#"{"secret": "s3cret", "eap": {"enable_tls": true, "session_idle_timeout_secs": 30,
+                "max_sessions": 10, "tls": {"cert_path": "c", "key_path": "k"}}}"#,
+        )
+        .unwrap();
+        let eap = explicit.eap.unwrap();
+        assert_eq!(eap.session_idle_timeout_secs, 30);
+        assert_eq!(eap.max_sessions, 10);
     }
 
     #[test]

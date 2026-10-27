@@ -318,7 +318,12 @@ correct stripping of server-added Proxy-State on the response leg.
 - ✅ Session context tracking
 - ✅ Multi-round authentication flow
 - ✅ Session identifiers and buffering
-- ✅ Automatic session cleanup
+- ✅ Bounded session store: conversations are released on Access-Accept /
+  Access-Reject, evicted after `eap.session_idle_timeout_secs` (default 120)
+  of silence, and capped at `eap.max_sessions` (default 4096, least recently
+  used evicted first). An evicted conversation fails closed (its State is
+  rejected without allocating anything); evictions are logged and counted in
+  `radius_eap_sessions_evicted_total{reason}`
 
 **RADIUS Integration (100%)**:
 
@@ -480,6 +485,40 @@ See EAP-TLS section under RFC 2869 for complete details.
 - ✅ Section 3.1 / 3.2: Request and Response packet format — Flags (L/M/S),
   TLS Message Length only with L, TLS Data; S accepted only on our own Start
 - ⚠️ Section 2.1.2: Session resumption not implemented (full handshake only)
+
+---
+
+## RFC 7170 - Tunnel EAP (TEAP)
+
+### ⚠️ Partial Implementation (v0.7.x; fragmentation and completion unreleased)
+
+**Status**: ⚠️ Phase 1 and Phase 2 state machines complete and tested against
+an in-memory rustls peer; wire format not yet interoperable with
+wpa_supplicant / eapol_test (see below), so TEAP has no interop scenario.
+
+- ✅ §3.1 Fragmentation, both phases and directions: outbound TLS messages
+  (handshake flights and encrypted TLV messages) are fragmented to the EAP
+  MTU and sent one per peer ACK; inbound non-final fragments are ACKed and
+  reassembled through the same bounded, fail-closed assembler as EAP-TLS; a
+  peer that sends data while server fragments are pending is rejected
+- ✅ §3.3 Phase 2 opens in the TLS message that ends the handshake flight
+  (Identity-Type TLV)
+- ✅ §3.3.3 Result exchange: the server's Result TLV is acknowledged by the
+  peer's Result TLV before EAP-Success/Failure; a Result TLV from the peer
+  before the server's is rejected; the MSK is released only when both
+  Results were Success
+- ✅ RFC 3748 §4.2: EAP-Success echoes the Identifier of the peer's last
+  EAP-Response
+- ✅ §5.2 / §5.4 IMCK, CMK and MSK derivation (RFC 5705 `session_key_seed`)
+- ⚠️ §4.2.13 Crypto-Binding TLV: encoded as a 68-octet TLV with one
+  32-octet HMAC-SHA256 compound MAC over the Phase 2 TLV history; the RFC
+  format is 76 octets with separate 20-octet EMSK and MSK Compound MACs over
+  the BUFFER of §5.3 (TLV ‖ EAP Type ‖ Outer TLVs). wpa_supplicant rejects
+  the 68-octet TLV, so the conversation cannot complete against it
+- ⚠️ §4.1 Version bits are not set on server packets (the peer expects
+  version 1) and the Start carries no Authority-ID TLV; §3.3.2
+  Intermediate-Result TLV is not sent after the inner method
+- ⚠️ Inner methods: Basic-Password-Auth and EAP-MD5 only (zero IMSK)
 
 ---
 
@@ -891,12 +930,17 @@ Total:         156+ tests
 ### Priority 3 (MEDIUM) - ⚠️ PARTIAL
 
 1. ✅ **EAP-TLS** (v0.5.0) - Complete
-2. ⚠️ **EAP-TEAP** (v0.7.x) - Phase 1 (TLS tunnel) and Phase 2 TLV protocol
-   complete, including history-aware Crypto-Binding compound MAC
-   (RFC 7170 §5.3) and RFC 5705 `session_key_seed` derivation. Inner
-   methods producing real keying material (e.g. EAP-MSCHAPv2) are still
-   pending; current inner methods (Basic-Password-Auth, EAP-MD5) use the
-   zero-IMSK fallback per RFC 7170 §5.2.
+2. ⚠️ **EAP-TEAP** (v0.7.x, fragmentation unreleased) - Phase 1 (TLS tunnel)
+   and Phase 2 TLV protocol complete through the RADIUS handler, with RFC
+   7170 §3.1 fragmentation in both phases and directions, the §3.3.3 Result
+   acknowledgement, history-aware Crypto-Binding compound MAC and RFC 5705
+   `session_key_seed` derivation. Not yet interoperable with wpa_supplicant:
+   the Crypto-Binding TLV is not in the §4.2.13 format (68 octets / one
+   HMAC-SHA256 instead of 76 octets / two 20-octet MACs), version bits and
+   Intermediate-Result TLV are missing. Inner methods producing real keying
+   material (e.g. EAP-MSCHAPv2) are still pending; current inner methods
+   (Basic-Password-Auth, EAP-MD5) use the zero-IMSK fallback per RFC 7170
+   §5.2.
 3. ⚠️ **Proxy-State** - Echoed in responses; ordering regression tests
    pending
 4. ❌ **Hot Configuration Reload** - Deferred (only the mgmt access policy reloads on SIGHUP)
@@ -947,7 +991,7 @@ Total:         156+ tests
 | Accounting Port 1813 | 2866 | ⚠️ Not bound | - | MEDIUM | Single UDP socket on listen_port |
 | Proxy-State | 2865 | ⚠️ Echoed | v0.x | MEDIUM | Ordering tests pending |
 | Hot Reload | - | ❌ Deferred | - | MEDIUM | Only mgmt access policy reloads on SIGHUP |
-| EAP-TEAP | 7170 | ⚠️ Phase 1+2 | v0.7.x | MEDIUM | Crypto-binding RFC-correct; MSK (§5.4) emitted as MS-MPPE keys; inner methods with real IMSK pending |
+| EAP-TEAP | 7170 | ⚠️ Phase 1+2 | v0.7.x | MEDIUM | §3.1 fragmentation both ways, §3.3.3 Result ack, MSK (§5.4) as MS-MPPE keys; Crypto-Binding TLV not in §4.2.13 format (no wpa_supplicant interop yet); inner methods with real IMSK pending |
 
 ---
 
@@ -1089,6 +1133,12 @@ The current implementation is **PRODUCTION-READY** for:
    - ⚠️ CRL/OCSP signatures not verified; static CRL files read once at startup
    - ⚠️ No certificate hot-rotation for RadSec or EAP-TLS
 
+4. **EAP Resource Exhaustion**
+   - ✅ Inbound EAP-TLS / EAP-TEAP fragment reassembly bounded at 64 KiB per conversation, L required on the first fragment, overrun and empty non-final fragments rejected, fail closed
+   - ✅ EAP session store bounded: idle timeout (default 120 s) and LRU cap (default 4096) on conversations and their TLS state, released on Accept/Reject; evicted conversations fail closed; `radius_eap_sessions_evicted_total` counter
+   - ⚠️ Capacity eviction is LRU, so a peer within the rate limits can still displace in-progress conversations once the cap is reached; size `eap.max_sessions` and the rate limits together
+   - ⚠️ EAP-TEAP wire format not yet interoperable with wpa_supplicant (Crypto-Binding TLV, version bits); do not enable TEAP for production supplicants
+
 ---
 
 ## Conclusion
@@ -1145,6 +1195,7 @@ The USG RADIUS server is **production-ready** for modern enterprise deployments 
 - **v0.10.1**: Container image built with the `tls` feature
 - **v0.11.0**: **MS-MPPE-Send/Recv-Key (RFC 2548)** on EAP Access-Accepts, RFC 9190 TLS 1.3 exporter labels + EAP-Key-Name, EAP-TEAP IMCK/CMK (RFC 7170 §5.2) and MSK (§5.4), Vendor-Specific and Tunnel-Password codecs, proxy re-keying of User-Password / Message-Authenticator (request leg) and MS-MPPE / Tunnel-Password / Message-Authenticator (response leg), signed proxy timeout rejects
 - **v0.12.0**: **Certificate revocation checking (RFC 5280 / RFC 6960)** wired into EAP-TLS and RadSec via the `revocation` block, fail-closed by default; EAP-Failure on every EAP Access-Reject (RFC 3579 §2.6.3); interop harness (revoked supplicant, 24 assertions) running in CI
+- **Unreleased**: EAP-TEAP fragmentation in both phases and directions (RFC 7170 §3.1) through the bounded reassembler, Phase 2 opened with the handshake flight (§3.3), Result TLV acknowledgement (§3.3.3), EAP-Success Identifier echoing the peer's last Response (RFC 3748 §4.2); bounded EAP session store (idle timeout + LRU cap, released on Accept/Reject, fail closed, `radius_eap_sessions_evicted_total`)
 
 ---
 

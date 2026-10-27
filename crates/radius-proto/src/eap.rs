@@ -1951,6 +1951,10 @@ pub struct EapSession {
     pub last_activity: u64,
     /// Number of authentication attempts
     pub attempt_count: u32,
+    /// Position in the owning [`EapSessionManager`]'s least-recently-used
+    /// order (larger = touched more recently). Maintained by the manager.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub lru_seq: u64,
 }
 
 impl EapSession {
@@ -1972,6 +1976,7 @@ impl EapSession {
             created_at: now,
             last_activity: now,
             attempt_count: 0,
+            lru_seq: 0,
         }
     }
 
@@ -2004,12 +2009,14 @@ impl EapSession {
 
     /// Check if session has timed out
     pub fn is_timed_out(&self, timeout_seconds: u64) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        self.is_timed_out_at(unix_now_secs(), timeout_seconds)
+    }
 
-        now - self.last_activity > timeout_seconds
+    /// Whether the session has been idle for more than `timeout_seconds` as
+    /// of `now_secs` (Unix epoch seconds). A `last_activity` in the future
+    /// counts as idle for zero seconds.
+    pub fn is_timed_out_at(&self, now_secs: u64, timeout_seconds: u64) -> bool {
+        now_secs.saturating_sub(self.last_activity) > timeout_seconds
     }
 
     /// Get session age in seconds
@@ -2034,57 +2041,150 @@ impl EapSession {
     }
 }
 
-/// EAP session manager for tracking multiple concurrent sessions
+/// Current Unix time in whole seconds.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Why [`EapSessionManager`] evicted a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionReason {
+    /// Idle for longer than the manager's timeout.
+    Idle,
+    /// The manager was at its maximum session count and this was the
+    /// least recently used session.
+    Capacity,
+}
+
+/// EAP session manager for tracking multiple concurrent sessions.
+///
+/// Sessions are kept in least-recently-used order: every lookup through
+/// [`get_session_mut`](Self::get_session_mut) moves the session to the most
+/// recent end. [`evict`](Self::evict) drops sessions idle for longer than the
+/// timeout and, when the store is at [`max_sessions`](Self::max_sessions),
+/// the least recently used ones, so the number of live sessions (and the
+/// per-session TLS state the caller keeps alongside them) is bounded even
+/// when an unauthenticated peer starts conversations and never finishes
+/// them.
 #[derive(Debug)]
 pub struct EapSessionManager {
     /// Active sessions indexed by session ID
     sessions: std::collections::HashMap<String, EapSession>,
+    /// Least-recently-used order: `lru_seq` → session ID, oldest first.
+    lru: std::collections::BTreeMap<u64, String>,
+    /// Next `lru_seq` to hand out.
+    next_seq: u64,
     /// Default session timeout in seconds
     default_timeout: u64,
     /// Maximum authentication attempts per session
     #[allow(dead_code)]
     max_attempts: u32,
+    /// Upper bound on live sessions enforced by [`Self::evict`].
+    max_sessions: usize,
 }
 
 impl EapSessionManager {
+    /// Default idle timeout, seconds. An EAP conversation that has not
+    /// advanced in two minutes has been abandoned by every NAS retransmission
+    /// schedule in use (RFC 3748 §4.3 suggests a few retries a few seconds
+    /// apart).
+    pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
+
+    /// Default maximum number of live sessions. Chosen against the server's
+    /// default rate limits (100 req/s per client, 1000 req/s global) and the
+    /// per-session memory of an EAP-TLS conversation (a rustls connection
+    /// plus at most 64 KiB of inbound fragment reassembly): 4096 sessions
+    /// bound the store to a few hundred MiB in the worst case while leaving
+    /// more than an order of magnitude of headroom over the number of
+    /// handshakes the global rate limit lets through in a few seconds.
+    pub const DEFAULT_MAX_SESSIONS: usize = 4096;
+
     /// Create a new session manager
     pub fn new() -> Self {
-        Self {
-            sessions: std::collections::HashMap::new(),
-            default_timeout: 300, // 5 minutes default
-            max_attempts: 3,
-        }
+        Self::with_config(300, 3)
     }
 
     /// Create a new session manager with custom settings
     pub fn with_config(timeout_seconds: u64, max_attempts: u32) -> Self {
         Self {
             sessions: std::collections::HashMap::new(),
+            lru: std::collections::BTreeMap::new(),
+            next_seq: 1,
             default_timeout: timeout_seconds,
             max_attempts,
+            max_sessions: Self::DEFAULT_MAX_SESSIONS,
         }
     }
 
+    /// Idle timeout in seconds used by [`Self::evict`] and
+    /// [`Self::cleanup_timed_out`].
+    pub fn idle_timeout_secs(&self) -> u64 {
+        self.default_timeout
+    }
+
+    /// Set the idle timeout in seconds.
+    pub fn set_idle_timeout_secs(&mut self, timeout_seconds: u64) {
+        self.default_timeout = timeout_seconds;
+    }
+
+    /// Maximum number of live sessions [`Self::evict`] keeps.
+    pub fn max_sessions(&self) -> usize {
+        self.max_sessions
+    }
+
+    /// Set the maximum number of live sessions. Zero is treated as one so
+    /// that a session can always be created.
+    pub fn set_max_sessions(&mut self, max_sessions: usize) {
+        self.max_sessions = max_sessions.max(1);
+    }
+
+    /// Move `session_id` to the most-recently-used end of the LRU order.
+    fn touch(&mut self, session_id: &str) {
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+        self.lru.remove(&session.lru_seq);
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        session.lru_seq = seq;
+        session.update_activity();
+        self.lru.insert(seq, session_id.to_string());
+    }
+
     /// Create a new session
+    ///
+    /// Does not evict anything; call [`Self::evict`] first to keep the store
+    /// within its bounds.
     pub fn create_session(&mut self, session_id: String) -> &mut EapSession {
+        if let Some(old) = self.sessions.remove(&session_id) {
+            self.lru.remove(&old.lru_seq);
+        }
         let session = EapSession::new(session_id.clone());
         self.sessions.insert(session_id.clone(), session);
+        self.touch(&session_id);
         self.sessions.get_mut(&session_id).unwrap()
     }
 
-    /// Get an existing session
+    /// Get an existing session without changing its LRU position.
     pub fn get_session(&self, session_id: &str) -> Option<&EapSession> {
         self.sessions.get(session_id)
     }
 
-    /// Get a mutable reference to an existing session
+    /// Get a mutable reference to an existing session, marking it as the
+    /// most recently used.
     pub fn get_session_mut(&mut self, session_id: &str) -> Option<&mut EapSession> {
+        self.touch(session_id);
         self.sessions.get_mut(session_id)
     }
 
     /// Remove a session
     pub fn remove_session(&mut self, session_id: &str) -> Option<EapSession> {
-        self.sessions.remove(session_id)
+        let session = self.sessions.remove(session_id)?;
+        self.lru.remove(&session.lru_seq);
+        Some(session)
     }
 
     /// Get or create a session
@@ -2092,7 +2192,58 @@ impl EapSessionManager {
         if !self.sessions.contains_key(&session_id) {
             self.create_session(session_id.clone());
         }
-        self.sessions.get_mut(&session_id).unwrap()
+        self.get_session_mut(&session_id).unwrap()
+    }
+
+    /// Evict sessions so that one more can be created within bounds: first
+    /// every session idle for longer than the timeout (as of `now_secs`),
+    /// then, while the store holds `max_sessions` or more, the least
+    /// recently used ones. Returns the evicted session IDs with the reason,
+    /// so the caller can drop whatever it keeps per session.
+    pub fn evict_at(&mut self, now_secs: u64) -> Vec<(String, EvictionReason)> {
+        let timeout = self.default_timeout;
+        let mut evicted = Vec::new();
+
+        // Idle sessions sit at the old end of the LRU order (a session's
+        // activity time only moves when it is touched), so stop at the first
+        // live one.
+        let mut stale = Vec::new();
+        for (seq, id) in &self.lru {
+            match self.sessions.get(id) {
+                Some(s) if s.is_timed_out_at(now_secs, timeout) => stale.push((*seq, id.clone())),
+                Some(_) => break,
+                None => stale.push((*seq, id.clone())), // dangling index entry
+            }
+        }
+        for (seq, id) in stale {
+            self.lru.remove(&seq);
+            if self.sessions.remove(&id).is_some() {
+                evicted.push((id, EvictionReason::Idle));
+            }
+        }
+
+        while self.sessions.len() >= self.max_sessions {
+            let Some((_, id)) = self.lru.pop_first() else {
+                // Sessions inserted behind the manager's back carry no LRU
+                // entry; evict any of them.
+                let Some(id) = self.sessions.keys().next().cloned() else {
+                    break;
+                };
+                self.sessions.remove(&id);
+                evicted.push((id, EvictionReason::Capacity));
+                continue;
+            };
+            if self.sessions.remove(&id).is_some() {
+                evicted.push((id, EvictionReason::Capacity));
+            }
+        }
+
+        evicted
+    }
+
+    /// [`Self::evict_at`] as of the current time.
+    pub fn evict(&mut self) -> Vec<(String, EvictionReason)> {
+        self.evict_at(unix_now_secs())
     }
 
     /// Clean up timed out sessions
@@ -2102,6 +2253,8 @@ impl EapSessionManager {
 
         self.sessions
             .retain(|_, session| !session.is_timed_out(timeout));
+        let sessions = &self.sessions;
+        self.lru.retain(|_, id| sessions.contains_key(id));
 
         before_count - self.sessions.len()
     }
@@ -2112,6 +2265,8 @@ impl EapSessionManager {
 
         self.sessions
             .retain(|_, session| !session.state.is_terminal());
+        let sessions = &self.sessions;
+        self.lru.retain(|_, id| sessions.contains_key(id));
 
         before_count - self.sessions.len()
     }
@@ -2821,6 +2976,105 @@ mod tests {
         assert_eq!(removed, 2); // Removed 2 terminal sessions
         assert_eq!(manager.session_count(), 1); // 1 remaining
         assert!(manager.get_session("session3").is_some());
+    }
+
+    // ===== Session Manager Eviction Tests =====
+
+    #[test]
+    fn session_manager_evicts_least_recently_used_at_capacity() {
+        let mut manager = EapSessionManager::with_config(300, 3);
+        manager.set_max_sessions(2);
+        assert_eq!(manager.max_sessions(), 2);
+
+        manager.create_session("a".to_string());
+        manager.create_session("b".to_string());
+        // Touch "a": "b" is now the least recently used.
+        assert!(manager.get_session_mut("a").is_some());
+
+        let evicted = manager.evict();
+        assert_eq!(evicted, vec![("b".to_string(), EvictionReason::Capacity)]);
+        assert_eq!(manager.session_count(), 1);
+        manager.create_session("c".to_string());
+        assert_eq!(manager.session_count(), 2);
+
+        // Nothing idle, store exactly full: one more eviction, "a" this time.
+        let evicted = manager.evict();
+        assert_eq!(evicted, vec![("a".to_string(), EvictionReason::Capacity)]);
+        assert!(manager.get_session("c").is_some());
+
+        // Below capacity: nothing to evict.
+        assert!(manager.evict().is_empty());
+    }
+
+    #[test]
+    fn session_manager_evicts_idle_sessions_first() {
+        let mut manager = EapSessionManager::with_config(10, 3);
+        manager.set_max_sessions(100);
+        manager.create_session("old".to_string());
+        manager.create_session("new".to_string());
+        let now = manager.get_session("new").unwrap().last_activity;
+
+        // Exactly at the timeout: still live.
+        assert!(manager.evict_at(now + 10).is_empty());
+        // Both idle past the timeout: both go, with the idle reason.
+        let mut evicted = manager.evict_at(now + 11);
+        evicted.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            evicted,
+            vec![
+                ("new".to_string(), EvictionReason::Idle),
+                ("old".to_string(), EvictionReason::Idle)
+            ]
+        );
+        assert_eq!(manager.session_count(), 0);
+    }
+
+    #[test]
+    fn session_manager_idle_eviction_stops_at_first_live_session() {
+        let mut manager = EapSessionManager::with_config(10, 3);
+        manager.create_session("stale".to_string());
+        manager.create_session("live".to_string());
+        // Backdate "stale" below the timeout; "live" was touched after it.
+        manager.get_session_mut("stale").unwrap().last_activity -= 60;
+        // Re-touch "live" so it is the most recent in LRU order.
+        let now = manager.get_session_mut("live").unwrap().last_activity;
+        // "stale" was touched by get_session_mut, so restore its backdate.
+        manager.sessions.get_mut("stale").unwrap().last_activity = now - 60;
+
+        let evicted = manager.evict_at(now);
+        assert_eq!(evicted, vec![("stale".to_string(), EvictionReason::Idle)]);
+        assert!(manager.get_session("live").is_some());
+    }
+
+    #[test]
+    fn session_manager_remove_and_recreate_keep_lru_consistent() {
+        let mut manager = EapSessionManager::with_config(300, 3);
+        manager.set_max_sessions(2);
+        manager.create_session("a".to_string());
+        manager.create_session("b".to_string());
+        assert!(manager.remove_session("a").is_some());
+        assert_eq!(manager.lru.len(), 1);
+        // Recreating an existing id replaces it without a dangling LRU entry.
+        manager.create_session("b".to_string());
+        assert_eq!(manager.lru.len(), 1);
+        manager.create_session("c".to_string());
+        assert_eq!(manager.session_count(), 2);
+        assert!(
+            manager
+                .evict()
+                .iter()
+                .all(|(_, r)| *r == EvictionReason::Capacity)
+        );
+        assert_eq!(manager.session_count(), 1);
+    }
+
+    #[test]
+    fn session_manager_zero_capacity_is_raised_to_one() {
+        let mut manager = EapSessionManager::new();
+        manager.set_max_sessions(0);
+        assert_eq!(manager.max_sessions(), 1);
+        manager.create_session("a".to_string());
+        assert_eq!(manager.evict().len(), 1);
     }
 
     #[test]

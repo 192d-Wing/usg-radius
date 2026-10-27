@@ -750,6 +750,10 @@ pub enum TeapPhase {
     Phase1TlsHandshake,
     /// Phase 2: Inner authentication
     Phase2InnerAuth,
+    /// The server has sent its Result TLV and waits for the peer's Result
+    /// TLV acknowledgement (RFC 7170 §3.3.3 / §4.2.2). Only after that does
+    /// the conversation complete and EAP-Success/Failure go out.
+    Phase2ResultSent,
     /// Authentication complete
     Complete,
 }
@@ -798,6 +802,18 @@ pub struct EapTeapServer {
     /// method succeeded *and* is bound to this tunnel. Gates `get_msk`.
     crypto_binding_verified: bool,
 
+    /// True once the server has sent its first Phase 2 TLV. Before that, an
+    /// empty inbound packet (the peer acknowledging the end of the handshake
+    /// flight) opens Phase 2; afterwards an empty packet that is not a
+    /// fragment ACK is a protocol error.
+    phase2_started: bool,
+
+    /// The Result TLV the server sent (`Phase2ResultSent`), and whether the
+    /// peer's acknowledgement agreed. The MSK is released only when both
+    /// sides said Success.
+    sent_result: Option<TeapResult>,
+    peer_result: Option<TeapResult>,
+
     /// Test-only override for `session_key_seed`.
     ///
     /// When set, `derive_session_key_seed` returns this value instead of
@@ -832,6 +848,9 @@ impl EapTeapServer {
             crypto_binding: None,
             phase2_tlv_history: Vec::new(),
             crypto_binding_verified: false,
+            phase2_started: false,
+            sent_result: None,
+            peer_result: None,
             #[cfg(test)]
             test_session_key_seed: None,
         }
@@ -855,6 +874,9 @@ impl EapTeapServer {
             crypto_binding: None,
             phase2_tlv_history: Vec::new(),
             crypto_binding_verified: false,
+            phase2_started: false,
+            sent_result: None,
+            peer_result: None,
             #[cfg(test)]
             test_session_key_seed: None,
         }
@@ -882,15 +904,41 @@ impl EapTeapServer {
 
     /// EAP MSK (RFC 7170 §5.4) for the MS-MPPE keys on the Access-Accept.
     ///
-    /// `Some` only after the inner method succeeded and the peer's
-    /// Crypto-Binding response verified; a failed or unbound conversation
-    /// yields no keying material. Derived from S-IMCK[j] with the TLS 1.2 PRF
-    /// (`P_SHA256`).
+    /// `Some` only after the inner method succeeded, the peer's
+    /// Crypto-Binding response verified, and the peer acknowledged the
+    /// server's Result=Success with a Result=Success of its own; a failed,
+    /// unbound or unacknowledged conversation yields no keying material.
+    /// Derived from S-IMCK[j] with the TLS 1.2 PRF (`P_SHA256`).
     pub fn get_msk(&self) -> Option<Vec<u8>> {
         if !self.crypto_binding_verified {
             return None;
         }
+        if self.sent_result != Some(TeapResult::Success)
+            || self.peer_result != Some(TeapResult::Success)
+        {
+            return None;
+        }
         self.crypto_binding.as_ref().map(CryptoBinding::derive_msk)
+    }
+
+    /// True while server-side fragments of the previous outbound message are
+    /// still queued; the peer's next packet is then a fragment ACK and the
+    /// caller sends [`Self::next_outgoing_fragment`] instead of processing it.
+    pub fn has_pending_fragments(&self) -> bool {
+        self.tls_server.has_pending_fragments()
+    }
+
+    /// Pop the next queued outbound fragment (see [`EapTlsServer::next_outgoing_fragment`]).
+    pub fn next_outgoing_fragment(&mut self) -> Option<EapTlsPacket> {
+        self.tls_server.next_outgoing_fragment()
+    }
+
+    /// Queue an outbound TLS message (Phase 1 handshake flight or Phase 2
+    /// encrypted TLVs) for transmission in fragments of at most
+    /// `max_fragment_size` bytes (RFC 7170 §3.1 / RFC 5216 §2.1.5).
+    pub fn queue_outgoing_tls(&mut self, tls_data: Vec<u8>, max_fragment_size: usize) {
+        self.tls_server
+            .queue_outgoing_tls(tls_data, max_fragment_size);
     }
 
     /// Derive `session_key_seed` for Crypto-Binding (RFC 7170 §5.2).
@@ -996,34 +1044,82 @@ impl EapTeapServer {
         ))
     }
 
-    /// Process client message (Phase 1 - TLS handshake)
+    /// Process one inbound EAP-TEAP packet from the peer.
     ///
-    /// This handles Phase 1 TLS tunnel establishment.
+    /// Phase 1 drives the TLS handshake through the wrapped
+    /// [`EapTlsServer`]; Phase 2 reassembles the peer's encrypted TLV
+    /// message, decrypts it and runs the TLV state machine. Both phases use
+    /// the same bounded fragment reassembler, so a fragmented inbound
+    /// message (RFC 7170 §3.1: L on the first fragment, M on every non-final
+    /// one) returns `Ok(None)` until the final fragment arrives; the caller
+    /// answers each such packet with an empty EAP-TEAP Request (ACK). Any
+    /// error ends the conversation.
+    ///
+    /// Returns `Ok(Some(tls_bytes))` when the server has a TLS message to
+    /// send (the caller fragments it to the EAP MTU with
+    /// [`Self::queue_outgoing_tls`]), `Ok(None)` when it has nothing to say
+    /// yet: more fragments are expected, or the conversation is complete
+    /// (see [`Self::is_complete`]).
     pub fn process_client_message(
         &mut self,
         tls_packet: &EapTlsPacket,
     ) -> Result<Option<Vec<u8>>, EapError> {
         match self.phase {
             TeapPhase::Phase1TlsHandshake => {
-                // Delegate to TLS server
-                let response = self.tls_server.process_client_message(tls_packet)?;
+                // Delegate to TLS server (reassembly, S-bit check, rustls).
+                let mut response = self.tls_server.process_client_message(tls_packet)?;
 
                 // Check if handshake complete
                 if self.tls_server.is_handshake_complete() {
                     // Extract keys for future use
                     self.tls_server.extract_keys()?;
-                    // Transition to Phase 2
+                    // Transition to Phase 2 and open it right away: the
+                    // first Phase 2 TLVs ride in the same TLS message as the
+                    // end of the handshake flight (RFC 7170 §3.3), so the
+                    // peer never has to send an empty packet to prompt them.
                     self.phase = TeapPhase::Phase2InnerAuth;
+                    if let Some(opening) = self.send_identity_type_request()? {
+                        response.get_or_insert_with(Vec::new).extend(opening);
+                    }
                 }
 
                 Ok(response)
             }
-            TeapPhase::Phase2InnerAuth => {
+            TeapPhase::Phase2InnerAuth | TeapPhase::Phase2ResultSent => {
+                // RFC 5216 §3.2 (TEAP reuses the flags, RFC 7170 §4.1): S is
+                // only valid on the server's Start.
+                if tls_packet.flags.start() {
+                    return Err(EapError::InvalidState);
+                }
+
+                // Reassemble the peer's message with the same bounded
+                // assembler Phase 1 uses; wait for more fragments if needed.
+                let Some(encrypted) = self.tls_server.context_mut().process_incoming(tls_packet)?
+                else {
+                    return Ok(None);
+                };
+
+                if encrypted.is_empty() {
+                    // An empty packet that is not a fragment ACK (the caller
+                    // handles those before reaching here). Before the first
+                    // Phase 2 TLV it is the peer acknowledging the handshake
+                    // flight: open Phase 2. Afterwards it is a protocol
+                    // error.
+                    if !self.phase2_started {
+                        return self.send_identity_type_request();
+                    }
+                    return Err(EapError::InvalidState);
+                }
+
                 // Decrypt TLS application data to get TLVs
-                let tlv_data = self.decrypt_tls_data(tls_packet)?;
+                let tlv_data = self.decrypt_tls_data(&encrypted)?;
 
                 // Parse TLVs from decrypted data
                 let tlvs = TeapTlv::parse_tlvs(&tlv_data)?;
+
+                if self.phase == TeapPhase::Phase2ResultSent {
+                    return self.process_result_ack(&tlvs);
+                }
 
                 // Process Phase 2 TLVs
                 self.process_phase2_tlvs(&tlvs)
@@ -1032,37 +1128,77 @@ impl EapTeapServer {
         }
     }
 
-    /// Decrypt TLS application data from EAP-TLS packet
+    /// Decrypt a reassembled Phase 2 TLS message into the peer's TLV bytes.
     ///
-    /// In Phase 2, the client sends TLVs encrypted in the TLS tunnel.
-    /// We need to decrypt them using the established TLS connection.
-    ///
-    /// This:
-    /// 1. Feeds encrypted TLS records to rustls
-    /// 2. Processes and decrypts the records
-    /// 3. Extracts the plaintext application data (TLVs)
-    fn decrypt_tls_data(&mut self, tls_packet: &EapTlsPacket) -> Result<Vec<u8>, EapError> {
+    /// Feeds the TLS records to rustls in a loop (rustls bounds how much
+    /// undecrypted data it buffers per call), decrypts them, and returns the
+    /// plaintext application data (TLVs).
+    fn decrypt_tls_data(&mut self, encrypted: &[u8]) -> Result<Vec<u8>, EapError> {
         use std::io::{Cursor, Read};
 
         // Get mutable access to TLS connection
         let conn = self.tls_server.get_connection_mut()?;
 
-        // Feed encrypted data to rustls
-        let mut cursor = Cursor::new(&tls_packet.tls_data);
-        conn.read_tls(&mut cursor)
-            .map_err(|e| EapError::TlsError(format!("Failed to read TLS data: {}", e)))?;
+        let mut cursor = Cursor::new(encrypted);
+        while (cursor.position() as usize) < encrypted.len() {
+            let consumed = conn
+                .read_tls(&mut cursor)
+                .map_err(|e| EapError::TlsError(format!("Failed to read TLS data: {}", e)))?;
+            if consumed == 0 {
+                return Err(EapError::TlsError(
+                    "TLS receive buffer full before the message was consumed".to_string(),
+                ));
+            }
+            // Process TLS records (decrypt)
+            conn.process_new_packets()
+                .map_err(|e| EapError::TlsError(format!("Failed to process TLS packets: {}", e)))?;
+        }
 
-        // Process TLS records (decrypt)
-        conn.process_new_packets()
-            .map_err(|e| EapError::TlsError(format!("Failed to process TLS packets: {}", e)))?;
-
-        // Read decrypted application data
+        // Read decrypted application data. rustls reports `WouldBlock` once
+        // the buffered plaintext is drained on an open connection.
         let mut plaintext = Vec::new();
-        conn.reader()
-            .read_to_end(&mut plaintext)
-            .map_err(|e| EapError::TlsError(format!("Failed to read decrypted data: {}", e)))?;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match conn.reader().read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => plaintext.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    return Err(EapError::TlsError(format!(
+                        "Failed to read decrypted data: {}",
+                        e
+                    )));
+                }
+            }
+        }
 
         Ok(plaintext)
+    }
+
+    /// Handle the peer's answer to the server's Result TLV (RFC 7170
+    /// §3.3.3): it must be a Result TLV. The conversation is then complete;
+    /// the MSK is released only if both Results were Success.
+    fn process_result_ack(&mut self, tlvs: &[TeapTlv]) -> Result<Option<Vec<u8>>, EapError> {
+        let Some(result_tlv) = tlvs
+            .iter()
+            .find(|tlv| tlv.get_type() == Some(TlvType::Result))
+        else {
+            return Err(EapError::InvalidState);
+        };
+        let result = TeapResult::from_result_tlv(result_tlv)?;
+        self.append_to_phase2_history(result_tlv);
+        self.peer_result = Some(result);
+        self.phase = TeapPhase::Complete;
+        Ok(None)
+    }
+
+    /// Send the server's final Result TLV and wait for the peer's
+    /// acknowledgement.
+    fn send_result(&mut self, result: TeapResult) -> Result<Option<Vec<u8>>, EapError> {
+        self.sent_result = Some(result);
+        self.phase = TeapPhase::Phase2ResultSent;
+        let result_tlv = result.to_result_tlv();
+        self.encrypt_and_send_tlvs(&[result_tlv])
     }
 
     /// Process Phase 2 TLVs
@@ -1074,15 +1210,19 @@ impl EapTeapServer {
             return self.send_identity_type_request();
         }
 
-        // Process each TLV
+        // Append every received TLV of this message to the conversation
+        // history for crypto-binding (RFC 7170 §5.3) before acting on any,
+        // so the BUFFER covers the whole message whichever TLV the server
+        // answers. The Crypto-Binding response is excluded: its MAC is
+        // verified against the history *without* itself.
         for tlv in tlvs {
-            // Append received TLV to conversation history for crypto-binding
-            // (RFC 7170 §5.3). The Crypto-Binding response is excluded here:
-            // its MAC is verified against history *without* itself, then it
-            // is appended below after verification.
             if tlv.get_type() != Some(TlvType::CryptoBinding) {
                 self.append_to_phase2_history(tlv);
             }
+        }
+
+        // Process each TLV
+        for tlv in tlvs {
             match tlv.get_type() {
                 Some(TlvType::IdentityType) => {
                     // Identity-Type response received
@@ -1111,9 +1251,7 @@ impl EapTeapServer {
                                 return self.send_crypto_binding_request();
                             } else {
                                 // Authentication failed, send failure result
-                                self.phase = TeapPhase::Complete;
-                                let failure_tlv = TeapResult::Failure.to_result_tlv();
-                                return self.encrypt_and_send_tlvs(&[failure_tlv]);
+                                return self.send_result(TeapResult::Failure);
                             }
                         }
                     }
@@ -1138,9 +1276,7 @@ impl EapTeapServer {
                                     return self.send_crypto_binding_request();
                                 } else {
                                     // Authentication failed, send failure result
-                                    self.phase = TeapPhase::Complete;
-                                    let failure_tlv = TeapResult::Failure.to_result_tlv();
-                                    return self.encrypt_and_send_tlvs(&[failure_tlv]);
+                                    return self.send_result(TeapResult::Failure);
                                 }
                             }
                         } else {
@@ -1161,9 +1297,10 @@ impl EapTeapServer {
                     return self.process_crypto_binding_response(tlv);
                 }
                 Some(TlvType::Result) => {
-                    // Final result TLV from client (acknowledgment)
-                    self.phase = TeapPhase::Complete;
-                    return Ok(None);
+                    // A Result TLV before the server sent its own is out of
+                    // order (RFC 7170 §3.3.3: the server concludes the
+                    // conversation). Fail closed.
+                    return Err(EapError::InvalidState);
                 }
                 _ => {
                     // Unknown or unsupported TLV
@@ -1221,6 +1358,7 @@ impl EapTeapServer {
         for tlv in tlvs {
             self.append_to_phase2_history(tlv);
         }
+        self.phase2_started = true;
 
         Ok(Some(encrypted))
     }
@@ -1237,7 +1375,16 @@ impl EapTeapServer {
         for tlv in tlvs {
             self.append_to_phase2_history(tlv);
         }
+        self.phase2_started = true;
         Ok(Some(tlv_data))
+    }
+
+    /// Test helper: [`Self::send_result`] without encryption.
+    #[cfg(test)]
+    fn send_result_plaintext(&mut self, result: TeapResult) -> Result<Option<Vec<u8>>, EapError> {
+        self.sent_result = Some(result);
+        self.phase = TeapPhase::Phase2ResultSent;
+        self.send_tlvs_plaintext(&[result.to_result_tlv()])
     }
 
     /// Test helper: Process Phase 2 TLVs without encryption (for unit tests)
@@ -1254,11 +1401,11 @@ impl EapTeapServer {
         }
 
         for tlv in tlvs {
-            // Append non-CryptoBinding received TLVs to history; CryptoBinding
-            // is appended only after MAC verification (see helper).
             if tlv.get_type() != Some(TlvType::CryptoBinding) {
                 self.append_to_phase2_history(tlv);
             }
+        }
+        for tlv in tlvs {
             match tlv.get_type() {
                 Some(TlvType::IdentityType) => {
                     if let Some(ref mut handler) = self.inner_method
@@ -1278,9 +1425,7 @@ impl EapTeapServer {
                                 let cb_tlv = self.build_crypto_binding_request_tlv()?;
                                 return self.send_tlvs_plaintext(&[cb_tlv]);
                             } else {
-                                self.phase = TeapPhase::Complete;
-                                let failure_tlv = TeapResult::Failure.to_result_tlv();
-                                return self.send_tlvs_plaintext(&[failure_tlv]);
+                                return self.send_result_plaintext(TeapResult::Failure);
                             }
                         }
                     }
@@ -1297,9 +1442,7 @@ impl EapTeapServer {
                                     let cb_tlv = self.build_crypto_binding_request_tlv()?;
                                     return self.send_tlvs_plaintext(&[cb_tlv]);
                                 } else {
-                                    self.phase = TeapPhase::Complete;
-                                    let failure_tlv = TeapResult::Failure.to_result_tlv();
-                                    return self.send_tlvs_plaintext(&[failure_tlv]);
+                                    return self.send_result_plaintext(TeapResult::Failure);
                                 }
                             }
                         } else {
@@ -1319,18 +1462,16 @@ impl EapTeapServer {
                     {
                         crypto_binding.client_nonce = Some(cb_response.nonce);
                     }
-                    self.phase = TeapPhase::Complete;
                     self.crypto_binding_verified = mac_ok;
-                    let result_tlv = if mac_ok {
-                        TeapResult::Success.to_result_tlv()
+                    let result = if mac_ok {
+                        TeapResult::Success
                     } else {
-                        TeapResult::Failure.to_result_tlv()
+                        TeapResult::Failure
                     };
-                    return self.send_tlvs_plaintext(&[result_tlv]);
+                    return self.send_result_plaintext(result);
                 }
                 Some(TlvType::Result) => {
-                    self.phase = TeapPhase::Complete;
-                    return Ok(None);
+                    return Err(EapError::InvalidState);
                 }
                 _ => continue,
             }
@@ -1369,14 +1510,13 @@ impl EapTeapServer {
             crypto_binding.client_nonce = Some(cb_response.nonce);
         }
 
-        self.phase = TeapPhase::Complete;
         self.crypto_binding_verified = mac_ok;
-        let result_tlv = if mac_ok {
-            TeapResult::Success.to_result_tlv()
+        let result = if mac_ok {
+            TeapResult::Success
         } else {
-            TeapResult::Failure.to_result_tlv()
+            TeapResult::Failure
         };
-        self.encrypt_and_send_tlvs(&[result_tlv])
+        self.send_result(result)
     }
 }
 
@@ -2362,8 +2502,9 @@ mod tests {
         let result = server.process_phase2_tlvs_test(&[password_response]);
         assert!(result.is_ok());
 
-        // Server should transition to Complete
-        assert_eq!(server.phase, TeapPhase::Complete);
+        // Server has sent its Result and waits for the peer's acknowledgement
+        assert_eq!(server.phase, TeapPhase::Phase2ResultSent);
+        assert!(!server.is_complete());
 
         let response = result.unwrap();
         assert!(response.is_some());
@@ -2464,7 +2605,8 @@ mod tests {
             .process_phase2_tlvs_test(&[cb_response_with_mac.to_tlv()])
             .unwrap();
         assert!(result4.is_some());
-        assert_eq!(server.phase, TeapPhase::Complete);
+        assert_eq!(server.phase, TeapPhase::Phase2ResultSent);
+        assert!(!server.is_complete());
 
         let tlvs4 = TeapTlv::parse_tlvs(&result4.unwrap()).unwrap();
         assert_eq!(tlvs4[0].get_type(), Some(TlvType::Result));
@@ -2487,17 +2629,27 @@ mod tests {
         let handler = BasicPasswordAuthHandler::new("alice".to_string(), "secret".to_string());
         let mut server = EapTeapServer::with_inner_method(config, Box::new(handler));
 
+        // A Result TLV before the server sent its own is out of order
+        // (RFC 7170 §3.3.3) and ends the conversation.
         server.phase = TeapPhase::Phase2InnerAuth;
+        let early = server.process_phase2_tlvs(&[TeapResult::Success.to_result_tlv()]);
+        assert!(matches!(early, Err(EapError::InvalidState)));
 
-        // Simulate receiving Result TLV from client (acknowledgment)
-        let result_tlv = TeapResult::Success.to_result_tlv();
-
-        let response = server.process_phase2_tlvs(&[result_tlv]);
+        // After the server's Result TLV the peer's Result TLV completes it.
+        server.phase = TeapPhase::Phase2ResultSent;
+        server.sent_result = Some(TeapResult::Success);
+        let response = server.process_result_ack(&[TeapResult::Success.to_result_tlv()]);
         assert!(response.is_ok());
 
         // Should transition to Complete and return None (no more data)
         assert_eq!(server.phase, TeapPhase::Complete);
         assert!(response.unwrap().is_none());
+        assert_eq!(server.peer_result, Some(TeapResult::Success));
+
+        // Anything but a Result TLV in that state is an error.
+        server.phase = TeapPhase::Phase2ResultSent;
+        let bad = server.process_result_ack(&[IdentityType::User.to_tlv()]);
+        assert!(matches!(bad, Err(EapError::InvalidState)));
     }
 
     #[test]
@@ -2528,7 +2680,7 @@ mod tests {
         // Note: Can't test actual decryption without completing handshake
         // This test validates the function exists and compiles correctly
         // Full decryption testing requires integration test with real TLS handshake
-        let result = server.decrypt_tls_data(&tls_packet);
+        let result = server.decrypt_tls_data(&tls_packet.tls_data);
 
         // May fail without handshake, but that's expected
         // In real usage, this is called after Phase 1 handshake completes
@@ -2827,8 +2979,8 @@ mod tests {
         let result = server.process_phase2_tlvs_test(&[cb_response_with_mac.to_tlv()]);
         assert!(result.is_ok());
 
-        // Should transition to Complete and send Success
-        assert_eq!(server.phase, TeapPhase::Complete);
+        // Should send Success and wait for the peer's Result acknowledgement
+        assert_eq!(server.phase, TeapPhase::Phase2ResultSent);
 
         let response = result.unwrap().unwrap();
         let tlvs = TeapTlv::parse_tlvs(&response).unwrap();
@@ -2886,8 +3038,8 @@ mod tests {
         let result = server.process_phase2_tlvs_test(&[cb_response.to_tlv()]);
         assert!(result.is_ok());
 
-        // Should transition to Complete and send Failure
-        assert_eq!(server.phase, TeapPhase::Complete);
+        // Should send Failure and wait for the peer's Result acknowledgement
+        assert_eq!(server.phase, TeapPhase::Phase2ResultSent);
 
         let response = result.unwrap().unwrap();
         let tlvs = TeapTlv::parse_tlvs(&response).unwrap();
@@ -3358,7 +3510,7 @@ mod tests {
         assert_eq!(result_tlvs[0].get_type(), Some(TlvType::Result));
         let result_value = u16::from_be_bytes([result_tlvs[0].value[0], result_tlvs[0].value[1]]);
         assert_eq!(result_value, TeapResult::Failure as u16);
-        assert_eq!(server.phase, TeapPhase::Complete);
+        assert_eq!(server.phase, TeapPhase::Phase2ResultSent);
     }
 
     /// `BasicPasswordAuthHandler` and `EapPayloadHandler` produce no inner
@@ -3517,6 +3669,17 @@ mod tests {
 
         let response = crypto_binding_response(&server, true);
         server.process_phase2_tlvs_test(&[response]).unwrap();
+        assert_eq!(server.phase, TeapPhase::Phase2ResultSent);
+        assert!(
+            server.get_msk().is_none(),
+            "no MSK before the peer acknowledges the Result"
+        );
+
+        // RFC 7170 §3.3.3: the peer's Result=Success acknowledgement completes
+        // the conversation and releases the MSK.
+        server
+            .process_result_ack(&[TeapResult::Success.to_result_tlv()])
+            .unwrap();
         assert!(server.is_complete());
 
         let msk = server.get_msk().expect("MSK after verified crypto-binding");
@@ -3529,8 +3692,27 @@ mod tests {
         let mut server = server_awaiting_crypto_binding();
         let response = crypto_binding_response(&server, false);
         server.process_phase2_tlvs_test(&[response]).unwrap();
-        // The conversation is over (Result=Failure sent) but no key material
-        // may leak to the Access-Accept builder.
+        // Result=Failure sent; once the peer acknowledges it the conversation
+        // is over, and no key material may leak to the Access-Accept builder
+        // whatever the peer claims in its own Result TLV.
+        assert!(server.get_msk().is_none());
+        server
+            .process_result_ack(&[TeapResult::Success.to_result_tlv()])
+            .unwrap();
+        assert!(server.is_complete());
+        assert!(server.get_msk().is_none());
+    }
+
+    /// A peer that answers the server's Result=Success with Result=Failure
+    /// does not get an Access-Accept: both sides must agree on Success.
+    #[test]
+    fn get_msk_withheld_when_peer_result_is_failure() {
+        let mut server = server_awaiting_crypto_binding();
+        let response = crypto_binding_response(&server, true);
+        server.process_phase2_tlvs_test(&[response]).unwrap();
+        server
+            .process_result_ack(&[TeapResult::Failure.to_result_tlv()])
+            .unwrap();
         assert!(server.is_complete());
         assert!(server.get_msk().is_none());
     }
