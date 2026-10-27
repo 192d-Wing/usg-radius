@@ -2471,8 +2471,9 @@ mod tests {
     fn test_basic_password_auth_empty_supplied_password_fails() {
         let mut handler =
             BasicPasswordAuthHandler::new("alice".to_string(), test_password().to_string());
+        let empty = String::new();
         let _ = handler
-            .process_inner_request(&password_response("alice", ""))
+            .process_inner_request(&password_response("alice", &empty))
             .unwrap();
         assert!(handler.is_complete());
         assert_eq!(handler.get_result(), TeapResult::Failure);
@@ -2484,13 +2485,16 @@ mod tests {
     fn test_basic_password_auth_without_password_rejects_everything() {
         let empty = String::new();
         let wrong = wrong_password_same_length();
-        for supplied in [empty.as_str(), test_password(), wrong.as_str()] {
+        for (case, supplied) in [empty.as_str(), test_password(), wrong.as_str()]
+            .into_iter()
+            .enumerate()
+        {
             let mut handler = BasicPasswordAuthHandler::without_password("alice".to_string());
             let result_tlv = handler
                 .process_inner_request(&password_response("alice", supplied))
                 .unwrap();
-            assert!(handler.is_complete(), "{supplied:?}");
-            assert_eq!(handler.get_result(), TeapResult::Failure, "{supplied:?}");
+            assert!(handler.is_complete(), "case {case}");
+            assert_eq!(handler.get_result(), TeapResult::Failure, "case {case}");
             assert_eq!(
                 TeapResult::from_result_tlv(&result_tlv).unwrap(),
                 TeapResult::Failure
