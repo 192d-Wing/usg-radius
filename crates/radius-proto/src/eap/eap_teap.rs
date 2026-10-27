@@ -743,6 +743,18 @@ impl CryptoBinding {
     }
 }
 
+/// Constant-time equality of two byte strings (false if lengths differ).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// TEAP authentication phase
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeapPhase {
@@ -808,6 +820,16 @@ pub struct EapTeapServer {
     /// fragment ACK is a protocol error.
     phase2_started: bool,
 
+    /// Reassembled Phase 2 messages received from the peer so far. Bounded
+    /// by `max_phase2_rounds`, so a peer cannot keep a conversation (and its
+    /// TLS state) alive indefinitely by sending TLVs the server answers.
+    phase2_rounds: u32,
+    /// Upper bound on `phase2_rounds` (default [`Self::MAX_PHASE2_ROUNDS`]).
+    max_phase2_rounds: u32,
+    /// Set once the peer has answered the Identity-Type TLV. A second one is
+    /// a protocol error, not a reason to re-send the inner method request.
+    identity_type_received: bool,
+
     /// The Result TLV the server sent (`Phase2ResultSent`), and whether the
     /// peer's acknowledgement agreed. The MSK is released only when both
     /// sides said Success.
@@ -824,6 +846,26 @@ pub struct EapTeapServer {
 }
 
 impl EapTeapServer {
+    /// Largest Phase 2 TLV history kept per conversation (the RFC 7170 §5.3
+    /// BUFFER prefix). One received message is already bounded at 64 KiB by
+    /// the fragment assembler; a conversation that accumulates more than
+    /// this is not a Basic-Password-Auth or EAP-Payload exchange.
+    pub const MAX_PHASE2_HISTORY_BYTES: usize = 64 * 1024;
+    /// Most Intermediate-Result TLVs (sent or received) kept per conversation.
+    pub const MAX_INTERMEDIATE_RESULTS: usize = 16;
+    /// Most reassembled Phase 2 messages a peer may send in one
+    /// conversation. Basic-Password-Auth needs four (Identity-Type,
+    /// Basic-Password-Auth-Resp, Crypto-Binding, Result); inner EAP methods
+    /// a few more.
+    pub const MAX_PHASE2_ROUNDS: u32 = 32;
+
+    /// Lower (or raise) the Phase 2 round bound for this conversation.
+    /// Exceeding it fails the conversation with
+    /// [`EapError::Phase2LimitExceeded`].
+    pub fn set_max_phase2_rounds(&mut self, rounds: u32) {
+        self.max_phase2_rounds = rounds;
+    }
+
     /// Create new TEAP server
     ///
     /// # Arguments
@@ -849,6 +891,9 @@ impl EapTeapServer {
             phase2_tlv_history: Vec::new(),
             crypto_binding_verified: false,
             phase2_started: false,
+            phase2_rounds: 0,
+            max_phase2_rounds: Self::MAX_PHASE2_ROUNDS,
+            identity_type_received: false,
             sent_result: None,
             peer_result: None,
             #[cfg(test)]
@@ -875,6 +920,9 @@ impl EapTeapServer {
             phase2_tlv_history: Vec::new(),
             crypto_binding_verified: false,
             phase2_started: false,
+            phase2_rounds: 0,
+            max_phase2_rounds: Self::MAX_PHASE2_ROUNDS,
+            identity_type_received: false,
             sent_result: None,
             peer_result: None,
             #[cfg(test)]
@@ -981,6 +1029,65 @@ impl EapTeapServer {
     /// History feeds the BUFFER for Crypto-Binding compound MAC (RFC 7170 §5.3).
     fn append_to_phase2_history(&mut self, tlv: &TeapTlv) {
         self.phase2_tlv_history.extend_from_slice(&tlv.to_bytes());
+    }
+
+    /// Append the TLVs of a received Phase 2 message to the history, except
+    /// the Crypto-Binding response (its MAC is verified against the history
+    /// *without* itself). Fails closed, before appending anything, when the
+    /// history would exceed [`Self::MAX_PHASE2_HISTORY_BYTES`].
+    fn append_received_to_phase2_history(&mut self, tlvs: &[TeapTlv]) -> Result<(), EapError> {
+        let extra: usize = tlvs
+            .iter()
+            .filter(|tlv| tlv.get_type() != Some(TlvType::CryptoBinding))
+            .map(|tlv| tlv.to_bytes().len())
+            .sum();
+        if self.phase2_tlv_history.len().saturating_add(extra) > Self::MAX_PHASE2_HISTORY_BYTES {
+            return Err(EapError::Phase2LimitExceeded("TLV history"));
+        }
+        for tlv in tlvs {
+            if tlv.get_type() != Some(TlvType::CryptoBinding) {
+                self.append_to_phase2_history(tlv);
+            }
+        }
+        Ok(())
+    }
+
+    /// Record an Intermediate-Result, bounded by
+    /// [`Self::MAX_INTERMEDIATE_RESULTS`].
+    ///
+    /// Takes the vector rather than `&mut self` so callers holding a borrow
+    /// of `inner_method` can use it.
+    fn push_intermediate_result(
+        results: &mut Vec<TeapResult>,
+        result: TeapResult,
+    ) -> Result<(), EapError> {
+        if results.len() >= Self::MAX_INTERMEDIATE_RESULTS {
+            return Err(EapError::Phase2LimitExceeded("Intermediate-Result TLVs"));
+        }
+        results.push(result);
+        Ok(())
+    }
+
+    /// Note the peer's Identity-Type TLV. The peer answers the server's
+    /// Identity-Type request once; a second Identity-Type TLV is a protocol
+    /// error (previously it was re-answered with a fresh inner method
+    /// request, without bound).
+    fn note_identity_type_received(&mut self) -> Result<(), EapError> {
+        if self.identity_type_received {
+            return Err(EapError::Phase2LimitExceeded("repeated Identity-Type TLV"));
+        }
+        self.identity_type_received = true;
+        Ok(())
+    }
+
+    /// Count one reassembled Phase 2 message from the peer, bounded by
+    /// `max_phase2_rounds`.
+    fn count_phase2_round(&mut self) -> Result<(), EapError> {
+        self.phase2_rounds = self.phase2_rounds.saturating_add(1);
+        if self.phase2_rounds > self.max_phase2_rounds {
+            return Err(EapError::Phase2LimitExceeded("Phase 2 rounds"));
+        }
+        Ok(())
     }
 
     /// Build a Crypto-Binding Request TLV bound to the current conversation.
@@ -1099,6 +1206,9 @@ impl EapTeapServer {
                     return Ok(None);
                 };
 
+                // One more Phase 2 round from the peer; fail closed past the bound.
+                self.count_phase2_round()?;
+
                 if encrypted.is_empty() {
                     // An empty packet that is not a fragment ACK (the caller
                     // handles those before reaching here). Before the first
@@ -1214,17 +1324,14 @@ impl EapTeapServer {
         // history for crypto-binding (RFC 7170 §5.3) before acting on any,
         // so the BUFFER covers the whole message whichever TLV the server
         // answers. The Crypto-Binding response is excluded: its MAC is
-        // verified against the history *without* itself.
-        for tlv in tlvs {
-            if tlv.get_type() != Some(TlvType::CryptoBinding) {
-                self.append_to_phase2_history(tlv);
-            }
-        }
+        // verified against the history *without* itself. Bounded.
+        self.append_received_to_phase2_history(tlvs)?;
 
         // Process each TLV
         for tlv in tlvs {
             match tlv.get_type() {
                 Some(TlvType::IdentityType) => {
+                    self.note_identity_type_received()?;
                     // Identity-Type response received
                     // Check if inner method can handle this (e.g., EapPayloadHandler)
                     // Otherwise fall back to password auth
@@ -1265,7 +1372,7 @@ impl EapTeapServer {
                         if response_tlv.get_type() == Some(TlvType::IntermediateResult) {
                             // Store intermediate result
                             let result = TeapResult::from_result_tlv(&response_tlv)?;
-                            self.intermediate_results.push(result);
+                            Self::push_intermediate_result(&mut self.intermediate_results, result)?;
 
                             // Check if authentication is complete
                             if handler.is_complete() {
@@ -1288,7 +1395,7 @@ impl EapTeapServer {
                 Some(TlvType::IntermediateResult) => {
                     // Intermediate-Result TLV from client (acknowledgment)
                     let result = TeapResult::from_result_tlv(tlv)?;
-                    self.intermediate_results.push(result);
+                    Self::push_intermediate_result(&mut self.intermediate_results, result)?;
                     // Continue processing other TLVs
                     continue;
                 }
@@ -1400,14 +1507,11 @@ impl EapTeapServer {
             return self.send_tlvs_plaintext(&[tlv]);
         }
 
-        for tlv in tlvs {
-            if tlv.get_type() != Some(TlvType::CryptoBinding) {
-                self.append_to_phase2_history(tlv);
-            }
-        }
+        self.append_received_to_phase2_history(tlvs)?;
         for tlv in tlvs {
             match tlv.get_type() {
                 Some(TlvType::IdentityType) => {
+                    self.note_identity_type_received()?;
                     if let Some(ref mut handler) = self.inner_method
                         && let Ok(response_tlv) = handler.process_inner_request(tlv)
                     {
@@ -1435,7 +1539,7 @@ impl EapTeapServer {
                         let response_tlv = handler.process_inner_request(tlv)?;
                         if response_tlv.get_type() == Some(TlvType::IntermediateResult) {
                             let result = TeapResult::from_result_tlv(&response_tlv)?;
-                            self.intermediate_results.push(result);
+                            Self::push_intermediate_result(&mut self.intermediate_results, result)?;
                             if handler.is_complete() {
                                 let auth_result = handler.get_result();
                                 if auth_result == TeapResult::Success {
@@ -1452,7 +1556,7 @@ impl EapTeapServer {
                 }
                 Some(TlvType::IntermediateResult) => {
                     let result = TeapResult::from_result_tlv(tlv)?;
-                    self.intermediate_results.push(result);
+                    Self::push_intermediate_result(&mut self.intermediate_results, result)?;
                     continue;
                 }
                 Some(TlvType::CryptoBinding) => {
@@ -1600,6 +1704,22 @@ impl BasicPasswordAuthHandler {
         }
     }
 
+    /// Create a handler for a user the backend has no password for.
+    ///
+    /// Every Basic-Password-Auth-Resp fails: there is nothing to compare
+    /// against, and substituting an empty expected password would accept an
+    /// empty supplied one. The tunnel still runs to completion so the peer
+    /// cannot tell an unknown user from a wrong password.
+    pub fn without_password(expected_username: String) -> Self {
+        Self {
+            expected_username: Some(expected_username),
+            expected_password: None,
+            username: None,
+            complete: false,
+            result: TeapResult::Failure,
+        }
+    }
+
     /// Create handler without pre-set credentials (for testing)
     pub fn new_empty() -> Self {
         Self {
@@ -1659,13 +1779,16 @@ impl BasicPasswordAuthHandler {
         let password = String::from_utf8(tlv.value[offset..offset + password_len].to_vec())
             .map_err(|_| EapError::InvalidResponseFormat)?;
 
-        // Verify credentials
-        let auth_success = if let (Some(exp_user), Some(exp_pass)) =
-            (&self.expected_username, &self.expected_password)
-        {
-            &username == exp_user && &password == exp_pass
-        } else {
-            false
+        // Verify credentials. Fail closed before any comparison when either
+        // side has no password: an empty expected password (the backend
+        // knows no password for this user, or stores an empty one) or an
+        // empty supplied password never authenticates. The password
+        // comparison itself is constant-time.
+        let auth_success = match (&self.expected_username, &self.expected_password) {
+            (Some(exp_user), Some(exp_pass)) if !exp_pass.is_empty() && !password.is_empty() => {
+                &username == exp_user && constant_time_eq(password.as_bytes(), exp_pass.as_bytes())
+            }
+            _ => false,
         };
 
         self.username = Some(username);
@@ -2271,22 +2394,82 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_basic_password_auth_empty_credentials() {
-        let mut handler = BasicPasswordAuthHandler::new("".to_string(), "".to_string());
-
-        // Empty username and password
+    fn password_response(username: &str, password: &str) -> TeapTlv {
         let mut value = Vec::new();
-        value.extend_from_slice(&0u16.to_be_bytes());
-        value.extend_from_slice(&0u16.to_be_bytes());
+        value.extend_from_slice(&(username.len() as u16).to_be_bytes());
+        value.extend_from_slice(username.as_bytes());
+        value.extend_from_slice(&(password.len() as u16).to_be_bytes());
+        value.extend_from_slice(password.as_bytes());
+        TeapTlv::new(TlvType::BasicPasswordAuthResp, true, value)
+    }
 
-        let response_tlv = TeapTlv::new(TlvType::BasicPasswordAuthResp, true, value);
-
-        let _result_tlv = handler.process_inner_request(&response_tlv).unwrap();
-
+    /// An empty expected password (what a backend without a password for the
+    /// user used to be mapped to) never matches, not even an empty supplied
+    /// password. This used to be asserted as Success.
+    #[test]
+    fn test_basic_password_auth_empty_credentials_fail_closed() {
+        let mut handler = BasicPasswordAuthHandler::new("".to_string(), "".to_string());
+        let _ = handler
+            .process_inner_request(&password_response("", ""))
+            .unwrap();
         assert!(handler.is_complete());
-        assert_eq!(handler.get_result(), TeapResult::Success);
+        assert_eq!(handler.get_result(), TeapResult::Failure);
         assert_eq!(handler.get_identity(), Some("".to_string()));
+
+        let mut handler = BasicPasswordAuthHandler::new("alice".to_string(), "".to_string());
+        let _ = handler
+            .process_inner_request(&password_response("alice", ""))
+            .unwrap();
+        assert_eq!(handler.get_result(), TeapResult::Failure);
+    }
+
+    /// An empty supplied password fails even though the expected one is set.
+    #[test]
+    fn test_basic_password_auth_empty_supplied_password_fails() {
+        let mut handler = BasicPasswordAuthHandler::new("alice".to_string(), "secret".to_string());
+        let _ = handler
+            .process_inner_request(&password_response("alice", ""))
+            .unwrap();
+        assert!(handler.is_complete());
+        assert_eq!(handler.get_result(), TeapResult::Failure);
+    }
+
+    /// A handler for a user without a stored password rejects every
+    /// password, including an empty one, but still completes.
+    #[test]
+    fn test_basic_password_auth_without_password_rejects_everything() {
+        for supplied in ["", "secret", "anything"] {
+            let mut handler = BasicPasswordAuthHandler::without_password("alice".to_string());
+            let result_tlv = handler
+                .process_inner_request(&password_response("alice", supplied))
+                .unwrap();
+            assert!(handler.is_complete(), "{supplied:?}");
+            assert_eq!(handler.get_result(), TeapResult::Failure, "{supplied:?}");
+            assert_eq!(
+                TeapResult::from_result_tlv(&result_tlv).unwrap(),
+                TeapResult::Failure
+            );
+            assert_eq!(handler.get_identity(), Some("alice".to_string()));
+        }
+    }
+
+    /// Passwords of the right length but different content still fail (the
+    /// constant-time comparison compares content, not only length).
+    #[test]
+    fn test_basic_password_auth_same_length_wrong_password_fails() {
+        let mut handler = BasicPasswordAuthHandler::new("alice".to_string(), "secret".to_string());
+        let _ = handler
+            .process_inner_request(&password_response("alice", "secreT"))
+            .unwrap();
+        assert_eq!(handler.get_result(), TeapResult::Failure);
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
     }
 
     #[test]
@@ -2650,6 +2833,120 @@ mod tests {
         server.phase = TeapPhase::Phase2ResultSent;
         let bad = server.process_result_ack(&[IdentityType::User.to_tlv()]);
         assert!(matches!(bad, Err(EapError::InvalidState)));
+    }
+
+    fn phase2_test_server() -> EapTeapServer {
+        use std::sync::Arc as StdArc;
+        let config = StdArc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(StdArc::new(
+                    rustls::server::ResolvesServerCertUsingSni::new(),
+                )),
+        );
+        let handler = BasicPasswordAuthHandler::new("alice".to_string(), "secret".to_string());
+        let mut server = EapTeapServer::with_inner_method(config, Box::new(handler));
+        server.initialize_connection().unwrap();
+        server.phase = TeapPhase::Phase2InnerAuth;
+        server
+    }
+
+    /// A second Identity-Type TLV is a protocol error, not another
+    /// Basic-Password-Auth-Req (which could be provoked without bound).
+    #[test]
+    fn test_phase2_repeated_identity_type_is_an_error() {
+        let mut server = phase2_test_server();
+        let first = server
+            .process_phase2_tlvs_test(&[IdentityType::User.to_tlv()])
+            .unwrap()
+            .unwrap();
+        let tlvs = TeapTlv::parse_tlvs(&first).unwrap();
+        assert_eq!(tlvs[0].get_type(), Some(TlvType::BasicPasswordAuthReq));
+
+        let again = server.process_phase2_tlvs_test(&[IdentityType::User.to_tlv()]);
+        assert!(
+            matches!(
+                again,
+                Err(EapError::Phase2LimitExceeded("repeated Identity-Type TLV"))
+            ),
+            "{again:?}"
+        );
+    }
+
+    /// The Phase 2 TLV history is capped; the message that would exceed the
+    /// cap is rejected before any of it is appended.
+    #[test]
+    fn test_phase2_tlv_history_is_bounded() {
+        let mut server = phase2_test_server();
+        let big = TeapTlv::new_raw(0x3FFF, false, vec![0u8; 40_000]);
+        // Unknown, non-mandatory TLV: ignored, but part of the history.
+        assert!(
+            server
+                .process_phase2_tlvs_test(std::slice::from_ref(&big))
+                .is_ok()
+        );
+        let len_before = server.phase2_tlv_history.len();
+        assert_eq!(len_before, big.to_bytes().len());
+
+        let overflow = server.process_phase2_tlvs_test(&[big]);
+        assert!(
+            matches!(overflow, Err(EapError::Phase2LimitExceeded("TLV history"))),
+            "{overflow:?}"
+        );
+        assert_eq!(
+            server.phase2_tlv_history.len(),
+            len_before,
+            "nothing appended on rejection"
+        );
+    }
+
+    #[test]
+    fn test_phase2_intermediate_results_are_bounded() {
+        let mut server = phase2_test_server();
+        let tlvs: Vec<TeapTlv> = (0..EapTeapServer::MAX_INTERMEDIATE_RESULTS)
+            .map(|_| TeapResult::Success.to_intermediate_result_tlv())
+            .collect();
+        assert!(server.process_phase2_tlvs_test(&tlvs).is_ok());
+        assert_eq!(
+            server.intermediate_results.len(),
+            EapTeapServer::MAX_INTERMEDIATE_RESULTS
+        );
+
+        let one_more =
+            server.process_phase2_tlvs_test(&[TeapResult::Success.to_intermediate_result_tlv()]);
+        assert!(
+            matches!(
+                one_more,
+                Err(EapError::Phase2LimitExceeded("Intermediate-Result TLVs"))
+            ),
+            "{one_more:?}"
+        );
+    }
+
+    /// Every reassembled Phase 2 message counts as a round; past the bound
+    /// the conversation fails before the message is even decrypted.
+    #[test]
+    fn test_phase2_round_limit() {
+        let mut server = phase2_test_server();
+        server.set_max_phase2_rounds(2);
+        let packet = EapTlsPacket::new(
+            crate::eap::eap_tls::TlsFlags::new(false, false, false),
+            None,
+            vec![0x17; 16],
+        );
+        for round in 1..=2 {
+            let r = server.process_client_message(&packet);
+            // Garbage TLS data fails at decryption, not at the round bound.
+            assert!(
+                !matches!(r, Err(EapError::Phase2LimitExceeded(_))),
+                "round {round}: {r:?}"
+            );
+        }
+        let third = server.process_client_message(&packet);
+        assert!(
+            matches!(third, Err(EapError::Phase2LimitExceeded("Phase 2 rounds"))),
+            "{third:?}"
+        );
     }
 
     #[test]

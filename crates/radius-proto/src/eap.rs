@@ -301,6 +301,12 @@ pub enum EapError {
     #[error("Invalid response format")]
     InvalidResponseFormat,
 
+    /// A per-conversation bound on EAP-TEAP Phase 2 state was exceeded
+    /// (TLV history, Intermediate-Result count, number of rounds, or a
+    /// repeated Identity-Type TLV). The conversation fails closed.
+    #[error("EAP-TEAP Phase 2 limit exceeded: {0}")]
+    Phase2LimitExceeded(&'static str),
+
     #[error("Encoding error: {0}")]
     EncodingError(String),
 

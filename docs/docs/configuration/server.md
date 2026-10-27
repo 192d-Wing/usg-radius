@@ -329,6 +329,56 @@ Burst capacity for global rate limiting.
 }
 ```
 
+## EAP (`eap` block)
+
+Optional. When present, the server answers Access-Requests that carry
+EAP-Message with EAP-TLS and/or EAP-TEAP (RFC 3579); the in-memory `users`
+list is the credential store for TEAP's inner Basic-Password-Auth. At least
+one of `enable_tls` and `enable_teap` must be set, or the server refuses to
+start.
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `tls.cert_path`, `tls.key_path` | string | required | Server certificate and private key (PEM), shared by both methods |
+| `tls.ca_path` | string | none | CA bundle used to verify supplicant certificates |
+| `tls.require_client_cert` | bool | `false` | Require and verify a supplicant certificate (EAP-TLS) |
+| `tls.revocation` | object | none | CRL/OCSP checking of supplicant certificates; needs `require_client_cert` and `ca_path` |
+| `enable_tls` | bool | `false` | Offer EAP-TLS (Type 13) |
+| `enable_teap` | bool | `false` | Offer EAP-TEAP (Type 55); offered before EAP-TLS when both are on |
+| `session_idle_timeout_secs` | integer ≥ 1 | `120` | Evict an EAP conversation after this long without a packet from the peer |
+| `max_sessions` | integer ≥ 1 | `4096` | Most live EAP conversations; the least recently used is evicted when full |
+
+**Example:**
+
+```json
+{
+  "eap": {
+    "enable_tls": true,
+    "enable_teap": false,
+    "tls": {
+      "cert_path": "/etc/radius/certs/server.pem",
+      "key_path": "/etc/radius/certs/server-key.pem",
+      "ca_path": "/etc/radius/certs/ca.pem",
+      "require_client_cert": true
+    },
+    "session_idle_timeout_secs": 120,
+    "max_sessions": 4096
+  }
+}
+```
+
+!!! warning "EAP-TEAP is opt-in"
+    `enable_teap` defaults to `false`. TEAP's only inner method is
+    Basic-Password-Auth, which compares the password the supplicant sends
+    inside the TLS tunnel against the password stored for that user in
+    `users`. A user without a stored password (unknown user, or a backend
+    that does not supply cleartext passwords) is always rejected; an empty
+    stored or supplied password is always rejected. The TEAP wire format is
+    not yet interoperable with wpa_supplicant (see
+    [RFC-COMPLIANCE](../protocol/RFC-COMPLIANCE.md)), and when TEAP is
+    enabled it is offered before EAP-TLS. Enable it only for supplicants you
+    have tested against this server.
+
 ## Complete Configuration Example
 
 ### Basic Configuration

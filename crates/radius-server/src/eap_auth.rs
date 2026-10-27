@@ -85,6 +85,11 @@ pub struct EapAuthHandler {
     /// Makes session IDs unique when one user starts several conversations
     /// within the same millisecond.
     session_seq: AtomicU64,
+
+    /// Override of the per-conversation EAP-TEAP Phase 2 round bound
+    /// (`None` = `EapTeapServer::MAX_PHASE2_ROUNDS`).
+    #[cfg(feature = "tls")]
+    teap_max_phase2_rounds: Option<u32>,
 }
 
 impl EapAuthHandler {
@@ -120,7 +125,16 @@ impl EapAuthHandler {
             evicted_idle: AtomicU64::new(0),
             evicted_capacity: AtomicU64::new(0),
             session_seq: AtomicU64::new(0),
+            #[cfg(feature = "tls")]
+            teap_max_phase2_rounds: None,
         }
+    }
+
+    /// Bound the number of Phase 2 messages a TEAP peer may send per
+    /// conversation (default `EapTeapServer::MAX_PHASE2_ROUNDS`).
+    #[cfg(feature = "tls")]
+    pub fn set_teap_max_phase2_rounds(&mut self, rounds: u32) {
+        self.teap_max_phase2_rounds = Some(rounds);
     }
 
     /// Bound the session store: evict a conversation after
@@ -225,9 +239,15 @@ impl EapAuthHandler {
         self.drop_method_state(std::iter::once(session_id));
     }
 
-    /// Release the conversation's state when `result` is terminal.
+    /// Release the conversation's state when `result` is terminal; mark the
+    /// session as recently used only when the packet advanced the
+    /// conversation (a Challenge). A rejected packet therefore never
+    /// refreshes a session's LRU position.
     fn finish(&self, session_id: &str, result: AuthResult) -> AuthResult {
-        if !matches!(result, AuthResult::Challenge { .. }) {
+        if matches!(result, AuthResult::Challenge { .. }) {
+            let mut manager = self.session_manager.write().unwrap();
+            manager.get_session_mut(session_id);
+        } else {
             self.end_session(session_id);
         }
         result
@@ -384,14 +404,15 @@ impl EapAuthHandler {
         Ok(())
     }
 
-    /// Resolve the session a RADIUS State attribute refers to, touching it
-    /// as recently used. `None` when there is no State or it names no live
-    /// session (expired, evicted, finished or never ours).
+    /// Resolve the session a RADIUS State attribute refers to, without
+    /// changing its LRU position (see [`Self::finish`]). `None` when there is
+    /// no State or it names no live session (expired, evicted, finished or
+    /// never ours).
     fn resolve_session(&self, state: Option<&[u8]>) -> Option<String> {
         // State format: session_id encoded as string
         let session_id = String::from_utf8(state?.to_vec()).ok()?;
-        let mut manager = self.session_manager.write().unwrap();
-        manager.get_session_mut(&session_id)?;
+        let manager = self.session_manager.read().unwrap();
+        manager.get_session(&session_id)?;
         Some(session_id)
     }
 
@@ -552,24 +573,41 @@ impl EapAuthHandler {
         });
 
         if let Some(config) = tls_config {
-            // Create inner authentication handler for Phase 2
-            // Get user credentials from inner handler
-            let password = self
-                .inner_handler
-                .get_user_password(username)
-                .unwrap_or_else(|| String::from(""));
-
-            let inner_method =
-                Box::new(radius_proto::eap::eap_teap::BasicPasswordAuthHandler::new(
-                    username.to_string(),
-                    password,
-                ));
+            // Inner authentication handler for Phase 2 (Basic-Password-Auth).
+            // When the inner handler has no password for this user (the
+            // backend does not supply cleartext passwords, or the user is
+            // unknown) the inner method fails closed: it never compares
+            // against a substituted empty password, and the tunnel still
+            // runs to completion so the peer learns nothing about whether
+            // the user exists.
+            use radius_proto::eap::eap_teap::BasicPasswordAuthHandler;
+            let inner_method: Box<BasicPasswordAuthHandler> =
+                match self.inner_handler.get_user_password(username) {
+                    Some(password) => Box::new(BasicPasswordAuthHandler::new(
+                        username.to_string(),
+                        password,
+                    )),
+                    None => {
+                        warn!(
+                            session_id,
+                            username,
+                            "start_eap_teap: inner handler has no password for this user; \
+                             Basic-Password-Auth will fail"
+                        );
+                        Box::new(BasicPasswordAuthHandler::without_password(
+                            username.to_string(),
+                        ))
+                    }
+                };
 
             // Create EAP-TEAP server for this session
             let mut teap_server = radius_proto::eap::eap_teap::EapTeapServer::with_inner_method(
                 StdArc::clone(config),
                 inner_method,
             );
+            if let Some(rounds) = self.teap_max_phase2_rounds {
+                teap_server.set_max_phase2_rounds(rounds);
+            }
             if let Err(e) = teap_server.initialize_connection() {
                 error!(session_id, error = ?e, "start_eap_teap: initialize_connection failed");
                 return AuthResult::Reject;
@@ -1119,18 +1157,17 @@ impl AuthHandler for EapAuthHandler {
         _password: Option<&str>,
         state: Option<&[u8]>,
     ) -> AuthResult {
-        // Get or create session
-        let session_id = self.get_or_create_session(username, state);
-
-        // Check if this is initial request or continuation
-        if state.is_none() {
-            // Initial request - start EAP-Identity
-            return self.handle_identity(username, &session_id);
+        // A continuation carries EAP-Message attributes, which this entry
+        // point cannot see: use authenticate_request. Reject without looking
+        // up or touching the session.
+        if state.is_some() {
+            return AuthResult::Reject;
         }
 
-        // This method doesn't have access to EAP-Message attributes
-        // Use authenticate_request instead
-        AuthResult::Reject
+        // Initial request - start EAP-Identity
+        let session_id = self.get_or_create_session(username, None);
+        let result = self.handle_identity(username, &session_id);
+        self.finish(&session_id, result)
     }
 
     fn authenticate_request(&self, request: &Packet, _secret: &[u8]) -> AuthResult {
@@ -1941,6 +1978,13 @@ mod eap_tls_mppe_tests {
         /// Extra non-mandatory TLV bytes appended to the Identity-Type
         /// response, to make it span fragments.
         identity_padding: usize,
+        /// Password the peer presents (`None` = the right one).
+        password: Option<String>,
+        /// Answer the server's Basic-Password-Auth-Req with another
+        /// Identity-Type TLV instead of a password (protocol error).
+        answer_password_request_with_identity_type: bool,
+        /// The server's Result TLV, once received; the peer echoes it.
+        server_result: Option<TeapResult>,
         /// Counts, for assertions.
         acks_received: usize,
         acks_sent: usize,
@@ -1972,6 +2016,9 @@ mod eap_tls_mppe_tests {
                 reassembly: Vec::new(),
                 history: Vec::new(),
                 identity_padding: 0,
+                password: None,
+                answer_password_request_with_identity_type: false,
+                server_result: None,
                 acks_received: 0,
                 acks_sent: 0,
                 phase2_fragments_received: 0,
@@ -2049,10 +2096,17 @@ mod eap_tls_mppe_tests {
                         }
                     }
                     Some(TlvType::BasicPasswordAuthReq) => {
+                        if self.answer_password_request_with_identity_type {
+                            out.push(IdentityType::User.to_tlv());
+                            continue;
+                        }
                         let mut value = Vec::new();
                         value.extend_from_slice(&(TEAP_USER.len() as u16).to_be_bytes());
                         value.extend_from_slice(TEAP_USER.as_bytes());
-                        let password = teap_password();
+                        let password = self
+                            .password
+                            .clone()
+                            .unwrap_or_else(|| teap_password().to_string());
                         value.extend_from_slice(&(password.len() as u16).to_be_bytes());
                         value.extend_from_slice(password.as_bytes());
                         out.push(TeapTlv::new(TlvType::BasicPasswordAuthResp, true, value));
@@ -2081,10 +2135,12 @@ mod eap_tls_mppe_tests {
                         return vec![response];
                     }
                     Some(TlvType::Result) => {
+                        // RFC 7170 §3.3.3: the peer acknowledges the server's
+                        // Result TLV with its own, agreeing with it.
                         let result = TeapResult::from_result_tlv(tlv).unwrap();
-                        assert_eq!(result, TeapResult::Success, "server Result TLV");
+                        self.server_result = Some(result);
                         self.peer_result_sent = true;
-                        out.push(TeapResult::Success.to_result_tlv());
+                        out.push(result.to_result_tlv());
                     }
                     other => panic!("unexpected server TLV {other:?}"),
                 }
@@ -2220,6 +2276,7 @@ mod eap_tls_mppe_tests {
         assert_eq!(msk.expect("MSK"), peer.msk(), "RFC 7170 §5.4 MSK agrees");
         // RFC 3748 §4.2: EAP-Success echoes the peer's last Response.
         assert_eq!(eap_success_identifier(&attributes), last_id);
+        assert_eq!(peer.server_result, Some(TeapResult::Success));
         assert!(peer.peer_result_sent, "peer acknowledged the Result TLV");
         assert!(
             peer.acks_sent >= 4,
@@ -2257,6 +2314,182 @@ mod eap_tls_mppe_tests {
             "every non-final peer fragment got an ACK: {}",
             peer.acks_received
         );
+    }
+
+    /// Drive a whole TEAP conversation that must end in Access-Reject, and
+    /// check that nothing of it is left behind.
+    fn assert_teap_rejected(handler: &EapAuthHandler, peer: &mut TeapPeer) {
+        let (result, _) = run_teap(handler, peer);
+        assert!(
+            matches!(result, AuthResult::Reject),
+            "expected Reject, got {result:?}"
+        );
+        assert_eq!(handler.active_session_count(), 0, "session released");
+        assert!(
+            handler.teap_sessions.read().unwrap().is_empty(),
+            "TEAP state released"
+        );
+    }
+
+    /// A TEAP handler whose inner handler knows the given users.
+    fn teap_handler_with_users(pki: &TestPki, users: &[(&str, &str)]) -> EapAuthHandler {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut inner = SimpleAuthHandler::new();
+        for (user, password) in users {
+            inner.add_user(*user, *password);
+        }
+        let mut handler = EapAuthHandler::new(Arc::new(inner));
+        handler
+            .configure_teap(
+                "",
+                TlsCertificateConfig::simple(pki.cert_path.clone(), pki.key_path.clone()),
+            )
+            .unwrap();
+        handler
+    }
+
+    #[test]
+    fn eap_teap_rejects_wrong_password() {
+        let pki = gen_pki();
+        let handler = teap_handler(&pki);
+        let mut peer = TeapPeer::new(&pki, 4096);
+        peer.password = Some(format!("{}x", teap_password()));
+        assert_teap_rejected(&handler, &mut peer);
+        assert_eq!(
+            peer.server_result,
+            Some(TeapResult::Failure),
+            "server sent Result=Failure before EAP-Failure"
+        );
+    }
+
+    /// A user the inner handler has no password for (every user with a
+    /// backend that does not supply cleartext passwords; an unknown user with
+    /// the in-memory backend) used to be compared against a substituted empty
+    /// password, so an empty supplied password was accepted. The tunnel now
+    /// completes with Result=Failure and Access-Reject.
+    #[test]
+    fn eap_teap_rejects_empty_password_for_user_without_stored_password() {
+        let pki = gen_pki();
+        // Inner handler knows no users at all: get_user_password → None.
+        let handler = teap_handler_with_users(&pki, &[]);
+        assert!(handler.get_user_password(TEAP_USER).is_none());
+        let mut peer = TeapPeer::new(&pki, 4096);
+        peer.password = Some(String::new());
+        assert_teap_rejected(&handler, &mut peer);
+        assert_eq!(peer.server_result, Some(TeapResult::Failure));
+
+        // Nor does the right password of some other user help.
+        let handler = teap_handler_with_users(&pki, &[("bob", teap_password())]);
+        let mut peer = TeapPeer::new(&pki, 4096);
+        assert_teap_rejected(&handler, &mut peer);
+        assert_eq!(peer.server_result, Some(TeapResult::Failure));
+    }
+
+    #[test]
+    fn eap_teap_rejects_empty_password_for_known_user() {
+        let pki = gen_pki();
+        let handler = teap_handler(&pki);
+        let mut peer = TeapPeer::new(&pki, 4096);
+        peer.password = Some(String::new());
+        assert_teap_rejected(&handler, &mut peer);
+        assert_eq!(peer.server_result, Some(TeapResult::Failure));
+    }
+
+    /// A user whose stored password is empty never authenticates, with or
+    /// without an empty supplied password.
+    #[test]
+    fn eap_teap_rejects_user_with_empty_stored_password() {
+        let pki = gen_pki();
+        for supplied in ["", "anything"] {
+            let handler = teap_handler_with_users(&pki, &[(TEAP_USER, "")]);
+            let mut peer = TeapPeer::new(&pki, 4096);
+            peer.password = Some(supplied.to_string());
+            assert_teap_rejected(&handler, &mut peer);
+            assert_eq!(
+                peer.server_result,
+                Some(TeapResult::Failure),
+                "{supplied:?}"
+            );
+        }
+    }
+
+    /// A peer that answers Basic-Password-Auth-Req with another Identity-Type
+    /// TLV used to be re-prompted without bound; it is now a protocol error.
+    #[test]
+    fn eap_teap_rejects_repeated_identity_type() {
+        let pki = gen_pki();
+        let handler = teap_handler(&pki);
+        let mut peer = TeapPeer::new(&pki, 4096);
+        peer.answer_password_request_with_identity_type = true;
+        assert_teap_rejected(&handler, &mut peer);
+        assert_eq!(
+            peer.server_result, None,
+            "conversation ended before any Result TLV"
+        );
+    }
+
+    /// The Phase 2 round bound ends the conversation: with a bound of one,
+    /// the peer's second Phase 2 message (its correct password) is rejected.
+    #[test]
+    fn eap_teap_rejects_past_phase2_round_limit() {
+        let pki = gen_pki();
+        let mut handler = teap_handler(&pki);
+        handler.set_teap_max_phase2_rounds(1);
+        let mut peer = TeapPeer::new(&pki, 4096);
+        assert_teap_rejected(&handler, &mut peer);
+        assert_eq!(peer.server_result, None);
+
+        // The same peer under the default bound authenticates.
+        let handler = teap_handler(&pki);
+        let mut peer = TeapPeer::new(&pki, 4096);
+        let (result, _) = run_teap(&handler, &mut peer);
+        assert!(matches!(result, AuthResult::Accept { .. }), "{result:?}");
+    }
+
+    fn lru_seq(handler: &EapAuthHandler, session_id: &str) -> u64 {
+        handler
+            .session_manager
+            .read()
+            .unwrap()
+            .get_session(session_id)
+            .expect("live session")
+            .lru_seq
+    }
+
+    /// Looking a session up for an inbound packet leaves its LRU position
+    /// alone; only a packet that advances the conversation (Challenge)
+    /// refreshes it, and a rejected packet releases it.
+    #[test]
+    fn eap_teap_rejected_packets_do_not_refresh_lru_position() {
+        let pki = gen_pki();
+        let handler = teap_handler(&pki);
+        let (state, start_eap) = teap_start(&handler);
+        let session_id = String::from_utf8(state.clone()).unwrap();
+        let seq_after_start = lru_seq(&handler, &session_id);
+
+        assert_eq!(
+            handler.resolve_session(Some(&state)),
+            Some(session_id.clone())
+        );
+        assert_eq!(lru_seq(&handler, &session_id), seq_after_start);
+
+        // The peer's ClientHello advances the conversation.
+        let mut peer = TeapPeer::new(&pki, 4096);
+        let response = peer.respond(&start_eap);
+        let result =
+            handler.authenticate_request(&access_request(2, &response, Some(&state)), SECRET);
+        assert!(matches!(result, AuthResult::Challenge { .. }));
+        assert!(lru_seq(&handler, &session_id) > seq_after_start);
+
+        // A malformed packet is rejected and the session is gone, so it can
+        // neither be refreshed nor displace anything.
+        let bad = EapTlsPacket::new(TlsFlags::new(false, true, false), None, vec![0x16; 10]);
+        let result = handler.authenticate_request(
+            &access_request(3, &teap_raw_response(7, bad), Some(&state)),
+            SECRET,
+        );
+        assert!(matches!(result, AuthResult::Reject));
+        assert!(handler.resolve_session(Some(&state)).is_none());
     }
 
     /// Server's Start, peer's first packet built by hand.
@@ -2517,6 +2750,21 @@ mod eap_tls_mppe_tests {
         handler.authenticate_request(&access_request(id, &response, Some(state)), SECRET)
     }
 
+    /// Advance conversation `state` with the peer's ClientHello: a packet
+    /// the server answers with a Challenge, which refreshes the session's
+    /// LRU position (merely looking it up does not).
+    fn advance_conversation(
+        handler: &EapAuthHandler,
+        pki: &TestPki,
+        state: &[u8],
+        id: u8,
+    ) -> AuthResult {
+        let mut peer = Supplicant::new(pki);
+        let start = EapTlsPacket::start().to_eap_request(id);
+        let response = peer.respond(&start);
+        handler.authenticate_request(&access_request(id, &response, Some(state)), SECRET)
+    }
+
     #[test]
     fn capacity_eviction_drops_least_recently_used_session_which_then_fails_closed() {
         let pki = gen_pki();
@@ -2528,8 +2776,11 @@ mod eap_tls_mppe_tests {
         assert_eq!(handler.active_session_count(), 2);
         assert_eq!(handler.tls_sessions.read().unwrap().len(), 2);
 
-        // Touch A so B becomes the least recently used.
-        assert!(handler.resolve_session(Some(&a)).is_some());
+        // Advance A so B becomes the least recently used.
+        assert!(matches!(
+            advance_conversation(&handler, &pki, &a, 10),
+            AuthResult::Challenge { .. }
+        ));
 
         // Third conversation: B is evicted.
         let _c = start_conversation(&handler, 3);
