@@ -32,9 +32,24 @@ usg_radius /path/to/custom-config.json
   "rate_limit_per_client_rps": 100,
   "rate_limit_per_client_burst": 200,
   "rate_limit_global_rps": 1000,
-  "rate_limit_global_burst": 2000
+  "rate_limit_global_burst": 2000,
+  "eap": {
+    "enable_tls": true,
+    "enable_teap": false,
+    "session_idle_timeout_secs": 120,
+    "max_sessions": 4096,
+    "tls": {
+      "cert_path": "/etc/radius/eap/server.pem",
+      "key_path": "/etc/radius/eap/server.key",
+      "ca_path": "/etc/radius/eap/supplicant-ca.pem",
+      "require_client_cert": true
+    }
+  }
 }
 ```
+
+The `eap` block is optional; without it the server answers EAP-Message
+requests with Access-Reject. See [EAP Settings](#eap-settings).
 
 ## Server Settings
 
@@ -329,55 +344,119 @@ Burst capacity for global rate limiting.
 }
 ```
 
-## EAP (`eap` block)
+## EAP Settings
 
-Optional. When present, the server answers Access-Requests that carry
-EAP-Message with EAP-TLS and/or EAP-TEAP (RFC 3579); the in-memory `users`
-list is the credential store for TEAP's inner Basic-Password-Auth. At least
-one of `enable_tls` and `enable_teap` must be set, or the server refuses to
-start.
-
-| Key | Type | Default | Meaning |
-|-----|------|---------|---------|
-| `tls.cert_path`, `tls.key_path` | string | required | Server certificate and private key (PEM), shared by both methods |
-| `tls.ca_path` | string | none | CA bundle used to verify supplicant certificates |
-| `tls.require_client_cert` | bool | `false` | Require and verify a supplicant certificate (EAP-TLS) |
-| `tls.revocation` | object | none | CRL/OCSP checking of supplicant certificates; needs `require_client_cert` and `ca_path` |
-| `enable_tls` | bool | `false` | Offer EAP-TLS (Type 13) |
-| `enable_teap` | bool | `false` | Offer EAP-TEAP (Type 55); offered before EAP-TLS when both are on |
-| `session_idle_timeout_secs` | integer ≥ 1 | `120` | Evict an EAP conversation after this long without a packet from the peer |
-| `max_sessions` | integer ≥ 1 | `4096` | Most live EAP conversations; the least recently used is evicted when full |
-
-**Example:**
+The optional `eap` object enables EAP-TLS (RFC 5216) and/or EAP-TEAP
+(RFC 7170) and bounds the server's per-conversation EAP state. It needs a
+binary built with the `tls` cargo feature (the release binary and the
+container image are); a binary built without it refuses a configuration that
+has an `eap` block. `examples/configs/eap-tls-revocation.json` shows the
+complete block.
+At least one of `enable_tls` and `enable_teap` must be set, or the
+server refuses to start. The in-memory `users` list is the credential
+store for TEAP's inner Basic-Password-Auth.
 
 ```json
 {
   "eap": {
     "enable_tls": true,
     "enable_teap": false,
-    "tls": {
-      "cert_path": "/etc/radius/certs/server.pem",
-      "key_path": "/etc/radius/certs/server-key.pem",
-      "ca_path": "/etc/radius/certs/ca.pem",
-      "require_client_cert": true
-    },
     "session_idle_timeout_secs": 120,
-    "max_sessions": 4096
+    "max_sessions": 4096,
+    "tls": {
+      "cert_path": "/etc/radius/eap/server.pem",
+      "key_path": "/etc/radius/eap/server.key",
+      "ca_path": "/etc/radius/eap/supplicant-ca.pem",
+      "require_client_cert": true,
+      "revocation": {
+        "mode": "crl_only",
+        "on_error": "fail_closed",
+        "crl": { "static_files": ["/etc/radius/eap/supplicant-ca.crl"] }
+      }
+    }
   }
 }
 ```
 
+### eap.tls
+
+TLS material shared by EAP-TLS and EAP-TEAP (Phase 1). Required when the
+`eap` block is present.
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `cert_path` | String | required | PEM server certificate chain presented to supplicants |
+| `key_path` | String | required | PEM private key for `cert_path` |
+| `ca_path` | String | none | PEM CA bundle used to verify supplicant certificates |
+| `require_client_cert` | Boolean | `false` | Require and verify a supplicant certificate (mutual TLS). EAP-TLS deployments set this to `true` |
+| `revocation` | Object | none | CRL/OCSP checking of supplicant certificates; requires `require_client_cert: true` and `ca_path`, and a binary built with the `revocation` feature. Fields as in `examples/configs/eap-tls-revocation.json` |
+
+The TLS stack is rustls with aws-lc-rs: TLS 1.2 and 1.3, no DTLS.
+
+### eap.enable_tls
+
+Offer EAP-TLS (EAP Type 13).
+
+- **Type**: Boolean
+- **Default**: `false`
+
+### eap.enable_teap
+
+Offer EAP-TEAP (EAP Type 55).
+
+- **Type**: Boolean
+- **Default**: `false`
+
+When both methods are enabled the server proposes TEAP first and does not
+yet honour an EAP-Nak asking for EAP-TLS instead, so an EAP-TLS-only
+population should leave `enable_teap` off. TEAP's wire format is not
+yet interoperable with wpa_supplicant (see
+[RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md#rfc-7170---tunnel-eap-teap)).
+
 !!! warning "EAP-TEAP is opt-in"
-    `enable_teap` defaults to `false`. TEAP's only inner method is
-    Basic-Password-Auth, which compares the password the supplicant sends
-    inside the TLS tunnel against the password stored for that user in
-    `users`. A user without a stored password (unknown user, or a backend
-    that does not supply cleartext passwords) is always rejected; an empty
-    stored or supplied password is always rejected. The TEAP wire format is
-    not yet interoperable with wpa_supplicant (see
-    [RFC-COMPLIANCE](../protocol/RFC-COMPLIANCE.md)), and when TEAP is
-    enabled it is offered before EAP-TLS. Enable it only for supplicants you
-    have tested against this server.
+    TEAP's only inner method is Basic-Password-Auth, which compares the
+    password the supplicant sends inside the TLS tunnel against the
+    password stored for that user in `users`. A user without a stored
+    password (unknown user, or a backend that does not supply cleartext
+    passwords) is always rejected; an empty stored or supplied password is
+    always rejected. Enable TEAP only for supplicants you have tested
+    against this server.
+
+### eap.session_idle_timeout_secs
+
+Seconds an EAP conversation may go without a packet from the peer before
+its state (the EAP session plus its EAP-TLS / EAP-TEAP TLS context) is
+evicted. The reaper runs on every incoming EAP packet, so the timeout holds
+on a quiet server too. An evicted conversation fails closed: the next
+Access-Request carrying its State is answered with Access-Reject +
+EAP-Failure and allocates nothing.
+
+- **Type**: Integer (seconds)
+- **Default**: `120`
+- **Validation**: must be at least 1 (`eap.session_idle_timeout_secs must be at least 1`)
+
+Conversations are also released as soon as they reach Access-Accept or
+Access-Reject, so this only governs abandoned ones. Set it above the
+supplicant's longest retransmission interval (wpa_supplicant and Windows
+retry within 30 s; eapol_test within 10 s).
+
+### eap.max_sessions
+
+Maximum number of live EAP conversations. When the store is full and a new
+conversation starts, the least recently used one is evicted (and fails
+closed as above). Continuations of live conversations never evict anything.
+
+- **Type**: Integer
+- **Default**: `4096`
+- **Validation**: must be at least 1 (`eap.max_sessions must be at least 1`)
+
+Each conversation holds a rustls connection plus at most 64 KiB of fragment
+reassembly, so the default bounds EAP state to a few hundred MiB in the worst
+case. Size it together with `rate_limit_per_client_rps` and
+`rate_limit_global_rps`: a peer within the rate limits can still fill the
+store and displace in-progress conversations once the cap is reached.
+Evictions are logged at debug level and counted in the
+`radius_eap_sessions_evicted_total{reason="idle"|"capacity"}` metric.
 
 ## Complete Configuration Example
 
@@ -518,6 +597,25 @@ Error: Port cannot be 0
 ```plain
 Error: Invalid listen address: 999.999.999.999
 ```
+
+**EAP session bounds:**
+
+```json
+{
+  "eap": {
+    "session_idle_timeout_secs": 0,
+    "tls": { "cert_path": "server.pem", "key_path": "server.key" }
+  }
+}
+```
+
+```plain
+Error: eap.session_idle_timeout_secs must be at least 1
+```
+
+`eap.max_sessions: 0` is rejected the same way, and `eap.tls.revocation`
+without `require_client_cert: true` and `ca_path` is rejected because there
+would be no supplicant certificate to check.
 
 ## Environment Variables
 

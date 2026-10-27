@@ -279,7 +279,7 @@ correct stripping of server-added Proxy-State on the response leg.
 
 **Fragmentation (100%)**:
 
-- ✅ Automatic fragmentation (configurable MTU, default 1020 bytes)
+- ✅ Automatic fragmentation (1020-byte fragments; `EapAuthHandler::set_max_fragment_size`, no config key yet)
 - ✅ Fragment reassembly, fail-closed: the first fragment of a fragmented
   message must carry L and a TLS Message Length of 1–65536 octets, a fragment
   may not carry the message past the announced length, a non-final fragment
@@ -321,9 +321,13 @@ correct stripping of server-added Proxy-State on the response leg.
 - ✅ Bounded session store: conversations are released on Access-Accept /
   Access-Reject, evicted after `eap.session_idle_timeout_secs` (default 120)
   of silence, and capped at `eap.max_sessions` (default 4096, least recently
-  used evicted first). An evicted conversation fails closed (its State is
-  rejected without allocating anything); evictions are logged and counted in
-  `radius_eap_sessions_evicted_total{reason}`
+  used evicted first). The idle reaper runs on every incoming EAP packet,
+  before its State is resolved, so an idle conversation is evicted whether or
+  not a new one starts and its own late packet cannot revive it. An evicted
+  conversation fails closed (its State is rejected without allocating
+  anything); evictions are logged and counted in
+  `radius_eap_sessions_evicted_total{reason}`. Configuration:
+  [server.md](../configuration/server.md#eap-settings)
 
 **RADIUS Integration (100%)**:
 
@@ -463,6 +467,22 @@ server does not originate tunnel attributes itself.
 - ✅ Multi-round authentication
 - ✅ EAP-TLS method (Type 13)
 
+- ✅ §4.1 Identifier: the first EAP-Request of a conversation continues the
+  NAS's sequence (Identity Response Identifier + 1) rather than starting at
+  0, so it never repeats the Identifier of the NAS's EAP-Request/Identity;
+  every later Request increments it
+- ✅ §4.2 EAP-Success / EAP-Failure Identifier echoes the peer's last
+  EAP-Response
+- ⚠️ §4.1 Identifier matching: an EAP-Response is not checked against the
+  Identifier of the outstanding Request, so a stale or duplicated Response
+  that reaches the server under a new RADIUS Identifier advances the
+  conversation (follow-up, together with the State redesign below)
+- ⚠️ State: the RADIUS State attribute is the session ID
+  (`username-millis-sequence`): predictable, not bound to the peer, able to
+  restart a live conversation when presented with a new Identity Response,
+  and longer than 253 octets for long User-Names. Replacing it with a random
+  16-octet ID keyed to the peer is a design change tracked as a follow-up
+
 ---
 
 ## RFC 5216 - EAP-TLS Authentication Protocol
@@ -499,11 +519,15 @@ wpa_supplicant / eapol_test (see below), so TEAP has no interop scenario.
 needs the inner handler to supply the user's password, which only the
 in-memory `users` list does.
 
-- ✅ §3.1 Fragmentation, both phases and directions: outbound TLS messages
+- ✅ §3.7 Fragmentation, both phases and directions: outbound TLS messages
   (handshake flights and encrypted TLV messages) are fragmented to the EAP
   MTU and sent one per peer ACK; inbound non-final fragments are ACKed and
   reassembled through the same bounded, fail-closed assembler as EAP-TLS; a
   peer that sends data while server fragments are pending is rejected
+- ✅ §3.7 L flag: set, with the TLS Message Length, on the first fragment of
+  a fragmented message and on no other message (EAP-TLS keeps L on every
+  first packet, which RFC 5216 permits and the interop suite was validated
+  against)
 - ✅ §3.3 Phase 2 opens in the TLS message that ends the handshake flight
   (Identity-Type TLV)
 - ✅ §3.3.3 Result exchange: the server's Result TLV is acknowledged by the
@@ -950,7 +974,7 @@ Total:         156+ tests
 1. ✅ **EAP-TLS** (v0.5.0) - Complete
 2. ⚠️ **EAP-TEAP** (v0.7.x, fragmentation unreleased) - Phase 1 (TLS tunnel)
    and Phase 2 TLV protocol complete through the RADIUS handler, with RFC
-   7170 §3.1 fragmentation in both phases and directions, the §3.3.3 Result
+   7170 §3.7 fragmentation in both phases and directions, the §3.3.3 Result
    acknowledgement, history-aware Crypto-Binding compound MAC and RFC 5705
    `session_key_seed` derivation. Not yet interoperable with wpa_supplicant:
    the Crypto-Binding TLV is not in the §4.2.13 format (68 octets / one
@@ -1011,7 +1035,7 @@ Total:         156+ tests
 | Accounting Port 1813 | 2866 | ⚠️ Not bound | - | MEDIUM | Single UDP socket on listen_port |
 | Proxy-State | 2865 | ⚠️ Echoed | v0.x | MEDIUM | Ordering tests pending |
 | Hot Reload | - | ❌ Deferred | - | MEDIUM | Only mgmt access policy reloads on SIGHUP |
-| EAP-TEAP | 7170 | ⚠️ Phase 1+2, off by default | v0.7.x | MEDIUM | §3.1 fragmentation both ways, §3.3.3 Result ack, MSK (§5.4) as MS-MPPE keys; Basic-Password-Auth fails closed, Phase 2 state bounded; Crypto-Binding TLV not in §4.2.13 format (no wpa_supplicant interop yet); inner methods with real IMSK pending |
+| EAP-TEAP | 7170 | ⚠️ Phase 1+2, off by default | v0.7.x | MEDIUM | §3.7 fragmentation both ways, §3.3.3 Result ack, MSK (§5.4) as MS-MPPE keys; Basic-Password-Auth fails closed, Phase 2 state bounded; Crypto-Binding TLV not in §4.2.13 format (no wpa_supplicant interop yet); inner methods with real IMSK pending |
 
 ---
 
@@ -1158,6 +1182,7 @@ The current implementation is **PRODUCTION-READY** for:
    - ✅ EAP session store bounded: idle timeout (default 120 s) and LRU cap (default 4096) on conversations and their TLS state, released on Accept/Reject; evicted conversations fail closed; `radius_eap_sessions_evicted_total` counter
    - ✅ EAP-TEAP Phase 2 state bounded per conversation (TLV history 64 KiB, 16 Intermediate-Results, 32 rounds, repeated Identity-Type TLV rejected), fail closed; a rejected packet never refreshes a session's LRU position
    - ⚠️ Capacity eviction is LRU, so a peer within the rate limits can still displace in-progress conversations once the cap is reached; size `eap.max_sessions` and the rate limits together
+   - ⚠️ EAP Identifier not matched on responses and State = `username-millis-sequence` (predictable, unbound to the peer, can restart a live conversation, may exceed 253 octets); redesign as random peer-bound IDs is a tracked follow-up (see RFC 3748 above)
    - ⚠️ EAP-TEAP wire format not yet interoperable with wpa_supplicant (Crypto-Binding TLV, version bits); do not enable TEAP for production supplicants
 
 5. **EAP-TEAP Inner Authentication**
@@ -1221,7 +1246,7 @@ The USG RADIUS server is **production-ready** for modern enterprise deployments 
 - **v0.10.1**: Container image built with the `tls` feature
 - **v0.11.0**: **MS-MPPE-Send/Recv-Key (RFC 2548)** on EAP Access-Accepts, RFC 9190 TLS 1.3 exporter labels + EAP-Key-Name, EAP-TEAP IMCK/CMK (RFC 7170 §5.2) and MSK (§5.4), Vendor-Specific and Tunnel-Password codecs, proxy re-keying of User-Password / Message-Authenticator (request leg) and MS-MPPE / Tunnel-Password / Message-Authenticator (response leg), signed proxy timeout rejects
 - **v0.12.0**: **Certificate revocation checking (RFC 5280 / RFC 6960)** wired into EAP-TLS and RadSec via the `revocation` block, fail-closed by default; EAP-Failure on every EAP Access-Reject (RFC 3579 §2.6.3); interop harness (revoked supplicant, 24 assertions) running in CI
-- **Unreleased**: EAP-TEAP fragmentation in both phases and directions (RFC 7170 §3.1) through the bounded reassembler, Phase 2 opened with the handshake flight (§3.3), Result TLV acknowledgement (§3.3.3), EAP-Success Identifier echoing the peer's last Response (RFC 3748 §4.2); bounded EAP session store (idle timeout + LRU cap, released on Accept/Reject, fail closed, `radius_eap_sessions_evicted_total`); EAP-TEAP Basic-Password-Auth fails closed (fixes an unreleased empty-password bypass), Phase 2 state bounded, `eap.enable_teap` default `false`
+- **Unreleased**: EAP-TEAP fragmentation in both phases and directions (RFC 7170 §3.7) through the bounded reassembler, L flag only on fragmented TEAP messages, Phase 2 opened with the handshake flight (§3.3), Result TLV acknowledgement (§3.3.3), EAP-Success Identifier echoing the peer's last Response (RFC 3748 §4.2), first EAP-Request Identifier following the NAS's Identity Request (RFC 3748 §4.1); bounded EAP session store (idle timeout enforced on every packet + LRU cap, released on Accept/Reject, fail closed, `radius_eap_sessions_evicted_total`); `eap` block documented; EAP-TEAP Basic-Password-Auth fails closed (fixes an unreleased empty-password bypass), Phase 2 state bounded, `eap.enable_teap` default `false`
 
 ---
 

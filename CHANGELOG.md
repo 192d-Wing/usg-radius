@@ -90,7 +90,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flight or encrypted TLVs) is queued and sent in fragments of at most the EAP
   MTU (1020 bytes), one per peer ACK; previously only the first fragment was
   ever sent and the peer's ACK was fed to rustls as data. A peer that sends
-  data while server fragments are pending is rejected (RFC 7170 §3.1).
+  data while server fragments are pending is rejected (RFC 7170 §3.7).
 - **EAP-TEAP conversations now complete through the handler.** The TEAP TLS
   connection was never initialized by `start_eap_teap`, so the first TEAP
   packet failed with `InvalidState`; the first Phase 2 TLV (Identity-Type)
@@ -107,6 +107,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **EAP session IDs collide no more** when one user starts several
   conversations within the same millisecond (a per-handler sequence number is
   appended).
+- **The first EAP-Request of a conversation follows the NAS's Identifier
+  (RFC 3748 §4.1).** The EAP-TLS / EAP-TEAP Start used to carry Identifier 0
+  regardless of the EAP-Request/Identity the NAS had sent, so one
+  conversation in 256 reused the Identity Request's Identifier and the
+  supplicant treated the Start as a retransmission. The server now seeds the
+  Identifier sequence from the peer's Identity Response (Identifier + 1).
+- **EAP-TEAP sets the L flag only on fragmented messages (RFC 7170 §3.7).**
+  An unfragmented TEAP message carried L and a TLS Message Length; §3.7 says
+  L "MUST NOT be present for any other message". EAP-TLS is unchanged (RFC
+  5216 permits L on an unfragmented message and the interop suite was
+  validated with it); `fragment_tls_message_with` takes a
+  `LengthFlagPolicy` and `EapTeapServer` selects `FragmentedOnly`.
+- **The EAP idle timeout is enforced on every incoming EAP packet**, not only
+  when a new conversation ran the reaper: `EapAuthHandler::reap_idle_at` runs
+  before the packet's State is resolved, so an idle conversation is evicted
+  even on a quiet server and its own late packet is rejected instead of
+  reviving it. Capacity (LRU) eviction still runs only before a new
+  conversation is created, so a continuation never displaces a live one.
+- RFC 7170 fragmentation is cited as §3.7 (was §3.1, which is Version
+  Negotiation) in code comments, `RFC-COMPLIANCE.md`, `INTEROP_TESTING.md`
+  and this file.
+
+### Changed
+
+- `EapTlsContext` and `CryptoBinding` no longer derive `Debug`: their
+  implementations print the lengths of the master secret, MSK, EMSK, IMCK and
+  CMK, never the bytes (as `MppeKeys` already did).
+
+### Documentation
+
+- The `eap` configuration block (`tls`, `enable_tls`, `enable_teap`,
+  `session_idle_timeout_secs`, `max_sessions`) is documented in
+  `docs/docs/configuration/server.md`, with defaults and validation rules;
+  `examples/README.md` points at `examples/configs/eap-tls-revocation.json`.
+  `RFC-COMPLIANCE.md` records EAP Identifier matching and the State redesign
+  (random, peer-bound session IDs) as a follow-up gap.
 
 ## [0.12.0] - 2026-10-26
 

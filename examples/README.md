@@ -15,7 +15,8 @@ examples/
 │   ├── basic-homelab.json   # Minimal config for testing
 │   ├── small-business.json  # SMB production config
 │   ├── enterprise.json      # Enterprise/high-scale config
-│   └── docker.json          # Container/Kubernetes config (env-var driven)
+│   ├── docker.json          # Container/Kubernetes config (env-var driven)
+│   └── eap-tls-revocation.json  # EAP-TLS with the full `eap` block and CRL/OCSP revocation
 ├── proxy_config.json        # RADIUS proxy configuration example
 ├── postgres_schema.sql      # PostgreSQL schema (auth + accounting)
 ├── postgres-schema.sql      # PostgreSQL schema (alternate)
