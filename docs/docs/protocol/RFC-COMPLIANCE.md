@@ -4,7 +4,7 @@ This document identifies gaps between the current USG RADIUS implementation and 
 
 ## Summary
 
-**Overall Status**: Production-ready for modern enterprise authentication with EAP-TLS over RadSec, server-originated CoA/Disconnect, certificate revocation checking, comprehensive rate limiting, accounting, and security features. Reflects the code at **v0.11.1 + unreleased main** (revocation integration).
+**Overall Status**: Production-ready for modern enterprise authentication with EAP-TLS over RadSec, server-originated CoA/Disconnect, certificate revocation checking, comprehensive rate limiting, accounting, and security features. Reflects the code at **v0.12.0**.
 
 **Implemented**: Core RADIUS authentication (RFC 2865, PAP + CHAP), Accounting (RFC 2866), Message-Authenticator (RFC 2869 / RFC 3579), EAP-TLS (RFC 5216 / RFC 9190), MS-MPPE key delivery (RFC 2548), RadSec (RFC 6614), CoA/Disconnect (RFC 5176), certificate revocation checking (RFC 5280 CRL, RFC 6960 OCSP) for EAP-TLS supplicant and RadSec NAS certificates, RADIUS proxy with secret re-keying on both legs, Rate Limiting, DoS Protection
 **Partial**: EAP-TEAP (RFC 7170) inner methods, Status-Server (RFC 5997) edge cases, OCSP response signature verification
@@ -19,11 +19,11 @@ This document identifies gaps between the current USG RADIUS implementation and 
 - ✅ v0.5.0: EAP-TLS with production key extraction (RFC 5216)
 - ✅ v0.6.0: PostgreSQL and LDAP backends, health checks, Prometheus metrics
 - ✅ v0.7.x: RADIUS proxy, EAP-TEAP Phase 1+2, CRL/OCSP module (`revocation` feature)
-- ✅ Unreleased: CRL/OCSP revocation checking wired into EAP-TLS and RadSec client-certificate verification (`revocation` block, fail-closed default)
 - ✅ v0.9.0: Kubernetes-only deployment, management API mTLS + ABAC, live session index
 - ✅ v0.10.0: RadSec transport (RFC 6614), server-originated CoA/Disconnect (RFC 5176), Message-Authenticator required on EAP requests
 - ✅ v0.10.1: Container image built with the `tls` feature (RadSec / EAP-TLS fix)
 - ✅ v0.11.0: MS-MPPE-Send/Recv-Key (RFC 2548) on EAP Access-Accepts, RFC 9190 TLS 1.3 exporter labels + EAP-Key-Name, RFC 7170 §5.2 IMCK/CMK and §5.4 MSK, Vendor-Specific and Tunnel-Password codecs, proxy re-keying of User-Password / Message-Authenticator / MS-MPPE / Tunnel-Password
+- ✅ v0.12.0: CRL/OCSP revocation checking wired into EAP-TLS and RadSec client-certificate verification (`revocation` block, fail-closed default), EAP-Failure on every EAP Access-Reject, interop harness (24 assertions incl. a revoked supplicant) running in CI
 
 ---
 
@@ -272,20 +272,19 @@ correct stripping of server-added Proxy-State on the response leg.
 - ✅ Packet parsing and encoding
 - ✅ EAP-TLS Start packet
 - ✅ TLS handshake data packets
-- ✅ TLS acknowledgment packets, in both directions: the server ACKs every
-  non-final supplicant fragment with an EAP-TLS Request carrying no data
-  (RFC 5216 §2.1.5; interop scenarios 8 and 9)
+- ✅ TLS acknowledgment packets, both directions: the peer's ACKs for our
+  fragments, and our empty EAP-TLS Request for each non-final peer fragment
+  (RFC 5216 §2.1.5; v0.12.0, verified against eapol_test with `fragment_size=300`,
+  interop scenarios 8 and 9)
 
 **Fragmentation (100%)**:
 
 - ✅ Automatic fragmentation (configurable MTU, default 1020 bytes)
-- ✅ Fragment reassembly with validation, bounded and fail-closed: L and the
-  TLS Message Length required on the first fragment of a fragmented message
-  (§3.1), announced length 1..64 KiB, overrun rejected before buffering,
-  empty non-final fragments rejected, assembler reset on every error, peer
-  S bit rejected (§3.2); every error ends the conversation with
-  Access-Reject + EAP-Failure
-- ✅ Multi-fragment handshake support (server and supplicant side)
+- ✅ Fragment reassembly, fail-closed: the first fragment of a fragmented
+  message must carry L and a TLS Message Length of 1–65536 octets, a fragment
+  may not carry the message past the announced length, a non-final fragment
+  must carry data, and a peer-sent S bit is rejected (v0.12.0)
+- ✅ Multi-fragment handshake support in both directions
 - ✅ TLS Message Length field handling
 - ✅ More Fragments (M) flag coordination
 
@@ -476,21 +475,22 @@ See EAP-TLS section under RFC 2869 for complete details.
 
 **Key RFC 5216 Compliance**:
 
-- ✅ Section 2.1.1: Base case (full handshake, mutual authentication)
-- ✅ Section 2.1.3: Termination (EAP-Failure on every failed conversation)
-- ✅ Section 2.1.5: Fragmentation — outbound fragmentation to the EAP MTU,
-  ACK of every non-final supplicant fragment, bounded fail-closed reassembly
-- ✅ Section 2.3: Key Derivation — MSK/EMSK (64 bytes each) from the RFC 5705
-  exporter (`"client EAP encryption"`; RFC 9190 §2.3 labels for TLS 1.3)
-- ✅ Section 3.1: Packet format — Flags (L/M/S), TLS Message Length, TLS Data
-- ✅ Section 3.2: EAP-TLS Start (S only valid from the server; a peer S bit
-  is rejected)
+- ✅ Section 2.1.1: Base case (server-only and mutual authentication)
+- ✅ Section 2.1.5: Fragmentation — outgoing fragments of at most 1020 octets
+  (L and TLS Message Length on the first, M on all but the last); each
+  non-final peer fragment acknowledged with an EAP-TLS Request carrying no
+  data; reassembly bounded at 64 KiB and fail-closed (v0.12.0)
+- ✅ Section 2.3: Key hierarchy — MSK and EMSK, 64 octets each, from the
+  RFC 5705 exporter (`client EAP encryption`); TLS 1.3 uses RFC 9190 §2.3
+- ✅ Section 3.1 / 3.2: Request and Response packet format — Flags (L/M/S),
+  TLS Message Length only with L, TLS Data; S accepted only on our own Start
+- ⚠️ Section 2.1.2: Session resumption not implemented (full handshake only)
 
 ---
 
 ## RFC 7170 - Tunnel EAP (TEAP)
 
-### ⚠️ Partial Implementation (v0.7.x, fragmentation and completion unreleased)
+### ⚠️ Partial Implementation (v0.7.x; fragmentation and completion unreleased)
 
 **Status**: ⚠️ Phase 1 and Phase 2 state machines complete and tested against
 an in-memory rustls peer; wire format not yet interoperable with
@@ -694,7 +694,7 @@ Set `"audit_log_path": "stdout"` (or `"-"`) to emit JSON Lines on stdout for the
 
 #### Certificate Revocation (CRL/OCSP) ✅ INTEGRATED
 
-**Status**: ✅ Wired into EAP-TLS and RadSec client-certificate verification (unreleased, after v0.11.1)
+**Status**: ✅ Wired into EAP-TLS and RadSec client-certificate verification (v0.12.0)
 **RFC**: RFC 5280 (CRL), RFC 6960 (OCSP), RFC 8954 (OCSP nonce)
 
 **Implemented** (`revocation` cargo feature of `radius-server`, which enables `radius-proto`'s; built into the container image, the release binary and the interop image):
@@ -945,7 +945,7 @@ Total:         156+ tests
    pending
 4. ❌ **Hot Configuration Reload** - Deferred (only the mgmt access policy reloads on SIGHUP)
 5. ⚠️ **Health Monitoring** - Basic Status-Server implemented; Message-Authenticator not verified, always Access-Accept
-6. ✅ **Certificate Revocation (CRL/OCSP)** - CRL (static files + Distribution Points) and OCSP checking of EAP-TLS supplicant and RadSec NAS certificates via the `revocation` block, fail-closed by default (unreleased); CRL/OCSP signature verification still pending
+6. ✅ **Certificate Revocation (CRL/OCSP)** - CRL (static files + Distribution Points) and OCSP checking of EAP-TLS supplicant and RadSec NAS certificates via the `revocation` block, fail-closed by default (v0.12.0); CRL/OCSP signature verification still pending
 7. ✅ **MS-MPPE Keys** - MS-MPPE-Send/Recv-Key (RFC 2548 §2.4) attached to EAP Access-Accepts (v0.11.0)
 
 ### Priority 4 (LOW) - ❌ NOT PLANNED
@@ -987,7 +987,7 @@ Total:         156+ tests
 | CoA/Disconnect | 5176 | ✅ RadSec only | v0.10.0 | MEDIUM | Server-originated via mgmt API; no UDP path |
 | NAS Identification | 2865 | ✅ Complete | v0.2.0 | MEDIUM | NAS-IP-Address or NAS-Identifier enforced |
 | Enumerated Values | 2865 | ✅ Strict mode | v0.2.0 | LOW | Lenient mode accepts unknown values |
-| Certificate Revocation | 5280 / 6960 | ✅ Integrated | v0.7.x / unreleased | HIGH | `revocation` block for EAP-TLS + RadSec, fail-closed default; CRL/OCSP signatures not verified |
+| Certificate Revocation | 5280 / 6960 | ✅ Integrated | v0.7.x / v0.12.0 | HIGH | `revocation` block for EAP-TLS + RadSec, fail-closed default; CRL/OCSP signatures not verified |
 | Accounting Port 1813 | 2866 | ⚠️ Not bound | - | MEDIUM | Single UDP socket on listen_port |
 | Proxy-State | 2865 | ⚠️ Echoed | v0.x | MEDIUM | Ordering tests pending |
 | Hot Reload | - | ❌ Deferred | - | MEDIUM | Only mgmt access policy reloads on SIGHUP |
@@ -1194,9 +1194,10 @@ The USG RADIUS server is **production-ready** for modern enterprise deployments 
 - **v0.10.0**: **RadSec (RFC 6614)** transport, **CoA/Disconnect (RFC 5176)** over RadSec, Message-Authenticator required on EAP requests, NAS-IPv6-Address, Termination-Action
 - **v0.10.1**: Container image built with the `tls` feature
 - **v0.11.0**: **MS-MPPE-Send/Recv-Key (RFC 2548)** on EAP Access-Accepts, RFC 9190 TLS 1.3 exporter labels + EAP-Key-Name, EAP-TEAP IMCK/CMK (RFC 7170 §5.2) and MSK (§5.4), Vendor-Specific and Tunnel-Password codecs, proxy re-keying of User-Password / Message-Authenticator (request leg) and MS-MPPE / Tunnel-Password / Message-Authenticator (response leg), signed proxy timeout rejects
-- **Unreleased**: **Certificate revocation checking (RFC 5280 / RFC 6960)** wired into EAP-TLS and RadSec via the `revocation` block, fail-closed by default; EAP-Failure on every EAP Access-Reject (RFC 3579 §2.6.3); EAP-TLS ACK of supplicant fragments (RFC 5216 §2.1.5) with bounded fail-closed reassembly; EAP-TEAP fragmentation in both phases (RFC 7170 §3.1), Result acknowledgement (§3.3.3) and EAP-Success Identifier (RFC 3748 §4.2); bounded EAP session store (idle timeout + LRU cap, fail closed)
+- **v0.12.0**: **Certificate revocation checking (RFC 5280 / RFC 6960)** wired into EAP-TLS and RadSec via the `revocation` block, fail-closed by default; EAP-Failure on every EAP Access-Reject (RFC 3579 §2.6.3); interop harness (revoked supplicant, 24 assertions) running in CI
+- **Unreleased**: EAP-TEAP fragmentation in both phases and directions (RFC 7170 §3.1) through the bounded reassembler, Phase 2 opened with the handshake flight (§3.3), Result TLV acknowledgement (§3.3.3), EAP-Success Identifier echoing the peer's last Response (RFC 3748 §4.2); bounded EAP session store (idle timeout + LRU cap, released on Accept/Reject, fail closed, `radius_eap_sessions_evicted_total`)
 
 ---
 
-*Last Updated: 2026-10-25*
-*Document Version: 3.2 (Revocation integrated: CRL/OCSP checking of EAP-TLS and RadSec client certificates, EAP-Failure on EAP rejects)*
+*Last Updated: 2026-10-26*
+*Document Version: 3.3 (v0.12.0 release: CRL/OCSP checking of EAP-TLS and RadSec client certificates, EAP-Failure on EAP rejects, interop harness in CI)*

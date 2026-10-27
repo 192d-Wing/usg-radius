@@ -734,9 +734,10 @@ impl EapAuthHandler {
             // No outbound handshake data. Either the handshake just
             // finished, or rustls is still waiting for more from the peer.
             Ok(None) => {
-                // RFC 5216 §2.1.5: a Response with M set is answered with an
-                // EAP-TLS Request carrying no data (ACK) so the peer sends
-                // the next fragment. The reassembler bounds what we buffer.
+                // RFC 5216 §2.1.5: a Response with the M bit set is answered
+                // with an EAP-Request of Type EAP-TLS carrying no data (flags
+                // 0x00, no TLS Message Length), so the peer sends the next
+                // fragment. The reassembler has already bounded the buffer.
                 if tls_packet.flags.more_fragments() {
                     let ack =
                         EapTlsPacket::new(TlsFlags::new(false, false, false), None, Vec::new());
@@ -744,7 +745,7 @@ impl EapAuthHandler {
                     debug!(
                         session_id,
                         identifier = id,
-                        "continue_eap_tls: ACKing peer fragment"
+                        "continue_eap_tls: ACKing non-final peer fragment"
                     );
                     return make_challenge(ack, id).unwrap_or(AuthResult::Reject);
                 }
@@ -1696,6 +1697,10 @@ mod eap_tls_mppe_tests {
         let ack_eap = eap_from_radius_packet(&ack_packet).unwrap().unwrap();
         assert_eq!(ack_eap.code, EapCode::Request);
         assert_eq!(ack_eap.eap_type, Some(EapType::Tls));
+        // RFC 3748 §4.1: the ACK is a new Request, so its Identifier differs
+        // from the Start's; reusing it would read as a retransmitted Start and
+        // make the peer resend its first fragment forever.
+        assert_ne!(ack_eap.identifier, start_eap.identifier);
 
         let ack_tls = EapTlsPacket::from_eap_data(&ack_eap.data).unwrap();
         assert_eq!(ack_tls.flags.as_u8(), 0);

@@ -2000,7 +2000,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radius-proto"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "chrono",
  "dashmap",
@@ -2022,7 +2022,7 @@ dependencies = [
 
 [[package]]
 name = "radius-server"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -3194,7 +3194,7 @@ dependencies = [
 
 [[package]]
 name = "usg-radius-workspace"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "base64 0.22.1",
  "bcrypt",
