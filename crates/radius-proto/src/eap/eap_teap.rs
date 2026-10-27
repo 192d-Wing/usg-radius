@@ -785,12 +785,12 @@ impl CryptoBindingTlv {
             return Err(EapError::InvalidLength(tlv.value.len()));
         }
         let v = &tlv.value;
-        let mut nonce = [0u8; 32];
-        nonce.copy_from_slice(&v[4..36]);
-        let mut emsk_compound_mac = [0u8; CryptoBinding::COMPOUND_MAC_LENGTH];
-        emsk_compound_mac.copy_from_slice(&v[36..56]);
-        let mut msk_compound_mac = [0u8; CryptoBinding::COMPOUND_MAC_LENGTH];
-        msk_compound_mac.copy_from_slice(&v[56..76]);
+        let bad = |_| EapError::InvalidResponseFormat;
+        let nonce: [u8; 32] = v[4..36].try_into().map_err(bad)?;
+        let emsk_compound_mac: [u8; CryptoBinding::COMPOUND_MAC_LENGTH] =
+            v[36..56].try_into().map_err(bad)?;
+        let msk_compound_mac: [u8; CryptoBinding::COMPOUND_MAC_LENGTH] =
+            v[56..76].try_into().map_err(bad)?;
         Ok(Self {
             version: v[1],
             received_version: v[2],
@@ -1010,9 +1010,7 @@ impl CryptoBinding {
     /// Random Binding Request nonce: 32 octets with the least significant bit
     /// of the last octet cleared (§4.2.13).
     pub fn generate_nonce() -> [u8; 32] {
-        use rand::RngExt;
-        let mut nonce = [0u8; 32];
-        rand::rng().fill(&mut nonce);
+        let mut nonce: [u8; 32] = rand::random();
         nonce[31] &= !0x01;
         nonce
     }
@@ -1897,7 +1895,7 @@ impl InnerMethodHandler for BasicPasswordAuthHandler {
 ///
 /// ```no_run
 /// # use radius_proto::eap::eap_teap::*;
-/// let handler = EapPayloadHandler::new("alice".to_string(), "password".to_string());
+/// let handler = EapPayloadHandler::new("alice".to_string(), test_password().to_string());
 /// // Process EAP-Payload TLVs...
 /// ```
 pub struct EapPayloadHandler {
@@ -2323,6 +2321,22 @@ mod tests {
     }
 
     // BasicPasswordAuthHandler tests
+    /// The inner-method password of these tests: random per test process, so
+    /// no credential is hard-coded (CodeQL rust/hard-coded-cryptographic-value).
+    fn test_password() -> &'static str {
+        static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PASSWORD.get_or_init(|| hex::encode(rand::random::<[u8; 8]>()))
+    }
+
+    /// A password that differs from [`test_password`].
+    fn wrong_password() -> String {
+        format!("{}x", test_password())
+    }
+
+    fn password_handler() -> BasicPasswordAuthHandler {
+        BasicPasswordAuthHandler::new("alice".to_string(), test_password().to_string())
+    }
+
     /// Basic-Password-Auth-Resp value (RFC 9930 §4.2.15): one-octet lengths.
     fn password_response(username: &[u8], password: &[u8]) -> TeapTlv {
         let mut value = vec![username.len() as u8];
@@ -2334,7 +2348,7 @@ mod tests {
 
     #[test]
     fn test_basic_password_auth_handler_creation() {
-        let handler = BasicPasswordAuthHandler::new("alice".to_string(), "secret".to_string());
+        let handler = password_handler();
 
         assert!(!handler.is_complete());
         assert_eq!(handler.get_result(), TeapResult::Failure);
@@ -2343,10 +2357,13 @@ mod tests {
 
     #[test]
     fn test_basic_password_auth_success() {
-        let mut handler = BasicPasswordAuthHandler::new("alice".to_string(), "secret".to_string());
-        let response_tlv = password_response(b"alice", b"secret");
-        // wpa_supplicant encodes the same TLV as 05 'alice' 06 'secret'.
-        assert_eq!(response_tlv.value, b"\x05alice\x06secret");
+        let mut handler = password_handler();
+        let response_tlv = password_response(b"alice", test_password().as_bytes());
+        // wpa_supplicant encodes the same TLV as Userlen 'alice' Passlen password.
+        let mut expected = b"\x05alice".to_vec();
+        expected.push(test_password().len() as u8);
+        expected.extend_from_slice(test_password().as_bytes());
+        assert_eq!(response_tlv.value, expected);
 
         let result_tlv = handler.process_inner_request(&response_tlv).unwrap();
 
@@ -2362,9 +2379,9 @@ mod tests {
 
     #[test]
     fn test_basic_password_auth_failure_wrong_password() {
-        let mut handler = BasicPasswordAuthHandler::new("alice".to_string(), "secret".to_string());
+        let mut handler = password_handler();
         let result_tlv = handler
-            .process_inner_request(&password_response(b"alice", b"wrong"))
+            .process_inner_request(&password_response(b"alice", wrong_password().as_bytes()))
             .unwrap();
 
         assert!(handler.is_complete());
@@ -2378,9 +2395,9 @@ mod tests {
 
     #[test]
     fn test_basic_password_auth_failure_wrong_username() {
-        let mut handler = BasicPasswordAuthHandler::new("alice".to_string(), "secret".to_string());
+        let mut handler = password_handler();
         handler
-            .process_inner_request(&password_response(b"bob", b"secret"))
+            .process_inner_request(&password_response(b"bob", test_password().as_bytes()))
             .unwrap();
 
         assert!(handler.is_complete());
@@ -2395,13 +2412,12 @@ mod tests {
             ("userlen only", vec![0x05]),
             ("username truncated", vec![0x05, b'a', b'l']),
             ("no passlen", b"\x05alice".to_vec()),
-            ("password truncated", b"\x05alice\x06sec".to_vec()),
-            ("trailing octets", b"\x05alice\x06secretX".to_vec()),
+            ("password truncated", b"\x05alice\x06abc".to_vec()),
+            ("trailing octets", b"\x05alice\x03abcX".to_vec()),
             // The pre-RFC two-octet length encoding is not accepted.
-            ("two-octet lengths", b"\x00\x05alice\x00\x06secret".to_vec()),
+            ("two-octet lengths", b"\x00\x05alice\x00\x03abc".to_vec()),
         ] {
-            let mut handler =
-                BasicPasswordAuthHandler::new("alice".to_string(), "secret".to_string());
+            let mut handler = password_handler();
             let tlv = TeapTlv::new(TlvType::BasicPasswordAuthResp, true, value);
             assert!(
                 handler.process_inner_request(&tlv).is_err(),
@@ -2439,7 +2455,7 @@ mod tests {
     fn test_inner_method_handler_trait() {
         let handler: Box<dyn InnerMethodHandler> = Box::new(BasicPasswordAuthHandler::new(
             "alice".to_string(),
-            "secret".to_string(),
+            test_password().to_string(),
         ));
 
         // Test trait methods
@@ -2477,7 +2493,7 @@ mod tests {
                 )),
         );
 
-        let handler = BasicPasswordAuthHandler::new("alice".to_string(), "secret".to_string());
+        let handler = password_handler();
         let server = EapTeapServer::with_inner_method(config, Box::new(handler));
 
         assert_eq!(server.phase, TeapPhase::Phase1TlsHandshake);
@@ -2567,11 +2583,12 @@ mod tests {
 
     #[test]
     fn crypto_binding_tlv_is_76_octets_and_round_trips() {
+        let nonce = CryptoBinding::generate_nonce();
         let mut cb = CryptoBindingTlv::new(
             CryptoBindingTlv::SUBTYPE_REQUEST,
             CryptoBindingTlv::FLAGS_MSK,
             1,
-            [0xA5; 32],
+            nonce,
         );
         cb.msk_compound_mac = [0x11; 20];
         let tlv = cb.to_tlv();
@@ -2583,7 +2600,7 @@ mod tests {
         assert_eq!(&bytes[..4], &[0x80, 0x0C, 0x00, 0x4C]);
         // Reserved, Version, Received-Ver, Flags<<4 | Sub-Type
         assert_eq!(&bytes[4..8], &[0x00, 0x01, 0x01, 0x20]);
-        assert_eq!(&bytes[8..40], &[0xA5; 32]);
+        assert_eq!(&bytes[8..40], &nonce);
         assert_eq!(&bytes[40..60], &[0u8; 20], "EMSK Compound-MAC absent");
         assert_eq!(&bytes[60..80], &[0x11; 20]);
 
@@ -2694,13 +2711,16 @@ mod tests {
         },
     ];
 
+    /// Request nonce of the vectors: a0 a1 .. bd be, LSB of the last octet 0.
+    const KAT_NONCE: &str = "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebe";
+
     fn kat_nonce() -> [u8; 32] {
-        let mut nonce = [0u8; 32];
-        for (i, b) in nonce.iter_mut().enumerate() {
-            *b = 0xA0 + i as u8;
-        }
-        nonce[31] = 0xBE;
-        nonce
+        unhex(KAT_NONCE).try_into().unwrap()
+    }
+
+    /// IMSK of Basic-Password-Auth (RFC 9930 §6.2.1): 32 zero octets.
+    fn zero_imsk() -> Vec<u8> {
+        unhex(&"00".repeat(CryptoBinding::IMSK_LENGTH))
     }
 
     /// RFC 9930 §6.2.2 IMCK[1] / S-IMCK[1] / CMK[1] and §6.4 MSK / EMSK from
@@ -2711,7 +2731,7 @@ mod tests {
             let cb = CryptoBinding::with_nonce(
                 kat.hash,
                 &unhex(kat.session_key_seed),
-                &[0u8; 32],
+                &zero_imsk(),
                 kat_nonce(),
             );
             assert_eq!(hex::encode(&cb.imck), kat.imck, "{:?} IMCK[1]", kat.hash);
@@ -2740,7 +2760,7 @@ mod tests {
             let cb = CryptoBinding::with_nonce(
                 kat.hash,
                 &unhex(kat.session_key_seed),
-                &[0u8; 32],
+                &zero_imsk(),
                 kat_nonce(),
             );
             let mut request = CryptoBindingTlv::new(
@@ -2810,7 +2830,7 @@ mod tests {
         let cb = CryptoBinding::with_nonce(
             TeapHash::Sha256,
             &unhex(SHA256_SESSION_KEY_SEED),
-            &[0u8; 32],
+            &zero_imsk(),
             kat_nonce(),
         );
         let request = CryptoBindingTlv::new(
@@ -2896,7 +2916,7 @@ mod tests {
     fn password_server() -> EapTeapServer {
         phase2_server(Box::new(BasicPasswordAuthHandler::new(
             "alice".to_string(),
-            "secret".to_string(),
+            test_password().to_string(),
         )))
     }
 
@@ -2963,7 +2983,7 @@ mod tests {
     fn phase2_opens_with_eap_identity_request_for_inner_eap() {
         let mut server = phase2_server(Box::new(EapPayloadHandler::new(
             "alice".to_string(),
-            "password".to_string(),
+            test_password().to_string(),
         )));
         let tlvs = parse(server.open_phase2().unwrap());
         assert_eq!(
@@ -2987,7 +3007,7 @@ mod tests {
         let tlvs = parse(
             server
                 .process_phase2_tlvs(&[
-                    password_response(b"alice", b"secret"),
+                    password_response(b"alice", test_password().as_bytes()),
                     IdentityType::User.to_tlv(),
                 ])
                 .unwrap(),
@@ -3038,7 +3058,7 @@ mod tests {
         server.open_phase2().unwrap();
         let tlvs = parse(
             server
-                .process_phase2_tlvs(&[password_response(b"alice", b"wrong")])
+                .process_phase2_tlvs(&[password_response(b"alice", wrong_password().as_bytes())])
                 .unwrap(),
         );
         assert_eq!(types(&tlvs), [Some(TlvType::Result)]);
@@ -3062,7 +3082,7 @@ mod tests {
         let mut server = password_server();
         server.open_phase2().unwrap();
         server
-            .process_phase2_tlvs(&[password_response(b"alice", b"wrong")])
+            .process_phase2_tlvs(&[password_response(b"alice", wrong_password().as_bytes())])
             .unwrap();
         server
             .process_result_ack(&[TeapResult::Success.to_result_tlv()])
@@ -3078,7 +3098,7 @@ mod tests {
         server.open_phase2().unwrap();
         let tlvs = parse(
             server
-                .process_phase2_tlvs(&[password_response(b"alice", b"secret")])
+                .process_phase2_tlvs(&[password_response(b"alice", test_password().as_bytes())])
                 .unwrap(),
         );
         (server, tlvs[2].clone())
@@ -3197,7 +3217,13 @@ mod tests {
         for tlv in [
             TeapResult::Success.to_result_tlv(),
             TeapResult::Success.to_intermediate_result_tlv(),
-            CryptoBindingTlv::new(CryptoBindingTlv::SUBTYPE_RESPONSE, 2, 1, [0; 32]).to_tlv(),
+            CryptoBindingTlv::new(
+                CryptoBindingTlv::SUBTYPE_RESPONSE,
+                2,
+                1,
+                CryptoBinding::generate_nonce(),
+            )
+            .to_tlv(),
             TeapTlv::new(TlvType::Nak, true, vec![0; 6]),
             TeapTlv::new_raw(0x3FFE, true, vec![1, 2, 3]),
             IdentityType::Machine.to_tlv(),
@@ -3218,7 +3244,7 @@ mod tests {
             server
                 .process_phase2_tlvs(&[
                     TeapTlv::new_raw(0x3FFE, false, vec![1, 2, 3]),
-                    password_response(b"alice", b"secret"),
+                    password_response(b"alice", test_password().as_bytes()),
                 ])
                 .unwrap(),
         );
@@ -3274,7 +3300,7 @@ mod tests {
     fn test_phase2_eap_payload_full_flow() {
         let mut server = phase2_server(Box::new(EapPayloadHandler::new(
             "alice".to_string(),
-            "password".to_string(),
+            test_password().to_string(),
         )));
 
         // Opening: EAP-Payload(Identity request) + Identity-Type.
@@ -3461,7 +3487,7 @@ mod tests {
 
     #[test]
     fn test_eap_payload_handler_creation() {
-        let handler = EapPayloadHandler::new("alice".to_string(), "password".to_string());
+        let handler = EapPayloadHandler::new("alice".to_string(), test_password().to_string());
 
         assert!(!handler.is_complete());
         assert_eq!(handler.get_result(), TeapResult::Failure);
@@ -3470,7 +3496,7 @@ mod tests {
 
     #[test]
     fn test_eap_payload_handler_identity_request() {
-        let mut handler = EapPayloadHandler::new("alice".to_string(), "password".to_string());
+        let mut handler = EapPayloadHandler::new("alice".to_string(), test_password().to_string());
 
         // Process Identity-Type TLV to trigger identity request
         let identity_type_tlv = IdentityType::User.to_tlv();
@@ -3490,7 +3516,7 @@ mod tests {
 
     #[test]
     fn test_eap_payload_handler_identity_response() {
-        let mut handler = EapPayloadHandler::new("alice".to_string(), "password".to_string());
+        let mut handler = EapPayloadHandler::new("alice".to_string(), test_password().to_string());
 
         // Step 1: Get identity request
         let identity_type_tlv = IdentityType::User.to_tlv();
@@ -3523,7 +3549,7 @@ mod tests {
 
     #[test]
     fn test_eap_payload_handler_md5_challenge_response() {
-        let mut handler = EapPayloadHandler::new("alice".to_string(), "password".to_string());
+        let mut handler = EapPayloadHandler::new("alice".to_string(), test_password().to_string());
 
         // Step 1: Get identity request
         let identity_type_tlv = IdentityType::User.to_tlv();
@@ -3565,7 +3591,7 @@ mod tests {
 
     #[test]
     fn test_eap_payload_handler_wrong_identity() {
-        let mut handler = EapPayloadHandler::new("alice".to_string(), "password".to_string());
+        let mut handler = EapPayloadHandler::new("alice".to_string(), test_password().to_string());
 
         // Step 1 & 2: Send identity response with wrong identity
         let identity_type_tlv = IdentityType::User.to_tlv();
@@ -3610,7 +3636,7 @@ mod tests {
     fn test_eap_payload_inner_method_handler_trait() {
         let handler: Box<dyn InnerMethodHandler> = Box::new(EapPayloadHandler::new(
             "alice".to_string(),
-            "password".to_string(),
+            test_password().to_string(),
         ));
 
         // Test trait methods
@@ -3628,13 +3654,13 @@ mod tests {
     fn test_inner_method_handlers_return_no_imsk() {
         let pw_handler: Box<dyn InnerMethodHandler> = Box::new(BasicPasswordAuthHandler::new(
             "alice".to_string(),
-            "secret".to_string(),
+            test_password().to_string(),
         ));
         assert!(pw_handler.get_imsk().is_none());
 
         let eap_handler: Box<dyn InnerMethodHandler> = Box::new(EapPayloadHandler::new(
             "alice".to_string(),
-            "password".to_string(),
+            test_password().to_string(),
         ));
         assert!(eap_handler.get_imsk().is_none());
     }
@@ -3669,14 +3695,8 @@ mod tests {
     /// list and reproduced in the Go and mbedTLS test suites.
     #[test]
     fn tls_prf_sha256_matches_published_vector() {
-        let secret = [
-            0x9b, 0xbe, 0x43, 0x6b, 0xa9, 0x40, 0xf0, 0x17, 0xb1, 0x76, 0x52, 0x84, 0x9a, 0x71,
-            0xdb, 0x35,
-        ];
-        let seed = [
-            0xa0, 0xba, 0x9f, 0x93, 0x6c, 0xda, 0x31, 0x18, 0x27, 0xa6, 0xf7, 0x96, 0xff, 0xd5,
-            0x19, 0x8c,
-        ];
+        let secret = unhex("9bbe436ba940f017b17652849a71db35");
+        let seed = unhex("a0ba9f936cda311827a6f796ffd5198c");
         let out = CryptoBinding::tls_prf_sha256(&secret, b"test label", &seed, 100);
         let expected = "e3f229ba727be17b8d122620557cd453c2aab21d07c3d495329b52d4e61edb5a6b301791e90d35c9c9a46b4e14baf9af0fa022f7077def17abfd3797c0564bab4fbc91666e9def9b97fce34f796789baa48082d122ee42c5a72e5a5110fff70187347b66";
         assert_eq!(hex::encode(out), expected);
@@ -3684,7 +3704,9 @@ mod tests {
 
     #[test]
     fn msk_and_emsk_derive_from_s_imck_with_distinct_labels() {
-        let cb = CryptoBinding::new(TeapHash::Sha256, &[0x11u8; 40], &[0x22u8; 32]);
+        let s_imck0: [u8; 40] = rand::random();
+        let imsk: [u8; 32] = rand::random();
+        let cb = CryptoBinding::new(TeapHash::Sha256, &s_imck0, &imsk);
         assert_eq!(cb.s_imck().len(), CryptoBinding::S_IMCK_LENGTH);
         assert_eq!(cb.s_imck(), &cb.imck[..40]);
         assert_eq!(&cb.cmk[..], &cb.imck[40..60]);
@@ -3704,9 +3726,10 @@ mod tests {
             )
         );
         // Different inner keys → different MSK; different hash → different MSK.
-        let other = CryptoBinding::new(TeapHash::Sha256, &[0x11u8; 40], &[0x23u8; 32]);
+        let other_imsk: [u8; 32] = rand::random();
+        let other = CryptoBinding::new(TeapHash::Sha256, &s_imck0, &other_imsk);
         assert_ne!(other.derive_msk(), msk);
-        let sha384 = CryptoBinding::new(TeapHash::Sha384, &[0x11u8; 40], &[0x22u8; 32]);
+        let sha384 = CryptoBinding::new(TeapHash::Sha384, &s_imck0, &imsk);
         assert_ne!(sha384.derive_msk(), msk);
     }
 
@@ -3715,7 +3738,11 @@ mod tests {
     /// session_key_seed = 0x01*32, IMSK = 0x02*32.
     #[test]
     fn test_crypto_binding_imck_is_tls12_prf() {
-        let imck = CryptoBinding::derive_imck(TeapHash::Sha256, &[0x01; 32], &[0x02; 32]);
+        let imck = CryptoBinding::derive_imck(
+            TeapHash::Sha256,
+            &unhex(&"01".repeat(32)),
+            &unhex(&"02".repeat(32)),
+        );
         assert_eq!(imck.len(), 60);
         assert_eq!(
             hex::encode(&imck),

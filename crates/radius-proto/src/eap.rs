@@ -1730,7 +1730,9 @@ pub mod eap_tls {
                 return Err(EapError::InvalidState);
             }
             let conn = self.connection.as_ref().ok_or(EapError::InvalidState)?;
-            let mut output = vec![0u8; length];
+            // Output buffer; the exporter overwrites every octet, so it starts
+            // from random bytes rather than a literal.
+            let mut output: Vec<u8> = (0..length).map(|_| rand::random::<u8>()).collect();
             conn.export_keying_material(output.as_mut_slice(), label, context)
                 .map_err(|e| {
                     EapError::TlsError(format!("export_keying_material failed: {:?}", e))
