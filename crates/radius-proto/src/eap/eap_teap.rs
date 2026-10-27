@@ -1895,7 +1895,7 @@ impl InnerMethodHandler for BasicPasswordAuthHandler {
 ///
 /// ```no_run
 /// # use radius_proto::eap::eap_teap::*;
-/// let handler = EapPayloadHandler::new("alice".to_string(), test_password().to_string());
+/// let handler = EapPayloadHandler::new("alice".to_string(), "password".to_string());
 /// // Process EAP-Payload TLVs...
 /// ```
 pub struct EapPayloadHandler {
@@ -2432,7 +2432,7 @@ mod tests {
 
     #[test]
     fn test_basic_password_auth_empty_credentials() {
-        let mut handler = BasicPasswordAuthHandler::new("".to_string(), "".to_string());
+        let mut handler = BasicPasswordAuthHandler::new(String::new(), String::new());
         handler
             .process_inner_request(&password_response(b"", b""))
             .unwrap();
