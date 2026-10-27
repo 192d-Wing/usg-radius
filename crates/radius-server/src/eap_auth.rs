@@ -164,14 +164,34 @@ impl EapAuthHandler {
 
     /// Run the session reaper as of `now_secs` (Unix seconds): evicts every
     /// conversation idle past the timeout and, if the store is full, the
-    /// least recently used ones, and drops their TLS/TEAP state. Called on
-    /// every new conversation; exposed so operators' tooling and tests can
-    /// trigger it. Returns the number of evicted conversations.
+    /// least recently used ones, and drops their TLS/TEAP state. Called
+    /// before every new conversation is created; exposed so operators'
+    /// tooling and tests can trigger it. Returns the number of evicted
+    /// conversations.
     pub fn reap_at(&self, now_secs: u64) -> usize {
         let evicted = {
             let mut manager = self.session_manager.write().unwrap();
             manager.evict_at(now_secs)
         }; // session-manager lock released before touching the method maps
+        self.drop_evicted(evicted)
+    }
+
+    /// Evict every conversation idle past the timeout as of `now_secs` and
+    /// drop its TLS/TEAP state, without displacing any live conversation for
+    /// capacity. Runs on every incoming EAP packet, before the packet's State
+    /// is resolved, so the idle timeout is enforced even when no new
+    /// conversation ever starts and an idle session can never be revived by
+    /// a late packet. Returns the number of evicted conversations.
+    pub fn reap_idle_at(&self, now_secs: u64) -> usize {
+        let evicted = {
+            let mut manager = self.session_manager.write().unwrap();
+            manager.evict_idle_at(now_secs)
+        }; // session-manager lock released before touching the method maps
+        self.drop_evicted(evicted)
+    }
+
+    /// Drop the method state of `evicted` sessions, count and log them.
+    fn drop_evicted(&self, evicted: Vec<(String, EvictionReason)>) -> usize {
         if evicted.is_empty() {
             return 0;
         }
@@ -1266,6 +1286,11 @@ impl AuthHandler for EapAuthHandler {
             .filter(|attr| attr.attr_type == 79) // EAP-Message
             .collect();
 
+        // Enforce the idle timeout on every packet, before State is resolved:
+        // an idle conversation is gone whether or not anything new starts,
+        // and a late packet for it fails closed instead of reviving it.
+        self.reap_idle_at(Self::now_secs());
+
         if eap_messages.is_empty() {
             // No EAP-Message - this is initial request, start EAP-Identity
             let session_id = self.get_or_create_session(&username, state);
@@ -1291,7 +1316,22 @@ impl AuthHandler for EapAuthHandler {
         // (expired, evicted, finished, forged) is rejected without allocating
         // anything, so stale or bogus State cannot churn the session store.
         let session_id = match eap_packet.eap_type {
-            Some(EapType::Identity) => self.get_or_create_session(&username, state),
+            Some(EapType::Identity) => {
+                let session_id = self.get_or_create_session(&username, state);
+                // RFC 3748 §4.1: the NAS chose the Identifier of its
+                // EAP-Request/Identity, which the peer echoed here; our first
+                // Request must carry a different one, so continue the NAS's
+                // sequence instead of starting at 0.
+                if let Some(session) = self
+                    .session_manager
+                    .write()
+                    .unwrap()
+                    .get_session_mut(&session_id)
+                {
+                    session.seed_identifier_after(eap_packet.identifier);
+                }
+                session_id
+            }
             _ => match self.resolve_session(state) {
                 Some(id) => id,
                 None => {
@@ -2845,6 +2885,120 @@ mod eap_tls_mppe_tests {
             AuthResult::Reject
         ));
         assert_eq!(handler.active_session_count(), 0);
+    }
+
+    /// RFC 3748 §4.1: the first Request of a conversation continues the
+    /// NAS's Identifier sequence (Identity Response id + 1) instead of
+    /// starting at 0, so it never repeats the Identity Request's Identifier.
+    #[test]
+    fn first_request_identifier_follows_the_nas_identity_request() {
+        let pki = gen_pki();
+        let handler = eap_handler(&pki);
+        for identity_id in [0u8, 1, 0x2A, 0xFE, 0xFF] {
+            let request =
+                access_request(7, &EapPacket::identity_response(identity_id, "alice"), None);
+            let AuthResult::Challenge { attributes, .. } =
+                handler.authenticate_request(&request, SECRET)
+            else {
+                panic!("expected EAP-TLS Start for identity id {identity_id}");
+            };
+            let challenge = packet_with(Code::AccessChallenge, 7, attributes);
+            let start = eap_from_radius_packet(&challenge).unwrap().unwrap();
+            assert_eq!(start.code, EapCode::Request);
+            assert_eq!(start.eap_type, Some(EapType::Tls));
+            assert_ne!(
+                start.identifier, identity_id,
+                "first Request reused the Identity Request's Identifier"
+            );
+            assert_eq!(start.identifier, identity_id.wrapping_add(1));
+        }
+    }
+
+    /// The idle timeout is enforced by every incoming EAP packet, not only
+    /// when a new conversation runs the reaper: an unrelated packet (here
+    /// one with a forged State, which creates nothing) evicts the idle
+    /// conversation, and its own late packet then fails closed.
+    #[test]
+    fn idle_session_is_evicted_by_any_incoming_packet() {
+        let pki = gen_pki();
+        let mut handler = eap_handler(&pki);
+        handler.set_session_limits(5, 100);
+        let a = start_conversation(&handler, 1);
+        let a_id = String::from_utf8(a.clone()).unwrap();
+        assert_eq!(handler.active_session_count(), 1);
+
+        // Backdate A past the idle timeout without touching the LRU order.
+        {
+            let mut manager = handler.session_manager.write().unwrap();
+            let session = manager.get_session_mut(&a_id).unwrap();
+            session.last_activity -= 10;
+        }
+
+        // A packet for no live session: not a new conversation, still
+        // evicts A before its own State is looked up.
+        assert!(matches!(
+            continue_conversation(&handler, b"nobody-0-0", 2),
+            AuthResult::Reject
+        ));
+        assert_eq!(handler.active_session_count(), 0);
+        assert!(handler.tls_sessions.read().unwrap().is_empty());
+        assert_eq!(handler.eviction_counts(), (1, 0));
+
+        // A's own late packet fails closed and revives nothing.
+        assert!(matches!(
+            continue_conversation(&handler, &a, 3),
+            AuthResult::Reject
+        ));
+        assert_eq!(handler.active_session_count(), 0);
+        assert_eq!(handler.eviction_counts(), (1, 0));
+    }
+
+    /// An idle conversation's own late packet is rejected rather than
+    /// touching (and reviving) the session, even when no other traffic ran
+    /// the reaper in between.
+    #[test]
+    fn idle_session_cannot_be_revived_by_its_own_late_packet() {
+        let pki = gen_pki();
+        let mut handler = eap_handler(&pki);
+        handler.set_session_limits(5, 100);
+        let a = start_conversation(&handler, 1);
+        let a_id = String::from_utf8(a.clone()).unwrap();
+        handler
+            .session_manager
+            .write()
+            .unwrap()
+            .get_session_mut(&a_id)
+            .unwrap()
+            .last_activity -= 10;
+
+        assert!(matches!(
+            continue_conversation(&handler, &a, 2),
+            AuthResult::Reject
+        ));
+        assert_eq!(handler.active_session_count(), 0);
+        assert!(handler.tls_sessions.read().unwrap().is_empty());
+        assert_eq!(handler.eviction_counts(), (1, 0));
+    }
+
+    /// A continuation of a live conversation at capacity evicts nothing: the
+    /// per-packet reaper handles idle sessions only.
+    #[test]
+    fn per_packet_reaper_does_not_evict_for_capacity() {
+        let pki = gen_pki();
+        let mut handler = eap_handler(&pki);
+        handler.set_session_limits(600, 2);
+        let a = start_conversation(&handler, 1);
+        let _b = start_conversation(&handler, 2);
+        assert_eq!(handler.active_session_count(), 2);
+
+        // A bogus-State packet while the store is full displaces nobody.
+        assert!(matches!(
+            continue_conversation(&handler, b"nobody-0-0", 3),
+            AuthResult::Reject
+        ));
+        assert_eq!(handler.active_session_count(), 2);
+        assert!(handler.resolve_session(Some(&a)).is_some());
+        assert_eq!(handler.eviction_counts(), (0, 0));
     }
 
     #[test]

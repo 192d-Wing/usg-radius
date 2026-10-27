@@ -47,7 +47,7 @@
 //! ```
 
 use super::EapError;
-use super::eap_tls::{EapTlsPacket, EapTlsServer, TlsFlags};
+use super::eap_tls::{EapTlsPacket, EapTlsServer, LengthFlagPolicy, TlsFlags};
 use std::sync::Arc;
 
 // Cryptographic imports for Crypto-Binding
@@ -876,12 +876,16 @@ pub struct CryptoBinding {
 }
 
 impl std::fmt::Debug for CryptoBinding {
+    /// Never print key material: IMCK and CMK appear as lengths only; the
+    /// hash and the nonces are public (they travel in the Crypto-Binding TLV).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CryptoBinding")
             .field("hash", &self.hash)
+            .field("imck_len", &self.imck.len())
+            .field("cmk_len", &self.cmk.len())
             .field("server_nonce", &self.server_nonce)
             .field("client_nonce", &self.client_nonce)
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
@@ -1182,7 +1186,7 @@ impl EapTeapServer {
         inner_method: Option<Box<dyn InnerMethodHandler>>,
     ) -> Self {
         Self {
-            tls_server: EapTlsServer::new(config),
+            tls_server: Self::new_tls_server(config),
             phase: TeapPhase::Phase1TlsHandshake,
             inner_method,
             crypto_binding: None,
@@ -1200,6 +1204,15 @@ impl EapTeapServer {
             #[cfg(test)]
             test_plaintext: false,
         }
+    }
+
+    /// The Phase 1 TLS server, fragmenting outbound messages the TEAP way:
+    /// RFC 9930 §3.3 (RFC 7170 §3.7) puts L on the first fragment of a fragmented message
+    /// and on no other message (EAP-TLS sends L on every first packet).
+    fn new_tls_server(config: Arc<rustls::ServerConfig>) -> EapTlsServer {
+        let mut tls_server = EapTlsServer::new(config);
+        tls_server.set_length_flag_policy(LengthFlagPolicy::FragmentedOnly);
+        tls_server
     }
 
     /// Initialize TLS connection (Phase 1)
@@ -1263,7 +1276,9 @@ impl EapTeapServer {
 
     /// Queue an outbound TLS message (Phase 1 handshake flight or Phase 2
     /// encrypted TLVs) for transmission in fragments of at most
-    /// `max_fragment_size` bytes (RFC 9930 §3.3 / RFC 5216 §2.1.5).
+    /// `max_fragment_size` bytes (RFC 9930 §3.3 / RFC 5216 §2.1.5): L and
+    /// the TLS Message Length on the first fragment of a fragmented message
+    /// only, M on every non-final fragment.
     pub fn queue_outgoing_tls(&mut self, tls_data: Vec<u8>, max_fragment_size: usize) {
         self.tls_server
             .queue_outgoing_tls(tls_data, max_fragment_size);
@@ -3430,6 +3445,64 @@ mod tests {
     }
 
     // ===== Crypto-Binding Tests (Week 4-5) =====
+
+    /// IMCK / CMK never appear in `Debug` output.
+    #[test]
+    fn crypto_binding_debug_prints_key_lengths_only() {
+        // Random inputs: nothing here is a real key, and nothing is hard-coded.
+        let session_key_seed: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+        let imsk: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+        let binding = CryptoBinding::new(TeapHash::Sha256, &session_key_seed, &imsk);
+        let printed = format!("{binding:?}");
+        assert!(printed.contains("imck_len: 60"), "{printed}");
+        assert!(printed.contains("cmk_len: 20"), "{printed}");
+        let imck_hex = binding
+            .imck
+            .iter()
+            .map(|b| format!("{b}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(!printed.contains(&imck_hex[..16]), "IMCK leaked: {printed}");
+        assert!(!printed.contains("imck: ["), "{printed}");
+        assert!(!printed.contains("cmk: ["), "{printed}");
+    }
+
+    /// RFC 9930 §3.3 (RFC 7170 §3.7): a TEAP server message that fits in one
+    /// packet is sent
+    /// without L or a TLS Message Length; a fragmented one carries both on
+    /// its first fragment only.
+    #[test]
+    fn teap_outbound_sets_length_flag_only_when_fragmented() {
+        use std::sync::Arc as StdArc;
+        let config = StdArc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(StdArc::new(
+                    rustls::server::ResolvesServerCertUsingSni::new(),
+                )),
+        );
+        let mut server = EapTeapServer::new(config);
+
+        server.queue_outgoing_tls(vec![0x16; 100], 1020);
+        let only = server.next_outgoing_fragment().unwrap();
+        assert!(!only.tls.flags.length_included());
+        assert!(!only.tls.flags.more_fragments());
+        assert_eq!(only.tls.tls_message_length, None);
+        assert_eq!(only.tls.tls_data.len(), 100);
+        assert!(server.next_outgoing_fragment().is_none());
+
+        server.queue_outgoing_tls(vec![0x16; 2000], 1020);
+        let first = server.next_outgoing_fragment().unwrap();
+        assert!(first.tls.flags.length_included());
+        assert!(first.tls.flags.more_fragments());
+        assert_eq!(first.tls.tls_message_length, Some(2000));
+        let second = server.next_outgoing_fragment().unwrap();
+        assert!(!second.tls.flags.length_included());
+        assert!(!second.tls.flags.more_fragments());
+        assert_eq!(second.tls.tls_message_length, None);
+        assert_eq!(first.tls.tls_data.len() + second.tls.tls_data.len(), 2000);
+        assert!(server.next_outgoing_fragment().is_none());
+    }
 
     #[test]
     fn test_eap_payload_tlv_creation() {
