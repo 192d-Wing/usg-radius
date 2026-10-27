@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **EAP-TEAP interoperates with wpa_supplicant (RFC 9930).** The TEAP server
+  now implements the Crypto-Binding TLV of RFC 9930 §4.2.13 (which obsoletes
+  RFC 7170): a 76-octet Value with Reserved, Version 1, Received-Ver, Flags ‖
+  Sub-Type, a 32-octet nonce whose last bit is 0 in the request and 1 in the
+  response, and separate 20-octet EMSK and MSK Compound-MACs computed per §6.3
+  as the first 20 octets of HMAC-<hash>(CMK[n], BUFFER), BUFFER being the TLV
+  with both MAC fields zeroed ‖ the TEAP EAP Type 0x37 ‖ the Outer TLVs of the
+  first server and peer messages. The hash and the TLS-PRF of the §6.2 / §6.4
+  key schedule follow the negotiated TLS cipher suite (SHA-384 for
+  `TLS_AES_256_GCM_SHA384` and the `*_SHA384` TLS 1.2 suites, SHA-256
+  otherwise), as wpa_supplicant and hostapd select them. Every server packet
+  carries TEAP Version 1 in the Flags/Ver octet (§3.1); the peer's first
+  response must propose version 1, and Received-Ver is checked in the
+  Crypto-Binding against a downgrade. Phase 2 opens with Basic-Password-Auth-Req
+  + Identity-Type in the message that ends the handshake, and on inner success
+  the server sends Intermediate-Result (Success), Result (Success) and the
+  Crypto-Binding Request together (§3.6.6, Appendix C.1), then requires the
+  peer's Intermediate-Result (Success), Crypto-Binding Response and Result
+  (Success), verifying the binding before either result is examined. The MSK
+  (RFC 9930 §6.4, from S-IMCK[1] with the zero IMSK of Basic-Password-Auth)
+  feeds the MS-MPPE keys as before. Verification fails closed on a wrong MAC,
+  nonce, version, Sub-Type or Flags, including a response that claims an EMSK
+  Compound-MAC no inner method here can produce. Known-answer vectors for the
+  key schedule, the BUFFER and both TLVs, for SHA-256 and SHA-384, come from
+  `tests/vectors/teap_rfc9930_vectors.py`, an independent implementation
+  written from the RFC text with the Python standard library and self-checked
+  against the published RFC 5246 `P_SHA256` vector; `eap_teap.rs` pins them.
+- **Interop harness: four EAP-TEAP scenarios** (57 assertions, up from 33),
+  on eapol_test from **wpa_supplicant 2.12** (previously 2.11): TEAP with
+  Basic-Password-Auth over TLS 1.3 (SHA-384 key schedule) directly against
+  usg-radius, the same through the proxy, TLS 1.2 with an AES-128-GCM-SHA256
+  suite (SHA-256 key schedule), and a wrong password. Each success asserts
+  eapol_test's `SUCCESS`, the TEAP version and Crypto-Binding fields it
+  accepted, the HMAC it selected, its `Authentication completed successfully`
+  and `MPPE keys OK: 1  mismatch: 0`, i.e. the MS-MPPE keys equal the MSK
+  eapol_test derived with its own RFC 9930 key schedule. 2.11 derived the
+  Basic-Password-Auth MSK from S-IMCK[0] (fixed upstream for RFC 9930 after
+  2.11) and reports a key mismatch against this server. The home server
+  (`tests/interop/usg-radius/home.json`) now enables TEAP next to EAP-TLS.
+- **`eap.teap_tls`**: optional TLS configuration for the EAP-TEAP tunnel (same
+  fields as `eap.tls`), so the tunnel can be server-authenticated only while
+  EAP-TLS keeps requiring and revocation-checking supplicant certificates.
+  Omitted, TEAP keeps sharing `eap.tls`.
+- **EAP-Nak method negotiation (RFC 3748 §5.3.1).** A peer that declines the
+  proposed method and lists EAP-TLS (13) or EAP-TEAP (55) is switched to that
+  method, once per conversation and only before any method data was
+  processed; the declined method's state is discarded. A server with both
+  methods enabled proposes TEAP first and now serves EAP-TLS supplicants (the
+  interop EAP-TLS scenarios exercise this); previously every Nak was rejected.
+
 - **Bounded EAP session store.** `EapAuthHandler` evicts an EAP conversation
   (its EAP session plus its EAP-TLS / EAP-TEAP TLS state) after
   `eap.session_idle_timeout_secs` without a packet from the peer (default 120)
@@ -24,6 +74,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   worst case (4096 × a rustls connection plus at most 64 KiB of reassembly)
   under the default per-client (100 req/s) and global (1000 req/s) rate
   limits.
+
+### Changed
+
+- **EAP-TEAP Crypto-Binding wire format and BUFFER.** The previous 68-octet
+  Crypto-Binding TLV with a single 32-octet HMAC-SHA256 over the Phase 2 TLV
+  history is replaced by the RFC 9930 §4.2.13 / §6.3 format above; it was
+  never interoperable with another implementation. The Basic-Password-Auth-Resp
+  TLV is parsed with the one-octet Userlen / Passlen of RFC 9930 §4.2.15
+  (previously two octets each, also non-interoperable), trailing octets are
+  rejected and the password compare is constant-time. The Identity-Type TLV
+  is sent together with the Basic-Password-Auth-Req instead of in a message of
+  its own (wpa_supplicant answers an Identity-Type only alongside a request).
+  `EapTeapServer::process_client_message` takes the new `TeapPacket` (EAP-TLS
+  packet plus version and Outer TLVs) and `CryptoBinding::new` takes the
+  cipher-suite hash (`TeapHash`).
 
 ### Security
 

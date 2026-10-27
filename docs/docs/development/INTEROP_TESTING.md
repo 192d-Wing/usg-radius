@@ -1,4 +1,4 @@
-# Interoperability test: proxy and EAP-TLS against FreeRADIUS and eapol_test
+# Interoperability test: proxy, EAP-TLS and EAP-TEAP against FreeRADIUS and eapol_test
 
 Everything in `crates/radius-server/src/proxy` and `radius_proto::mppe` is
 unit-tested against this codebase's own encoder and decoder. This test closes
@@ -7,17 +7,19 @@ asserts outcomes those implementations compute on their own.
 
 - **FreeRADIUS 3.2** (Debian package) as the home server behind the usg-radius
   proxy, with EAP-TLS and a PAP user.
-- **eapol_test** from wpa_supplicant 2.11 as NAS + supplicant. It derives the
-  EAP MSK from its own TLS stack, decrypts the MS-MPPE keys in the
-  Access-Accept with *its* shared secret, and fails the run if the two do not
-  agree (`MPPE keys OK: 1  mismatch: 0` / `SUCCESS`).
+- **eapol_test** from wpa_supplicant 2.12 as NAS + supplicant. It derives the
+  EAP MSK from its own TLS stack (and, for TEAP, its own RFC 9930 key
+  schedule), decrypts the MS-MPPE keys in the Access-Accept with *its* shared
+  secret, and fails the run if the two do not agree (`MPPE keys OK: 1
+  mismatch: 0` / `SUCCESS`). 2.12 is the first release whose EAP-TEAP follows
+  RFC 9930; see scenario 10 for why 2.11 cannot be used for TEAP.
 - **radclient** (FreeRADIUS utils) for the PAP checks.
 
 The shared secret differs on every hop, so nothing passes by accident:
 
 ```
 nas 10.77.0.40 ──[nas-proxy-secret-1]──▶ usg-proxy 10.77.0.20 ──[proxy-freeradius-secret-2]──▶ freeradius 10.77.0.10
-nas 10.77.0.40 ──[nas-usghome-secret-3]─▶ usg-home 10.77.0.30   (usg-radius as EAP-TLS home server, no proxy)
+nas 10.77.0.40 ──[nas-usghome-secret-3]─▶ usg-home 10.77.0.30   (usg-radius as EAP-TLS / EAP-TEAP home server, no proxy)
 ```
 
 ## Running it
@@ -80,8 +82,8 @@ image build (default 2).
 
 ## What is checked
 
-Thirty-three assertions across nine scenarios. All pass on the current tree (run
-`tests/interop/run.sh`).
+Fifty-seven assertions across thirteen scenarios. All pass on the current tree
+(run `tests/interop/run.sh`).
 
 ### 1 & 2 — EAP-TLS through the proxy to FreeRADIUS
 
@@ -183,21 +185,65 @@ The same configuration through the proxy to usg-home: `SUCCESS`, and the
 MS-MPPE keys re-encrypted by the proxy match the supplicant's MSK, so the ACK
 round trips survive the proxy hop.
 
-### Not covered: EAP-TEAP
+### 10 — EAP-TEAP (RFC 9930) directly against usg-radius: TLS 1.3, Basic-Password-Auth
 
-The `nas` image builds eapol_test with `CONFIG_EAP_TEAP=y`, so the harness
-*could* drive TEAP. It does not yet, because usg-radius's TEAP wire format is
-not interoperable with wpa_supplicant's: the Crypto-Binding TLV is encoded as
-68 octets with one 32-octet HMAC-SHA256 compound MAC, while RFC 7170 §4.2.13
-requires 76 octets with separate 20-octet EMSK and MSK Compound MACs over the
-§5.3 BUFFER, the server does not set the version bits (§4.1) and sends no
-Intermediate-Result TLV (§3.3.2). eapol_test would fail at the Crypto-Binding
-TLV before fragmentation could be observed, so a TEAP fragmentation scenario
-would only prove that. TEAP fragmentation (RFC 7170 §3.1, both phases and
-directions) is covered by the unit tests in
-`crates/radius-server/src/eap_auth.rs` against an in-memory rustls TEAP peer
-that fragments and reassembles; add the eapol_test scenario once the
-Crypto-Binding TLV format lands.
+`home.json` enables EAP-TEAP next to EAP-TLS and gives the TEAP tunnel its own
+TLS block (`eap.teap_tls`: the same server certificate, no client certificate),
+with the user `teapuser@usg.test` in `users`. `eapol_test/eap-teap-usg.conf`
+authenticates with `eap=TEAP`, identity + password, `ca_cert`, `domain_match`
+and `phase1="tls_disable_tlsv1_3=0"` (wpa_supplicant disables TLS 1.3 for TEAP
+by default). Because usg-home proposes TEAP first, this scenario and the
+EAP-TLS ones together also prove RFC 3748 §5.3.1 EAP-Nak method switching:
+eapol_test's EAP-TLS configurations answer the TEAP/Start with a Nak for Type
+13 and are switched to EAP-TLS. Proven:
+
+- eapol_test exits 0 and prints `SUCCESS`; TLS 1.3 is negotiated for the tunnel.
+- `EAP-TEAP: Using TEAP version 1`: the Start carried Version 1 (§3.1).
+- `Crypto-Binding TLV: Version 1 Received Version 1 Flags 2 Sub-Type 0`: the
+  peer parsed and accepted the server's 76-octet Binding Request (§4.2.13),
+  with the MSK Compound-MAC only (no inner EMSK).
+- `MAC algorithm: HMAC-SHA384` and no `Compound MAC did not match`: rustls
+  negotiated `TLS_AES_256_GCM_SHA384`, so both sides derived the IMCK/CMK with
+  the SHA-384 TLS-PRF and the Compound-MAC with HMAC-SHA384 (§6.2, §6.3), and
+  the peer's independent computation over the §6.3 BUFFER matched ours.
+- `EAP-TEAP: Authentication completed successfully`: the peer saw
+  Intermediate-Result (Success), Result (Success) and a valid Crypto-Binding in
+  one message and answered in kind (§3.6.6); EAP-Success followed.
+- `MPPE keys OK: 1  mismatch: 0`: the MS-MPPE keys equal the MSK eapol_test
+  derived itself as TLS-PRF(S-IMCK[1], "Session Key Generating Function") with
+  the zero IMSK of Basic-Password-Auth (§6.2.1, §6.4).
+
+wpa_supplicant 2.11 cannot pass this scenario: it derived the
+Basic-Password-Auth MSK from S-IMCK[0] (`eap_teap_derive_cmk_basic_pw_auth`,
+removed upstream by "EAP-TEAP: Fix S-IMCK derivation based on RFC 7170bis",
+2024-12-31) and would report `MPPE keys OK: 0  mismatch: 1` against an
+RFC 9930 server even though the Crypto-Binding exchange succeeds. The harness
+therefore builds eapol_test from 2.12.
+
+### 11 — EAP-TEAP through the proxy
+
+The same configuration through the proxy to usg-home: `SUCCESS`, Phase 2
+completed, and the MS-MPPE keys re-encrypted by the proxy match the
+supplicant's TEAP MSK. The TEAP Start, version bits, fragments and Phase 2
+messages all survive the proxy hop.
+
+### 12 — EAP-TEAP over TLS 1.2 with a SHA-256 cipher suite
+
+`eapol_test/eap-teap-usg-tls12.conf` leaves TLS 1.3 disabled (wpa_supplicant's
+TEAP default) and forces `ECDHE-*-AES128-GCM-SHA256`, so the key schedule runs
+with the other hash the server must select from the negotiated suite: `Using
+TLS version TLSv1.2`, `MAC algorithm: HMAC-SHA256`, `SUCCESS` and
+`MPPE keys OK: 1  mismatch: 0`. Together with scenario 10 this covers both
+branches of the cipher-suite-dependent TLS-PRF / HMAC selection.
+
+### 13 — EAP-TEAP with the wrong password
+
+`eapol_test/eap-teap-usg-badpass.conf`: the server answers the
+Basic-Password-Auth-Resp with Result (Failure) inside the tunnel
+(`EAP-TEAP: Server rejected authentication`), the peer acknowledges with its
+own Result (Failure), and the server sends Access-Reject + EAP-Failure
+(`completion (param=failure)`): non-zero exit, `FAILURE`, no `MS-MPPE-*` in the
+reject.
 
 ### Server fixes this test drove out
 
