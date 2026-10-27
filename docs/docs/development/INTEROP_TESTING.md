@@ -193,7 +193,7 @@ requires 76 octets with separate 20-octet EMSK and MSK Compound MACs over the
 §5.3 BUFFER, the server does not set the version bits (§4.1) and sends no
 Intermediate-Result TLV (§3.3.2). eapol_test would fail at the Crypto-Binding
 TLV before fragmentation could be observed, so a TEAP fragmentation scenario
-would only prove that. TEAP fragmentation (RFC 7170 §3.1, both phases and
+would only prove that. TEAP fragmentation (RFC 7170 §3.7, both phases and
 directions) is covered by the unit tests in
 `crates/radius-server/src/eap_auth.rs` against an in-memory rustls TEAP peer
 that fragments and reassembles; add the eapol_test scenario once the
