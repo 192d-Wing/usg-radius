@@ -2403,22 +2403,42 @@ mod tests {
         TeapTlv::new(TlvType::BasicPasswordAuthResp, true, value)
     }
 
+    /// The inner-method password used by these tests: random per test
+    /// process, so no credential is hard-coded.
+    fn test_password() -> &'static str {
+        static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PASSWORD.get_or_init(|| {
+            let bytes: Vec<u8> = (0..12).map(|_| rand::random::<u8>()).collect();
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        })
+    }
+
+    /// A password of the same length as [`test_password`] that differs in
+    /// its last character.
+    fn wrong_password_same_length() -> String {
+        let mut wrong = test_password().to_string();
+        let last = wrong.pop().expect("test password is not empty");
+        wrong.push(if last == 'f' { '0' } else { 'f' });
+        wrong
+    }
+
     /// An empty expected password (what a backend without a password for the
     /// user used to be mapped to) never matches, not even an empty supplied
     /// password. This used to be asserted as Success.
     #[test]
     fn test_basic_password_auth_empty_credentials_fail_closed() {
-        let mut handler = BasicPasswordAuthHandler::new("".to_string(), "".to_string());
+        let empty = String::new();
+        let mut handler = BasicPasswordAuthHandler::new(empty.clone(), empty.clone());
         let _ = handler
-            .process_inner_request(&password_response("", ""))
+            .process_inner_request(&password_response(&empty, &empty))
             .unwrap();
         assert!(handler.is_complete());
         assert_eq!(handler.get_result(), TeapResult::Failure);
-        assert_eq!(handler.get_identity(), Some("".to_string()));
+        assert_eq!(handler.get_identity(), Some(String::new()));
 
-        let mut handler = BasicPasswordAuthHandler::new("alice".to_string(), "".to_string());
+        let mut handler = BasicPasswordAuthHandler::new("alice".to_string(), empty.clone());
         let _ = handler
-            .process_inner_request(&password_response("alice", ""))
+            .process_inner_request(&password_response("alice", &empty))
             .unwrap();
         assert_eq!(handler.get_result(), TeapResult::Failure);
     }
@@ -2426,7 +2446,8 @@ mod tests {
     /// An empty supplied password fails even though the expected one is set.
     #[test]
     fn test_basic_password_auth_empty_supplied_password_fails() {
-        let mut handler = BasicPasswordAuthHandler::new("alice".to_string(), "secret".to_string());
+        let mut handler =
+            BasicPasswordAuthHandler::new("alice".to_string(), test_password().to_string());
         let _ = handler
             .process_inner_request(&password_response("alice", ""))
             .unwrap();
@@ -2438,7 +2459,9 @@ mod tests {
     /// password, including an empty one, but still completes.
     #[test]
     fn test_basic_password_auth_without_password_rejects_everything() {
-        for supplied in ["", "secret", "anything"] {
+        let empty = String::new();
+        let wrong = wrong_password_same_length();
+        for supplied in [empty.as_str(), test_password(), wrong.as_str()] {
             let mut handler = BasicPasswordAuthHandler::without_password("alice".to_string());
             let result_tlv = handler
                 .process_inner_request(&password_response("alice", supplied))
@@ -2457,9 +2480,10 @@ mod tests {
     /// constant-time comparison compares content, not only length).
     #[test]
     fn test_basic_password_auth_same_length_wrong_password_fails() {
-        let mut handler = BasicPasswordAuthHandler::new("alice".to_string(), "secret".to_string());
+        let mut handler =
+            BasicPasswordAuthHandler::new("alice".to_string(), test_password().to_string());
         let _ = handler
-            .process_inner_request(&password_response("alice", "secreT"))
+            .process_inner_request(&password_response("alice", &wrong_password_same_length()))
             .unwrap();
         assert_eq!(handler.get_result(), TeapResult::Failure);
     }
@@ -2869,7 +2893,7 @@ mod tests {
                 again,
                 Err(EapError::Phase2LimitExceeded("repeated Identity-Type TLV"))
             ),
-            "{again:?}"
+            "a repeated Identity-Type TLV must fail with Phase2LimitExceeded"
         );
     }
 
@@ -2891,7 +2915,7 @@ mod tests {
         let overflow = server.process_phase2_tlvs_test(&[big]);
         assert!(
             matches!(overflow, Err(EapError::Phase2LimitExceeded("TLV history"))),
-            "{overflow:?}"
+            "exceeding the TLV history cap must fail with Phase2LimitExceeded"
         );
         assert_eq!(
             server.phase2_tlv_history.len(),
@@ -2919,7 +2943,7 @@ mod tests {
                 one_more,
                 Err(EapError::Phase2LimitExceeded("Intermediate-Result TLVs"))
             ),
-            "{one_more:?}"
+            "exceeding the Intermediate-Result cap must fail with Phase2LimitExceeded"
         );
     }
 
@@ -2939,13 +2963,13 @@ mod tests {
             // Garbage TLS data fails at decryption, not at the round bound.
             assert!(
                 !matches!(r, Err(EapError::Phase2LimitExceeded(_))),
-                "round {round}: {r:?}"
+                "round {round} hit the round bound before the configured limit"
             );
         }
         let third = server.process_client_message(&packet);
         assert!(
             matches!(third, Err(EapError::Phase2LimitExceeded("Phase 2 rounds"))),
-            "{third:?}"
+            "the round past the limit must fail with Phase2LimitExceeded"
         );
     }
 
