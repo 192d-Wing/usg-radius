@@ -1,6 +1,6 @@
 # Interop test: usg-radius as proxy and as EAP-TLS / EAP-TEAP home server
 # against FreeRADIUS 3.2 and eapol_test (wpa_supplicant 2.12), driven by
-# tests/interop/run.sh. Fifty-seven assertions; the job fails if any one fails.
+# tests/interop/run.sh. Sixty-seven assertions; the job fails if any one fails.
 # See docs/docs/development/INTEROP_TESTING.md.
 #
 # Base images: the three harness images build from public Debian and rust

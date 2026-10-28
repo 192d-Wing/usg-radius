@@ -82,8 +82,8 @@ image build (default 2).
 
 ## What is checked
 
-Fifty-seven assertions across thirteen scenarios. All pass on the current tree
-(run `tests/interop/run.sh`).
+Sixty-seven assertions across fourteen scenarios, plus one host-side check in
+`run.sh` (§14). All pass on the current tree (run `tests/interop/run.sh`).
 
 ### 1 & 2 — EAP-TLS through the proxy to FreeRADIUS
 
@@ -244,6 +244,50 @@ Basic-Password-Auth-Resp with Result (Failure) inside the tunnel
 own Result (Failure), and the server sends Access-Reject + EAP-Failure
 (`completion (param=failure)`): non-zero exit, `FAILURE`, no `MS-MPPE-*` in the
 reject.
+
+### 14 — Status-Server (RFC 5997) and the accounting port (RFC 2866)
+
+radclient (FreeRADIUS's client) is the independent implementation here: it
+computes the Message-Authenticator on each Status-Server it sends and, before
+it prints `Received ...`, verifies the reply's Response Authenticator under
+the hop secret and — when the reply carries one — its Message-Authenticator.
+A `Received` line therefore proves the Response Authenticator and proves the
+Message-Authenticator *if present*; it does not by itself prove one was sent,
+so the positive Status-Server cases add a separate check on radclient's `-x`
+attribute dump of the reply (`Message-Authenticator = 0x...` after the
+`Received` line). The checks:
+
+- Status-Server to the proxy on 1812 → `Received Access-Accept`, and the
+  reply carries a Message-Authenticator (RFC 5997 §4.2). That the proxy
+  answers this itself rather than forwarding (§4.3) is true by construction —
+  Status-Server is dispatched before any routing in `process_request` — and
+  is not something radclient can distinguish from a forwarded, re-keyed
+  reply; the unit tests cover the dispatch order.
+- Status-Server to usg-home on 1812 → `Received Access-Accept`, and the reply
+  carries a Message-Authenticator (§4.1, §4.2).
+- Status-Server to usg-home on 1813 → `Received Accounting-Response`, and the
+  reply carries a Message-Authenticator (§4.2).
+- Accounting-Request (Start) to usg-home on 1813 → `Received
+  Accounting-Response` from the dedicated accounting socket (RFC 2866 §2).
+- Status-Server signed with the wrong secret → `No reply`: silent discard
+  (§4.1).
+- Access-Request to the accounting port → `No reply` (RFC 2865 §3 discard of
+  a code the socket does not serve; RFC 2866 §2 assigns the port).
+- Accounting-Request to the authentication port → `No reply`: with a dedicated
+  accounting socket (`accounting_port: 1813`, as both interop configs set),
+  Code 4 on 1812 is discarded; `"accounting_port": "shared"` restores the old
+  single-socket behaviour.
+
+The proxy's own probes are covered from the host side: `proxy.json` runs with
+`health_check` enabled, and after the eapol_test/radclient suite `run.sh`
+asserts that the proxy's Status-Server probes against FreeRADIUS and against
+usg-home succeeded (the `nas` container cannot see the proxy's log, so the
+assertion runs on the host). FreeRADIUS answering the probe is the
+independent check of what the probe puts on the wire — random Request
+Authenticator and a Message-Authenticator under the home secret; the unit
+tests in `crates/radius-server/src/proxy/health.rs` additionally run the
+probe against a fake home server that verifies the Message-Authenticator and
+signs its reply.
 
 ### Server fixes this test drove out
 

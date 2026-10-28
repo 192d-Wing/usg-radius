@@ -105,14 +105,39 @@ pub fn verify_request_authenticator(packet: &Packet) -> bool {
 /// Verify Response Authenticator
 ///
 /// Verifies that the Response Authenticator matches the expected value
-/// calculated from the request and secret.
+/// calculated from the request and secret. The comparison is constant-time
+/// (CWE-208): the digest is keyed by the shared secret, so an early-exit
+/// compare would leak how many leading octets of a guess were right.
 pub fn verify_response_authenticator(
     response: &Packet,
     request_authenticator: &[u8; 16],
     secret: &[u8],
 ) -> bool {
     let calculated = calculate_response_authenticator(response, request_authenticator, secret);
-    response.authenticator == calculated
+    constant_time_eq(&response.authenticator, &calculated)
+}
+
+/// Verify the Request Authenticator of an Accounting-Request (RFC 2866 §3),
+/// Disconnect-Request or CoA-Request (RFC 5176 §3.4): recompute
+/// `MD5(Code + ID + Length + 16 zero octets + Attributes + Secret)` and compare
+/// it with the packet's Authenticator field in constant time. The packet's own
+/// Authenticator is not part of the input, so no copy is needed.
+pub fn verify_accounting_request_authenticator(packet: &Packet, secret: &[u8]) -> bool {
+    let calculated = calculate_accounting_request_authenticator(packet, secret);
+    constant_time_eq(&packet.authenticator, &calculated)
+}
+
+/// Constant-time equality of two byte strings (false if lengths differ). Used
+/// wherever a keyed digest or MAC is compared against a value a peer sent.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Encrypt User-Password attribute per RFC 2865 Section 5.2

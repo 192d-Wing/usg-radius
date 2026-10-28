@@ -20,6 +20,7 @@ usg_radius /path/to/custom-config.json
 {
   "listen_address": "::",
   "listen_port": 1812,
+  "accounting_port": 1813,
   "secret": "testing123",
   "clients": [],
   "users": [],
@@ -81,7 +82,9 @@ The IP address the server binds to.
 
 ### listen_port
 
-The UDP port the server listens on.
+The UDP port for authentication traffic (Access-Request, and Status-Server
+answered with Access-Accept). Accounting has its own socket, see
+[`accounting_port`](#accounting_port).
 
 - **Type**: Integer
 - **Default**: `1812`
@@ -101,6 +104,58 @@ The UDP port the server listens on.
 
 !!! warning
     Changing from standard port 1812 requires configuring all clients to use the custom port.
+
+### accounting_port
+
+Where Accounting-Request (RFC 2866) is accepted over UDP. The default binds a
+second UDP socket on `listen_address:1813` next to the authentication socket,
+so a NAS sends accounting to the standard port and gets its Accounting-Response
+back from source port 1813. A Status-Server received on this socket is answered
+with Accounting-Response (RFC 5997 §4.2).
+
+- **Type**: Integer (1-65535) or one of the strings `"shared"`, `"disabled"`
+- **Default**: `1813`
+- **Forms**:
+  - An integer: bind a dedicated accounting socket on that port. The same
+    `listen_address` is used, so dual-stack (`"::"`) binding applies to both
+    sockets. Accounting-Request arriving on the authentication port is
+    silently discarded (one warn-level log line, no reply).
+  - `"shared"`: no second socket; Accounting-Request is accepted on the
+    authentication socket. This is the behaviour of releases before the
+    accounting socket existed.
+  - `"disabled"`: no second socket; Accounting-Request over UDP is discarded.
+
+Access-Request on the accounting socket is always discarded. A failure to
+bind the accounting socket is fatal, like a failure to bind the
+authentication socket.
+
+**Example:**
+
+```json
+{
+  "listen_port": 1812,
+  "accounting_port": 1813
+}
+```
+
+**Validation:**
+
+- `0` is rejected: `accounting_port cannot be 0 (use "disabled" or "shared")`
+- A value equal to `listen_port` is rejected: `accounting_port 1812 must differ from listen_port`
+- Any string other than `"shared"` or `"disabled"` fails to parse
+
+!!! note
+    Ignored under `transport = "radsec"`: authentication, accounting and
+    Status-Server share the single TLS connection on 2083/tcp (RFC 6614 §2.5).
+
+!!! warning "Migration"
+    Earlier releases bound only `listen_port` and accepted accounting there.
+    With the default `accounting_port: 1813`, a NAS still sending
+    Accounting-Request to the authentication port gets no reply and
+    retransmits. Either point the NAS's accounting server at 1813, or set
+    `"accounting_port": "shared"` until every NAS has moved. The shipped
+    `examples/configs/*.json` and the Kubernetes manifest set the key
+    explicitly.
 
 ### secret
 
@@ -483,6 +538,7 @@ Evictions are logged at debug level and counted in the
 {
   "listen_address": "::",
   "listen_port": 1812,
+  "accounting_port": 1813,
   "secret": "SecureSharedSecret2024!",
   "clients": [
     {
@@ -518,6 +574,7 @@ Evictions are logged at debug level and counted in the
 {
   "listen_address": "::",
   "listen_port": 1812,
+  "accounting_port": 1813,
   "secret": "ProductionDefaultSecret2024!Change",
   "clients": [
     {
@@ -601,6 +658,31 @@ Error: Secret cannot be empty
 
 ```plain
 Error: Port cannot be 0
+```
+
+**Accounting port of 0:**
+
+```json
+{
+  "accounting_port": 0
+}
+```
+
+```plain
+Error: accounting_port cannot be 0 (use "disabled" or "shared")
+```
+
+**Accounting port equal to the authentication port:**
+
+```json
+{
+  "listen_port": 1812,
+  "accounting_port": 1812
+}
+```
+
+```plain
+Error: accounting_port 1812 must differ from listen_port
 ```
 
 **Invalid IP Address:**
@@ -764,11 +846,15 @@ sudo setcap 'cap_net_bind_service=+ep' target/release/usg_radius
 
 **Problem**: `Error: Address already in use`
 
-**Solution**: Another process is using port 1812
+**Solution**: Another process is using port 1812 or 1813. The server binds
+both the authentication socket (`listen_port`) and, by default, the
+accounting socket (`accounting_port`); either one failing to bind stops
+startup.
 
 ```bash
-sudo lsof -i :1812
-# Stop conflicting process or change port
+sudo lsof -i :1812 -i :1813
+# Stop the conflicting process, change the port, or set
+# "accounting_port": "shared" / "disabled" if 1813 is taken on purpose
 ```
 
 ### Configuration Errors

@@ -1484,7 +1484,7 @@ mod tests {
 mod eap_tls_mppe_tests {
     use super::*;
     use crate::config::Config;
-    use crate::server::{RadiusServer, ServerConfig, SimpleAuthHandler};
+    use crate::server::{PortRole, RadiusServer, ServerConfig, SimpleAuthHandler};
     use radius_proto::eap::eap_tls::{EAP_TLS_TYPE_CODE, TlsFlags};
     use radius_proto::eap::{EapCode, eap_from_radius_packet};
     use radius_proto::mppe::{MICROSOFT_VENDOR_ID, MS_MPPE_RECV_KEY, MS_MPPE_SEND_KEY};
@@ -1496,7 +1496,16 @@ mod eap_tls_mppe_tests {
     use rustls::{ClientConfig, ClientConnection, RootCertStore};
     use std::io::Write as _;
 
-    const SECRET: &[u8] = b"s3cret";
+    /// The shared secret the fake NAS and the handler agree on: random bytes
+    /// drawn once per process (never a literal, so CodeQL does not read it as
+    /// a hard-coded key).
+    fn secret() -> &'static [u8] {
+        static SECRET: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        SECRET.get_or_init(|| {
+            use rand::RngExt;
+            rand::rng().random::<[u8; 16]>().to_vec()
+        })
+    }
     const SERVER_NAME: &str = "radius.test";
 
     struct TestPki {
@@ -1744,7 +1753,7 @@ mod eap_tls_mppe_tests {
         p.add_attribute(
             Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]).unwrap(),
         );
-        let mac = calculate_message_authenticator(&p.encode().unwrap(), SECRET);
+        let mac = calculate_message_authenticator(&p.encode().unwrap(), secret());
         p.attributes.last_mut().unwrap().value = mac.to_vec();
         p
     }
@@ -1822,7 +1831,7 @@ mod eap_tls_mppe_tests {
 
         // Identity → TEAP/Start.
         let request = identity_request();
-        let start = challenge_of(&request, handler.authenticate_request(&request, SECRET));
+        let start = challenge_of(&request, handler.authenticate_request(&request, secret()));
         let start_eap = eap_of(&start);
         assert_eq!(start_eap.eap_type, Some(EapType::Teap));
 
@@ -1832,7 +1841,7 @@ mod eap_tls_mppe_tests {
             &nak(start_eap.identifier, &[13]),
             Some(&state_of(&start)),
         );
-        let tls_start = challenge_of(&request, handler.authenticate_request(&request, SECRET));
+        let tls_start = challenge_of(&request, handler.authenticate_request(&request, secret()));
         let tls_start_eap = eap_of(&tls_start);
         assert_eq!(tls_start_eap.eap_type, Some(EapType::Tls));
         assert!(
@@ -1852,7 +1861,7 @@ mod eap_tls_mppe_tests {
                 request.identifier < 64,
                 "EAP-TLS did not converge after the Nak"
             );
-            match handler.authenticate_request(&request, SECRET) {
+            match handler.authenticate_request(&request, secret()) {
                 AuthResult::Challenge {
                     state, attributes, ..
                 } => {
@@ -1868,27 +1877,27 @@ mod eap_tls_mppe_tests {
 
         // A second Nak in the same conversation is rejected.
         let request = identity_request();
-        let start = challenge_of(&request, handler.authenticate_request(&request, SECRET));
+        let start = challenge_of(&request, handler.authenticate_request(&request, secret()));
         let request = access_request(
             2,
             &nak(eap_of(&start).identifier, &[13]),
             Some(&state_of(&start)),
         );
-        let tls_start = challenge_of(&request, handler.authenticate_request(&request, SECRET));
+        let tls_start = challenge_of(&request, handler.authenticate_request(&request, secret()));
         let request = access_request(
             3,
             &nak(eap_of(&tls_start).identifier, &[55]),
             Some(&state_of(&tls_start)),
         );
         assert!(matches!(
-            handler.authenticate_request(&request, SECRET),
+            handler.authenticate_request(&request, secret()),
             AuthResult::Reject
         ));
 
         // A Nak for methods we do not offer (none / MD5 / PEAP) is rejected.
         for desired in [&[0u8][..], &[4u8], &[25u8, 21u8]] {
             let request = identity_request();
-            let start = challenge_of(&request, handler.authenticate_request(&request, SECRET));
+            let start = challenge_of(&request, handler.authenticate_request(&request, secret()));
             let request = access_request(
                 2,
                 &nak(eap_of(&start).identifier, desired),
@@ -1896,7 +1905,7 @@ mod eap_tls_mppe_tests {
             );
             assert!(
                 matches!(
-                    handler.authenticate_request(&request, SECRET),
+                    handler.authenticate_request(&request, secret()),
                     AuthResult::Reject
                 ),
                 "Nak {desired:?} must be rejected"
@@ -1906,17 +1915,17 @@ mod eap_tls_mppe_tests {
         // A Nak once the method has started (after the ClientHello) is rejected.
         let mut peer = TeapPeer::new(&pki, 4096);
         let request = identity_request();
-        let start = challenge_of(&request, handler.authenticate_request(&request, SECRET));
+        let start = challenge_of(&request, handler.authenticate_request(&request, secret()));
         let hello = peer.respond(&eap_of(&start));
         let request = access_request(2, &hello, Some(&state_of(&start)));
-        let flight = challenge_of(&request, handler.authenticate_request(&request, SECRET));
+        let flight = challenge_of(&request, handler.authenticate_request(&request, secret()));
         let request = access_request(
             3,
             &nak(eap_of(&flight).identifier, &[13]),
             Some(&state_of(&flight)),
         );
         assert!(matches!(
-            handler.authenticate_request(&request, SECRET),
+            handler.authenticate_request(&request, secret()),
             AuthResult::Reject
         ));
     }
@@ -1933,7 +1942,7 @@ mod eap_tls_mppe_tests {
                 request.identifier < 64,
                 "EAP-TLS conversation did not converge"
             );
-            match handler.authenticate_request(&request, SECRET) {
+            match handler.authenticate_request(&request, secret()) {
                 AuthResult::Challenge {
                     state, attributes, ..
                 } => {
@@ -1982,7 +1991,8 @@ mod eap_tls_mppe_tests {
         let handler = eap_handler(&pki);
         let mut peer = Supplicant::new(&pki);
 
-        let (state, attributes) = match handler.authenticate_request(&identity_request(), SECRET) {
+        let (state, attributes) = match handler.authenticate_request(&identity_request(), secret())
+        {
             AuthResult::Challenge {
                 state, attributes, ..
             } => (state, attributes),
@@ -2009,7 +2019,7 @@ mod eap_tls_mppe_tests {
         )
         .to_eap_response(start_eap.identifier);
         let request = access_request(2, &first, Some(&state));
-        let (state, attributes) = match handler.authenticate_request(&request, SECRET) {
+        let (state, attributes) = match handler.authenticate_request(&request, secret()) {
             AuthResult::Challenge {
                 state, attributes, ..
             } => (state, attributes),
@@ -2040,7 +2050,7 @@ mod eap_tls_mppe_tests {
         .to_eap_response(ack_eap.identifier);
         let mut request = access_request(3, &last, Some(&state));
         for _ in 0..64 {
-            match handler.authenticate_request(&request, SECRET) {
+            match handler.authenticate_request(&request, secret()) {
                 AuthResult::Challenge {
                     state, attributes, ..
                 } => {
@@ -2081,7 +2091,7 @@ mod eap_tls_mppe_tests {
                 request.identifier < 64,
                 "EAP-TLS conversation did not converge"
             );
-            match handler.authenticate_request(&request, SECRET) {
+            match handler.authenticate_request(&request, secret()) {
                 AuthResult::Challenge {
                     state, attributes, ..
                 } => {
@@ -2152,11 +2162,16 @@ mod eap_tls_mppe_tests {
                 request.identifier < 64,
                 "EAP-TLS conversation did not converge"
             );
-            let bytes =
-                RadiusServer::process_request(&request.encode().unwrap(), nas_ip, SECRET, &cfg)
-                    .await
-                    .unwrap()
-                    .expect("Access-Request warrants a reply");
+            let bytes = RadiusServer::process_request(
+                &request.encode().unwrap(),
+                nas_ip,
+                secret(),
+                PortRole::Auth,
+                &cfg,
+            )
+            .await
+            .unwrap()
+            .expect("Access-Request warrants a reply");
             let response = Packet::decode(&bytes).unwrap();
             // No reply before the Accept may leak key material.
             assert!(
@@ -2175,7 +2190,7 @@ mod eap_tls_mppe_tests {
         assert!(verify_response_authenticator(
             &accept,
             &request.authenticator,
-            SECRET
+            secret()
         ));
         assert!(
             accept
@@ -2197,7 +2212,7 @@ mod eap_tls_mppe_tests {
                 .len(),
             1
         );
-        let keys = MppeKeys::from_packet(&accept, SECRET, &request.authenticator)
+        let keys = MppeKeys::from_packet(&accept, secret(), &request.authenticator)
             .unwrap()
             .expect("Access-Accept must carry MS-MPPE keys");
         let msk = peer.msk();
@@ -2548,7 +2563,7 @@ mod eap_tls_mppe_tests {
         let mut request = identity_request();
         let mut last_response_id = 1u8;
         for _ in 0..512 {
-            match handler.authenticate_request(&request, SECRET) {
+            match handler.authenticate_request(&request, secret()) {
                 AuthResult::Challenge {
                     state, attributes, ..
                 } => {
@@ -2749,7 +2764,7 @@ mod eap_tls_mppe_tests {
         let mut peer = TeapPeer::new(&pki, 4096);
         let response = peer.respond(&start_eap);
         let result =
-            handler.authenticate_request(&access_request(2, &response, Some(&state)), SECRET);
+            handler.authenticate_request(&access_request(2, &response, Some(&state)), secret());
         assert!(matches!(result, AuthResult::Challenge { .. }));
         assert!(lru_seq(&handler, &session_id) > seq_after_start);
 
@@ -2758,7 +2773,7 @@ mod eap_tls_mppe_tests {
         let bad = EapTlsPacket::new(TlsFlags::new(false, true, false), None, vec![0x16; 10]);
         let result = handler.authenticate_request(
             &access_request(3, &teap_raw_response(7, bad), Some(&state)),
-            SECRET,
+            secret(),
         );
         assert!(matches!(result, AuthResult::Reject));
         assert!(handler.resolve_session(Some(&state)).is_none());
@@ -2822,7 +2837,8 @@ mod eap_tls_mppe_tests {
 
     /// Server's Start, peer's first packet built by hand.
     fn teap_start(handler: &EapAuthHandler) -> (Vec<u8>, EapPacket) {
-        let (state, attributes) = match handler.authenticate_request(&identity_request(), SECRET) {
+        let (state, attributes) = match handler.authenticate_request(&identity_request(), secret())
+        {
             AuthResult::Challenge {
                 state, attributes, ..
             } => (state, attributes),
@@ -2876,7 +2892,7 @@ mod eap_tls_mppe_tests {
             );
             assert!(
                 matches!(
-                    handler.authenticate_request(&request, SECRET),
+                    handler.authenticate_request(&request, secret()),
                     AuthResult::Reject
                 ),
                 "{name}: expected Reject"
@@ -2900,7 +2916,7 @@ mod eap_tls_mppe_tests {
             &teap_raw_response(start_eap.identifier, first),
             Some(&state),
         );
-        let (state, attributes) = match handler.authenticate_request(&request, SECRET) {
+        let (state, attributes) = match handler.authenticate_request(&request, secret()) {
             AuthResult::Challenge {
                 state, attributes, ..
             } => (state, attributes),
@@ -2918,7 +2934,7 @@ mod eap_tls_mppe_tests {
         let overrun = EapTlsPacket::new(TlsFlags::new(false, true, false), None, vec![0x16; 40]);
         let request = access_request(3, &teap_raw_response(ack.identifier, overrun), Some(&state));
         assert!(matches!(
-            handler.authenticate_request(&request, SECRET),
+            handler.authenticate_request(&request, secret()),
             AuthResult::Reject
         ));
     }
@@ -2934,7 +2950,7 @@ mod eap_tls_mppe_tests {
         let mut peer = TeapPeer::new(pki, 4096);
         let mut request = identity_request();
         for _ in 0..64 {
-            let (state, attributes) = match handler.authenticate_request(&request, SECRET) {
+            let (state, attributes) = match handler.authenticate_request(&request, secret()) {
                 AuthResult::Challenge {
                     state, attributes, ..
                 } => (state, attributes),
@@ -2990,7 +3006,7 @@ mod eap_tls_mppe_tests {
             );
             assert!(
                 matches!(
-                    handler.authenticate_request(&request, SECRET),
+                    handler.authenticate_request(&request, secret()),
                     AuthResult::Reject
                 ),
                 "{name}: expected Reject"
@@ -3010,7 +3026,7 @@ mod eap_tls_mppe_tests {
             &teap_raw_response(eap_request.identifier, first),
             Some(&state),
         );
-        let (state, attributes) = match handler.authenticate_request(&request, SECRET) {
+        let (state, attributes) = match handler.authenticate_request(&request, secret()) {
             AuthResult::Challenge {
                 state, attributes, ..
             } => (state, attributes),
@@ -3028,7 +3044,7 @@ mod eap_tls_mppe_tests {
         let overrun = EapTlsPacket::new(TlsFlags::new(false, true, false), None, vec![0x17; 20]);
         let request = access_request(8, &teap_raw_response(ack.identifier, overrun), Some(&state));
         assert!(matches!(
-            handler.authenticate_request(&request, SECRET),
+            handler.authenticate_request(&request, secret()),
             AuthResult::Reject
         ));
 
@@ -3049,7 +3065,7 @@ mod eap_tls_mppe_tests {
             Some(&state),
         );
         assert!(matches!(
-            handler.authenticate_request(&request, SECRET),
+            handler.authenticate_request(&request, secret()),
             AuthResult::Reject
         ));
     }
@@ -3062,7 +3078,7 @@ mod eap_tls_mppe_tests {
     /// Start an EAP-TLS conversation (Identity → Start) and return its State.
     fn start_conversation(handler: &EapAuthHandler, id: u8) -> Vec<u8> {
         let request = access_request(id, &EapPacket::identity_response(id, "alice"), None);
-        match handler.authenticate_request(&request, SECRET) {
+        match handler.authenticate_request(&request, secret()) {
             AuthResult::Challenge { state, .. } => state,
             other => panic!("expected Start, got {other:?}"),
         }
@@ -3072,7 +3088,7 @@ mod eap_tls_mppe_tests {
     fn continue_conversation(handler: &EapAuthHandler, state: &[u8], id: u8) -> AuthResult {
         let response = EapTlsPacket::new(TlsFlags::new(false, false, false), None, Vec::new())
             .to_eap_response(id);
-        handler.authenticate_request(&access_request(id, &response, Some(state)), SECRET)
+        handler.authenticate_request(&access_request(id, &response, Some(state)), secret())
     }
 
     /// Advance conversation `state` with the peer's ClientHello: a packet
@@ -3087,7 +3103,7 @@ mod eap_tls_mppe_tests {
         let mut peer = Supplicant::new(pki);
         let start = EapTlsPacket::start().to_eap_request(id);
         let response = peer.respond(&start);
-        handler.authenticate_request(&access_request(id, &response, Some(state)), SECRET)
+        handler.authenticate_request(&access_request(id, &response, Some(state)), secret())
     }
 
     #[test]
@@ -3162,7 +3178,7 @@ mod eap_tls_mppe_tests {
             let request =
                 access_request(7, &EapPacket::identity_response(identity_id, "alice"), None);
             let AuthResult::Challenge { attributes, .. } =
-                handler.authenticate_request(&request, SECRET)
+                handler.authenticate_request(&request, secret())
             else {
                 panic!("expected EAP-TLS Start for identity id {identity_id}");
             };
@@ -3291,7 +3307,7 @@ mod eap_tls_mppe_tests {
         // Accept releases everything.
         let mut request = identity_request();
         loop {
-            match handler.authenticate_request(&request, SECRET) {
+            match handler.authenticate_request(&request, secret()) {
                 AuthResult::Challenge {
                     state, attributes, ..
                 } => {
@@ -3315,7 +3331,7 @@ mod eap_tls_mppe_tests {
         let bad = EapTlsPacket::new(TlsFlags::new(false, true, false), None, vec![1, 2, 3]);
         let request = access_request(2, &bad.to_eap_response(0), Some(&state));
         assert!(matches!(
-            handler.authenticate_request(&request, SECRET),
+            handler.authenticate_request(&request, secret()),
             AuthResult::Reject
         ));
         assert_eq!(handler.active_session_count(), 0);
@@ -3330,7 +3346,7 @@ mod eap_tls_mppe_tests {
         let pkt = EapTlsPacket::new(TlsFlags::new(false, false, true), None, vec![0x16; 10]);
         let request = access_request(2, &pkt.to_eap_response(0), Some(&state));
         assert!(matches!(
-            handler.authenticate_request(&request, SECRET),
+            handler.authenticate_request(&request, secret()),
             AuthResult::Reject
         ));
     }

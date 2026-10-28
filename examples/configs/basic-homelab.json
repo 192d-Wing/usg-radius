@@ -4,6 +4,7 @@
   "_security_warning": "This configuration uses weak secrets - DO NOT use in production!",
   "listen_address": "::",
   "listen_port": 1812,
+  "accounting_port": 1813,
   "secret": "testing123",
   "clients": [
     {
