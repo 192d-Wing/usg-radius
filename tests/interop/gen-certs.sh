@@ -123,11 +123,17 @@ echo 10 > crlnumber
 openssl ca -config wrongkey.cnf -gencrl -out ca-wrongkey.crl 2>/dev/null
 [ "$(openssl crl -in ca-wrongkey.crl -noout -issuer)" = "$(openssl x509 -in ca.crt -noout -subject | sed 's/^subject=/issuer=/')" ] \
     || { echo "gen-certs: forged CRL does not name the CA as issuer" >&2; exit 1; }
-if openssl crl -in ca-wrongkey.crl -CAfile ca.crt -noout 2>/dev/null; then
-    echo "gen-certs: forged CRL verifies with the CA key" >&2; exit 1
-fi
-openssl crl -in ca.crl -CAfile ca.crt -noout 2>/dev/null \
+# `openssl crl -CAfile` reports the signature check as a "verify OK" or
+# "verify failure" line, but its exit status differs by version (OpenSSL 3.0
+# exits 0 on "verify failure", 3.5+ exits 1), so read the line, not the status.
+crl_verify_result() { # crl_verify_result <crl>: prints OK, failure or the openssl error
+    openssl crl -in "$1" -CAfile ca.crt -noout 2>&1 |
+        sed -n -e 's/^verify OK$/OK/p' -e 's/^verify failure$/failure/p' | head -n 1
+}
+[ "$(crl_verify_result ca.crl)" = OK ] \
     || { echo "gen-certs: ca.crl does not verify with the CA key" >&2; exit 1; }
+[ "$(crl_verify_result ca-wrongkey.crl)" = failure ] \
+    || { echo "gen-certs: forged CRL verifies with the CA key (or could not be checked)" >&2; exit 1; }
 
 rm -f ext.cnf crl.cnf wrongkey.cnf ca.srl index.txt index.txt.* wrongkey-index.txt wrongkey-index.txt.* \
     crlnumber crlnumber.old wrongkey.key wrongkey.crt
