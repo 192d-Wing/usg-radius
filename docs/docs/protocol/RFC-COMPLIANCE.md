@@ -76,16 +76,23 @@ This document identifies gaps between the current USG RADIUS implementation and 
 
 **Status**: ✅ Complete
 **Implementation**: Thread-safe cache with automatic expiry and replay attack prevention
-**RFC**: RFC 2865 Section 2 - "The Identifier field aids in matching requests and replies"
+**RFC**: RFC 2865 Section 2 - "The Identifier field aids in matching requests and replies"; RFC 5080 §2.2.2
 
 **Features**:
 
-- ✅ Request fingerprinting (Source IP + Identifier + Authenticator)
-- ✅ Automatic cache expiry (configurable TTL, default 60s)
-- ✅ Thread-safe concurrent cache (DashMap)
-- ✅ Configurable max entries (default 10,000)
+- ✅ Request fingerprinting (Source IP + Identifier + first 8 octets of the Request Authenticator), plus a SHA-256 over the transport's shared secret and the whole request
+- ✅ **Retransmitted Access-Requests get the cached reply** (RFC 5080 §2.2.2, unreleased): a byte-identical retransmission, under the same shared secret, of a locally answered Access-Request (PAP, CHAP, EAP) within the TTL is answered with the identical reply, final Access-Accept / Access-Reject included, without processing the request again. The replay re-sends bytes already computed for exactly that request (for EAP, after its Message-Authenticator was verified) and acts on nothing new; it goes only to the source address and port the original came from, at most 8 times. A duplicate still in progress, one answered with no reply, or different content (or another secret) under the same fingerprint is dropped. `radius_retransmissions_replayed_total` counter. Interop scenario 15
+- ✅ Automatic cache expiry (configurable TTL, default 60s), also checked on lookup
+- ✅ Thread-safe concurrent cache (DashMap); admission is atomic per fingerprint
+- ✅ Configurable max entries (default 10,000); at most one cached reply (≤ 4096 octets) per entry. A full cache evicts an arbitrary entry (an unreleased fix: eviction used to deadlock the request task once the cache was full)
+- ✅ Packets failing Message-Authenticator verification, and Accounting-Requests failing their Request Authenticator (RFC 2866 §3), never reach the cache (RFC 5080 §2.2.2 "MUST NOT affect the cache in any way")
+- ⚠️ Non-EAP Access-Requests without a Message-Authenticator have nothing to verify, so a spoofer of a client address can still fill the cache with them (bounded by the rate limits) and push out cached replies; a full cache evicts an arbitrary entry
+- ⚠️ The default TTL (60 s) exceeds RFC 5080 §2.2.2's 5–30 s SHOULD; set `request_cache_ttl` to 30 or less to follow it. The TTL is also the window in which a reply can be replayed
+- ⚠️ Differences from RFC 2865 §3 / RFC 5080 §2.2.2 that do not affect a conformant NAS: the duplicate key is source IP + Identifier + Request Authenticator (the source port is compared only for a replay, which goes back to the original address and port), an older entry is not purged when its Identifier is reused with a new authenticator (it ages out), and a reply is replayed at most 8 times
 - ✅ Protection against replay attacks
 - ✅ Cache statistics and monitoring
+- ⚠️ Accounting-Request retransmissions are still dropped, not answered with the Accounting-Response again (outside RFC 5080 §2.2.2, which covers Access-Request; Status-Server is answered once by design, see RFC 5997)
+- ⚠️ Proxied Access-Requests are answered asynchronously by the proxy, so their replies are not cached: a NAS retransmission to the proxy is dropped while the original is in the cache (pre-existing behaviour)
 
 **Files**:
 
@@ -427,6 +434,7 @@ eap_handler.configure_tls("", cert_config)?;
 
 - ✅ HMAC-MD5 calculation over the packet with the attribute value zeroed
 - ✅ Verified whenever present on an Access-Request; an invalid value rejects the request
+- ✅ Verified first, before the duplicate cache and before proxy routing (unreleased): a packet failing the check leaves no cache entry and evicts nothing (RFC 5080 §2.2.2), and the proxy never forwards it re-signed under a home server's secret (before, routing ran first, so an EAP Access-Request with a missing or invalid Message-Authenticator from a spoofed client address reached the home server validly signed). Status-Server is checked at the same point
 - ✅ **Required** when EAP-Message is present; an EAP Access-Request without Message-Authenticator is rejected (RFC 3579 §3.2, "Blast-RADIUS" CVE-2024-3596 mitigation, v0.10.0)
 - ✅ Added to every Access-Accept, Access-Reject, and Access-Challenge that carries EAP-Message
 - ✅ Inside RadSec the fixed secret `"radsec"` is used for the HMAC per RFC 6614 §2.3
@@ -483,15 +491,45 @@ server does not originate tunnel attributes itself.
   every later Request increments it
 - ✅ §4.2 EAP-Success / EAP-Failure Identifier echoes the peer's last
   EAP-Response
-- ⚠️ §4.1 Identifier matching: an EAP-Response is not checked against the
-  Identifier of the outstanding Request, so a stale or duplicated Response
-  that reaches the server under a new RADIUS Identifier advances the
-  conversation (follow-up, together with the State redesign below)
-- ⚠️ State: the RADIUS State attribute is the session ID
-  (`username-millis-sequence`): predictable, not bound to the peer, able to
-  restart a live conversation when presented with a new Identity Response,
-  and longer than 253 octets for long User-Names. Replacing it with a random
-  16-octet ID keyed to the peer is a design change tracked as a follow-up
+- ✅ §4.1 Identifier matching (unreleased): each conversation tracks
+  the Identifier of its outstanding EAP-Request and accepts only an
+  EAP-Response carrying it, once. A Response with any other Identifier,
+  or a duplicate of one already processed that reaches the server under a
+  new RADIUS Identifier, is silently discarded (no RADIUS reply) without
+  advancing or refreshing the conversation; the matching Response then
+  proceeds. Concurrent copies cannot both be processed
+- ✅ State (RFC 2865 §5.24, RFC 5080 §2.1.1 / §2.1.2, unreleased): 16 octets from the
+  operating system's CSPRNG (`getrandom`), fixed length, never derived from
+  the User-Name or the time, constant for the whole conversation. The
+  conversation is bound to the RADIUS client address that started it and to
+  the request's NAS-IP-Address, NAS-IPv6-Address, NAS-Identifier and
+  User-Name; a State presented by another NAS or for another user gets an
+  Access-Reject and leaves the live conversation untouched. An
+  EAP-Response/Identity (or an Access-Request without EAP-Message) always
+  starts a new conversation, so a replayed State can neither resume nor
+  restart one
+- ⚠️ Over RadSec the shared secret is the public `"radsec"`, so the binding
+  rests on the peer IP and the NAS attributes, not on the peer's verified
+  client certificate: two RadSec NASes behind one NAT address are not told
+  apart. Binding the certificate identity is a follow-up
+- ✅ NAS retransmissions of an Access-Request get the cached reply, the final
+  Access-Accept / Access-Reject included (RFC 5080 §2.2.2; see Request
+  Deduplication under RFC 2865)
+- ✅ RFC 3579 §2.6.2 (unreleased): an Access-Request encapsulating an
+  EAP-Request (role reversal), EAP-Success or EAP-Failure gets an
+  Access-Reject without touching any conversation; for an EAP-Request the
+  Reject carries an EAP-Response/Nak offering no method
+- ✅ RFC 3579 §2.1 EAP-Start (an EAP-Message of length 2) starts a
+  conversation like an Access-Request without EAP-Message (unreleased; it
+  used to be rejected), provided the request carries a User-Name: every
+  Access-Request without one is dropped before the EAP handler
+- ⚠️ A Response that does not answer the outstanding Request is silently
+  discarded at the RADIUS level too (no reply), as RFC 3748 §4.1 asks of the
+  EAP authenticator; the RFC 3579 §2.2 alternative (an Access-Challenge with
+  Error-Cause 202 and the last EAP-Request, ending the conversation after
+  about 5 invalid packets) is not implemented. A NAS that forwards such
+  packets sees a RADIUS timeout for each; the conversation itself is
+  unaffected and idles out if nothing valid follows
 
 ---
 
@@ -642,7 +680,7 @@ the in-memory `users` list does.
 - ✅ Reply carries a correct Response Authenticator (RFC 2865 §3 / RFC 2866 §3) and a Message-Authenticator (the §5 attribute table permits it on both reply codes; radclient and FreeRADIUS verify it when present); Proxy-State echoed unmodified and in order (RFC 2865 §5.33); nothing else — no State, EAP-Message or Reply-Message
 - ✅ **The proxy never forwards Status-Server** (§4.3): it is answered before any routing decision, so a NAS probing the proxy learns the proxy's liveness only
 - ✅ **Home-server health probes are RFC 5997 clients**: random Request Authenticator (§3) and Identifier, Message-Authenticator under the home server's secret (§4.1), an ephemeral socket per probe so concurrent probes cannot mis-attribute replies. A reply counts only if it comes from the probed address with the same Identifier, its Response Authenticator verifies under that secret, and any Message-Authenticator it carries verifies too (§4.4, RFC 3579 §3.2). Access-Accept, Accounting-Response and an authenticated Access-Reject (which §4.2 permits a server to send) count as alive; an undecodable datagram, any other code, or a datagram that fails either check is skipped and the probe keeps waiting, so the probe fails only when its deadline passes without a verified reply
-- ✅ Rate limiting and the duplicate-request cache apply to Status-Server as to every other code (§6)
+- ✅ Rate limiting and the duplicate-request cache apply to Status-Server as to every other code (§6). An identical copy within the cache TTL is dropped: clients do not retransmit Status-Server (§4.1) and get at most one reply (§3); RFC 5080 §2.2.2's reply replay covers Access-Request only
 - ✅ Interop (scenario 14): radclient Status-Server to usg-home on 1812 → Access-Accept, on 1813 → Accounting-Response, to the proxy on 1812 → Access-Accept, each reply carrying a Message-Authenticator; wrong secret → no reply. The proxy's own probes against FreeRADIUS and usg-home are asserted to succeed with health checks enabled
 
 ### ⚠️ Partial
@@ -651,7 +689,6 @@ the in-memory `users` list does.
 
 - ⚠️ **No administrative switch.** §4.2 says servers SHOULD let an administrator globally enable or disable the acceptance of Status-Server (per-client control MAY be offered). Acceptance is always on — the default the RFC recommends — and cannot be turned off; use a firewall if a deployment must not answer probes
 - ⚠️ Response always indicates healthy; it is not tied to backend (LDAP/PostgreSQL) health. Kubernetes probes use the HTTP `/health/*` endpoints instead
-- ⚠️ A retransmitted Status-Server (same Identifier and Request Authenticator within the cache TTL) is dropped by the duplicate-request cache rather than answered with the cached reply (RFC 5080 §2.2.2 recommends replaying it). Pre-existing behaviour shared with every code
 
 **Priority**: LOW
 
@@ -1254,7 +1291,9 @@ The current implementation is **PRODUCTION-READY** for:
    - ⚠️ Capacity eviction is LRU, so a peer within the rate limits can still displace in-progress conversations once the cap is reached; size `eap.max_sessions` and the rate limits together
    - ✅ EAP-TEAP Crypto-Binding (RFC 9930 §4.2.13 / §6.3) verified before any Result is examined, fail closed on an invalid binding, nonce, version or Flags, and the MSK released only after a verified binding and both Results Success; version negotiation and EAP-Nak switching bounded to one renegotiation per conversation
    - ⚠️ EAP-TEAP with Basic-Password-Auth binds the inner method with the zero IMSK of RFC 9930 §6.2.1: the password is protected by the server-authenticated tunnel only, which the RFC marks NOT RECOMMENDED without a key-deriving inner method; supplicants must validate the server certificate (`ca_cert` / `domain_match`)
-   - ⚠️ EAP Identifier not matched on responses and State = `username-millis-sequence` (predictable, unbound to the peer, can restart a live conversation, may exceed 253 octets); redesign as random peer-bound IDs is a tracked follow-up (see RFC 3748 above)
+   - ⚠️ An Access-Request without EAP-Message (which therefore needs no Message-Authenticator) still starts an EAP conversation, so a spoofer of a client address can allocate sessions and push live ones toward LRU eviction within the rate limits (pre-existing)
+   - ✅ The proxy verifies the NAS's Message-Authenticator before routing (unreleased): an EAP Access-Request with a missing or invalid one is no longer forwarded re-signed under the home secret (RFC 3579 §3.2)
+   - ✅ EAP conversations are named by a 16-octet CSPRNG State bound to the NAS (client address, NAS-IP-Address / NAS-IPv6-Address / NAS-Identifier) and the User-Name; a State from anyone else is rejected without touching the conversation, an Identity Response never resumes or restarts one, and EAP-Responses must answer the outstanding Request's Identifier (others silently discarded, RFC 3748 §4.1); NAS retransmissions get the cached reply (RFC 5080 §2.2.2)
 
 5. **EAP-TEAP Inner Authentication**
    - ✅ Basic-Password-Auth fails closed: no stored password, empty stored password or empty supplied password → Result=Failure inside the tunnel and Access-Reject; constant-time password comparison. An unreleased build (after v0.12.0, before v0.13.0) accepted an empty password for any user without a stored password

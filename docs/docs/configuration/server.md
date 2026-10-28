@@ -317,11 +317,17 @@ Request deduplication cache time-to-live in seconds.
 }
 ```
 
-Prevents replay attacks by caching request authenticators.
+Prevents replay attacks by caching request authenticators. Within the TTL a
+byte-identical retransmission of a locally answered Access-Request (a NAS that
+lost the reply), from the same address and port, gets the cached reply again,
+unchanged (RFC 5080 §2.2.2); other duplicates are dropped. Keep the TTL longer than your NASes' retransmission
+schedule.
 
 ### request_cache_max_entries
 
-Maximum number of cached requests for deduplication.
+Maximum number of cached requests for deduplication. Each entry holds at most
+one cached reply (≤ 4096 octets), so the cache uses at most about 4 KiB per
+entry.
 
 - **Type**: Integer
 - **Default**: `10000`

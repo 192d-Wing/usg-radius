@@ -75,7 +75,7 @@ pub use access::{
 };
 pub use accounting::{AccountingHandler, AccountingResult, Session, SimpleAccountingHandler};
 pub use audit::{AuditEntry, AuditEventType, AuditLogger};
-pub use cache::{RequestCache, RequestFingerprint};
+pub use cache::{Admission, RequestCache, RequestFingerprint};
 pub use config::{AccountingPort, AccountingPortMode, Client, Config, ConfigError, User};
 pub use eap_auth::EapAuthHandler;
 pub use ldap_auth::{LdapAuthHandler, LdapConfig, LdapError};

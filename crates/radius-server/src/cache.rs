@@ -4,12 +4,16 @@
 //! Helps prevent replay attacks and ensures proper handling of retransmissions.
 
 use dashmap::DashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time;
 use tracing::debug;
+
+/// Process-wide count of retransmitted Access-Requests answered with the
+/// cached reply (exported as `radius_retransmissions_replayed_total`).
+pub static RETRANSMISSIONS_REPLAYED: AtomicU64 = AtomicU64::new(0);
 
 /// Request fingerprint for deduplication
 ///
@@ -43,13 +47,86 @@ impl RequestFingerprint {
     }
 }
 
+/// How many times one cached reply is sent again. A NAS retransmits a few
+/// times (typically 3 to 5); the cap bounds what a captured request can
+/// reflect toward its NAS.
+pub const MAX_REPLAYS_PER_REQUEST: u8 = 8;
+
 /// Cached request entry with timestamp
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CacheEntry {
     /// When this entry was created
     inserted_at: Instant,
-    /// Full authenticator for verification (optional, for stricter checking)
-    _authenticator: [u8; 16],
+    /// [`request_digest`] of the request: a later packet under the same
+    /// fingerprint is a retransmission only if it is byte-identical and
+    /// arrived under the same shared secret.
+    request_digest: [u8; 32],
+    /// Address the request came from and its reply went to. A cached reply
+    /// is only ever sent there again.
+    source: SocketAddr,
+    /// The encoded reply, once one was sent and is replayable (RFC 5080
+    /// §2.2.2). `None` while the request is being processed, when it got no
+    /// reply, or when its replies are not cached.
+    reply: Option<Arc<[u8]>>,
+    /// Times `reply` has been sent again (see [`MAX_REPLAYS_PER_REQUEST`]).
+    replays: u8,
+}
+
+/// Prints the reply's length only: a cached Access-Accept carries MS-MPPE
+/// and Tunnel-Password values.
+impl std::fmt::Debug for CacheEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheEntry")
+            .field("inserted_at", &self.inserted_at)
+            .field("source", &self.source)
+            .field("reply_len", &self.reply.as_ref().map(|r| r.len()))
+            .field("replays", &self.replays)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What [`RequestCache::admit`] decided about a request.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// Not seen within the TTL: process it. It is now recorded as in progress.
+    New,
+    /// A byte-identical copy is being processed, was processed without a
+    /// replayable reply, came from another address than the original, or
+    /// has had its reply replayed [`MAX_REPLAYS_PER_REQUEST`] times: drop it.
+    InProgress,
+    /// A byte-identical retransmission of a request already answered, from
+    /// the same address and under the same secret: send this reply again,
+    /// unchanged (RFC 5080 §2.2.2).
+    Replay(Arc<[u8]>),
+    /// Same source, Identifier and Request Authenticator prefix as a recent
+    /// request but different content (or another shared secret): drop it.
+    Conflict,
+}
+
+/// Prints the replayed reply's length only (see [`CacheEntry`]'s `Debug`).
+impl std::fmt::Debug for Admission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Admission::New => f.write_str("New"),
+            Admission::InProgress => f.write_str("InProgress"),
+            Admission::Replay(reply) => write!(f, "Replay(<{} octets>)", reply.len()),
+            Admission::Conflict => f.write_str("Conflict"),
+        }
+    }
+}
+
+/// Identity of a retransmission: SHA-256 over the shared secret in force
+/// for the transport (length-prefixed) and the request's bytes. A cached
+/// reply's Response Authenticator, Message-Authenticator and MS-MPPE keys
+/// are bound to that secret, so the same bytes arriving under another
+/// secret (UDP vs. RadSec from one address) never match.
+pub fn request_digest(secret: &[u8], request: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update((secret.len() as u64).to_be_bytes());
+    h.update(secret);
+    h.update(request);
+    h.finalize().into()
 }
 
 /// Request cache for duplicate detection
@@ -119,10 +196,15 @@ impl RequestCache {
                         .map(|entry| entry.key().clone())
                         .collect();
 
-                    // Remove expired entries
+                    // Remove expired entries, unless `admit` replaced one
+                    // with a fresh entry in the meantime.
                     for key in expired_keys {
-                        cache_clone.remove(&key);
-                        removed += 1;
+                        if cache_clone
+                            .remove_if(&key, |_, e| now.duration_since(e.inserted_at) > ttl)
+                            .is_some()
+                        {
+                            removed += 1;
+                        }
                     }
 
                     if removed > 0 {
@@ -148,37 +230,98 @@ impl RequestCache {
 
     /// Check if a request is a duplicate
     ///
-    /// Returns `true` if this request was seen recently, `false` otherwise.
-    /// Also adds the request to the cache if it's new.
-    ///
-    /// This method no longer performs inline cleanup - the background task handles expiry.
+    /// Returns `true` if a request with this fingerprint was seen recently,
+    /// `false` otherwise (and records it). Kept for callers that only need
+    /// duplicate detection; the server uses [`Self::admit`], which also
+    /// replays cached replies.
     pub fn is_duplicate(&self, fingerprint: RequestFingerprint, authenticator: [u8; 16]) -> bool {
-        // Check if request already exists
-        if self.cache.contains_key(&fingerprint) {
-            return true;
-        }
+        let source = SocketAddr::new(fingerprint.source_ip, 0);
+        self.admit(fingerprint, source, request_digest(&[], &authenticator)) != Admission::New
+    }
 
-        // Enforce max entries limit with simple FIFO eviction
-        if self.cache.len() >= self.max_entries {
-            // Remove oldest entry (simple FIFO eviction)
-            // Background cleanup will handle expired entries over time
-            if let Some(entry) = self.cache.iter().next() {
-                let key_to_remove = entry.key().clone();
-                drop(entry);
-                self.cache.remove(&key_to_remove);
+    /// Decide what to do with a request from `source` whose
+    /// [`request_digest`] is `digest`, atomically with respect to concurrent
+    /// copies of it.
+    ///
+    /// RFC 5080 §2.2.2: a server that receives a duplicate of a request it
+    /// has answered sends the same reply again instead of processing the
+    /// request a second time, and drops duplicates of a request still being
+    /// processed. A packet is treated as a retransmission only when it is
+    /// byte-identical to the recorded request under the same shared secret
+    /// (same Identifier and Request Authenticator, and the same attributes,
+    /// so the same State and EAP-Message): a replay sends bytes already
+    /// computed for exactly that request and acts on nothing new. The reply
+    /// is replayed only to the address the original came from, at most
+    /// [`MAX_REPLAYS_PER_REQUEST`] times, so a captured request cannot be
+    /// used to reflect replies elsewhere or without bound. Entries older
+    /// than the TTL are replaced as if absent.
+    pub fn admit(
+        &self,
+        fingerprint: RequestFingerprint,
+        source: SocketAddr,
+        digest: [u8; 32],
+    ) -> Admission {
+        use dashmap::mapref::entry::Entry;
+
+        let now = Instant::now();
+
+        // Make room first by dropping an arbitrary entry (expired ones go
+        // with the background cleanup). Pick the victim in its own
+        // statement: an iterator still alive across `remove` holds its
+        // shard's lock and deadlocks.
+        if self.cache.len() >= self.max_entries && !self.cache.contains_key(&fingerprint) {
+            let victim = self.cache.iter().next().map(|e| e.key().clone());
+            if let Some(key) = victim {
+                self.cache.remove(&key);
             }
         }
 
-        // Add to cache
-        self.cache.insert(
-            fingerprint,
-            CacheEntry {
-                inserted_at: Instant::now(),
-                _authenticator: authenticator,
-            },
-        );
+        let fresh = CacheEntry {
+            inserted_at: now,
+            request_digest: digest,
+            source,
+            reply: None,
+            replays: 0,
+        };
+        match self.cache.entry(fingerprint) {
+            Entry::Vacant(slot) => {
+                slot.insert(fresh);
+                Admission::New
+            }
+            Entry::Occupied(mut slot) => {
+                let entry = slot.get_mut();
+                if now.duration_since(entry.inserted_at) > self.ttl {
+                    slot.insert(fresh);
+                    Admission::New
+                } else if entry.request_digest != digest {
+                    Admission::Conflict
+                } else if entry.source != source || entry.replays >= MAX_REPLAYS_PER_REQUEST {
+                    Admission::InProgress
+                } else {
+                    match &entry.reply {
+                        Some(reply) => {
+                            entry.replays += 1;
+                            Admission::Replay(Arc::clone(reply))
+                        }
+                        None => Admission::InProgress,
+                    }
+                }
+            }
+        }
+    }
 
-        false
+    /// Record `reply` as the answer to the request admitted under
+    /// `fingerprint` with `digest`, so that a retransmission of it within the
+    /// TTL gets it again. Does nothing if the entry has since expired, been
+    /// evicted or been replaced by different content. The cache holds at
+    /// most `max_entries` replies, each at most one RADIUS packet (4096
+    /// octets).
+    pub fn store_reply(&self, fingerprint: &RequestFingerprint, digest: &[u8; 32], reply: &[u8]) {
+        if let Some(mut entry) = self.cache.get_mut(fingerprint)
+            && entry.request_digest == *digest
+        {
+            entry.reply = Some(Arc::from(reply));
+        }
     }
 
     /// Get the number of entries in the cache
@@ -316,8 +459,9 @@ mod tests {
         assert!(!cache.is_duplicate(fingerprint.clone(), auth));
     }
 
+    /// Filling the cache evicts an entry instead of deadlocking on the
+    /// iterator's shard lock (this test used to hang and was ignored).
     #[test]
-    #[ignore] // FIXME: This test hangs - investigate DashMap iteration issue
     fn test_cache_max_entries() {
         let cache = RequestCache::new_no_background(Duration::from_secs(60), 3);
 
@@ -346,6 +490,150 @@ mod tests {
 
         // Cache should still be at max (one was evicted)
         assert_eq!(cache.len(), 3);
+    }
+
+    fn fp(id: u8) -> RequestFingerprint {
+        RequestFingerprint::new("192.0.2.1".parse().unwrap(), id, &[7u8; 16])
+    }
+
+    fn nas() -> SocketAddr {
+        "192.0.2.1:40000".parse().unwrap()
+    }
+
+    fn digest(request: &[u8]) -> [u8; 32] {
+        request_digest(b"client-secret", request)
+    }
+
+    /// RFC 5080 §2.2.2: a byte-identical retransmission is dropped while the
+    /// original is in progress and gets the same reply once one was sent.
+    #[test]
+    fn admit_replays_the_reply_to_a_byte_identical_retransmission() {
+        let cache = RequestCache::new_no_background(Duration::from_secs(60), 100);
+        let request = digest(b"access-request bytes");
+
+        assert_eq!(cache.admit(fp(1), nas(), request), Admission::New);
+        assert_eq!(cache.admit(fp(1), nas(), request), Admission::InProgress);
+
+        cache.store_reply(&fp(1), &request, b"access-challenge bytes");
+        assert_eq!(
+            cache.admit(fp(1), nas(), request),
+            Admission::Replay(Arc::from(&b"access-challenge bytes"[..]))
+        );
+        // Still replayable for further retransmissions.
+        assert!(matches!(
+            cache.admit(fp(1), nas(), request),
+            Admission::Replay(_)
+        ));
+    }
+
+    /// Same fingerprint, different content: never answered from the cache,
+    /// and a reply is never stored against a request it does not answer.
+    #[test]
+    fn admit_refuses_different_content_under_the_same_fingerprint() {
+        let cache = RequestCache::new_no_background(Duration::from_secs(60), 100);
+        assert_eq!(
+            cache.admit(fp(2), nas(), digest(b"original")),
+            Admission::New
+        );
+        cache.store_reply(&fp(2), &digest(b"original"), b"reply");
+        assert_eq!(
+            cache.admit(fp(2), nas(), digest(b"forged")),
+            Admission::Conflict
+        );
+
+        cache.store_reply(&fp(2), &digest(b"forged"), b"other reply");
+        assert_eq!(
+            cache.admit(fp(2), nas(), digest(b"original")),
+            Admission::Replay(Arc::from(&b"reply"[..]))
+        );
+    }
+
+    /// The same bytes under another shared secret (RadSec's "radsec" vs. a
+    /// UDP client secret, from one address) are not a retransmission: the
+    /// cached reply's authenticators and MS-MPPE keys belong to the other
+    /// secret.
+    #[test]
+    fn admit_binds_the_reply_to_the_shared_secret() {
+        let cache = RequestCache::new_no_background(Duration::from_secs(60), 100);
+        let over_radsec = request_digest(b"radsec", b"same bytes");
+        assert_eq!(cache.admit(fp(3), nas(), over_radsec), Admission::New);
+        cache.store_reply(&fp(3), &over_radsec, b"accept");
+        let over_udp = request_digest(b"client-secret", b"same bytes");
+        assert_eq!(cache.admit(fp(3), nas(), over_udp), Admission::Conflict);
+        // Length-prefixed: moving octets between secret and request changes the digest.
+        assert_ne!(request_digest(b"ab", b"c"), request_digest(b"a", b"bc"));
+    }
+
+    /// A cached reply goes only back to the address the original came from,
+    /// and at most MAX_REPLAYS_PER_REQUEST times: a captured request cannot
+    /// reflect it to other ports or without bound.
+    #[test]
+    fn admit_replays_only_to_the_original_address_and_a_bounded_number_of_times() {
+        let cache = RequestCache::new_no_background(Duration::from_secs(60), 100);
+        let request = digest(b"req");
+        assert_eq!(cache.admit(fp(4), nas(), request), Admission::New);
+        cache.store_reply(&fp(4), &request, b"reply");
+
+        let other_port: SocketAddr = "192.0.2.1:40001".parse().unwrap();
+        assert_eq!(
+            cache.admit(fp(4), other_port, request),
+            Admission::InProgress
+        );
+
+        for _ in 0..MAX_REPLAYS_PER_REQUEST {
+            assert!(matches!(
+                cache.admit(fp(4), nas(), request),
+                Admission::Replay(_)
+            ));
+        }
+        assert_eq!(cache.admit(fp(4), nas(), request), Admission::InProgress);
+    }
+
+    /// A reply is not replayed after the TTL: the packet is new again.
+    #[test]
+    fn admit_treats_an_expired_entry_as_new() {
+        let cache = RequestCache::new_no_background(Duration::from_millis(20), 100);
+        let request = digest(b"req");
+        assert_eq!(cache.admit(fp(5), nas(), request), Admission::New);
+        cache.store_reply(&fp(5), &request, b"reply");
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(cache.admit(fp(5), nas(), request), Admission::New);
+        assert_eq!(cache.admit(fp(5), nas(), request), Admission::InProgress);
+    }
+
+    /// Storing a reply for a request that was evicted in the meantime does
+    /// nothing, and the cache stays within `max_entries` while full.
+    #[test]
+    fn store_reply_after_eviction_is_a_no_op_and_the_bound_holds() {
+        let cache = RequestCache::new_no_background(Duration::from_secs(60), 2);
+        assert_eq!(cache.admit(fp(6), nas(), digest(b"a")), Admission::New);
+        assert_eq!(cache.admit(fp(7), nas(), digest(b"b")), Admission::New);
+        assert_eq!(cache.admit(fp(8), nas(), digest(b"c")), Admission::New);
+        assert_eq!(cache.len(), 2);
+        let evicted = [6u8, 7]
+            .into_iter()
+            .find(|id| !cache.cache.contains_key(&fp(*id)))
+            .expect("one of the first two entries was evicted");
+        cache.store_reply(&fp(evicted), &digest(b"x"), b"reply");
+        assert!(!cache.cache.contains_key(&fp(evicted)));
+        assert_eq!(cache.len(), 2);
+    }
+
+    /// Debug output never contains a cached reply's bytes.
+    #[test]
+    fn debug_output_shows_reply_length_only() {
+        let reply: Arc<[u8]> = Arc::from(&b"\x1a\x0csecret-mppe"[..]);
+        let shown = format!("{:?}", Admission::Replay(Arc::clone(&reply)));
+        assert_eq!(shown, format!("Replay(<{} octets>)", reply.len()));
+        let entry = CacheEntry {
+            inserted_at: Instant::now(),
+            request_digest: [0; 32],
+            source: nas(),
+            reply: Some(reply),
+            replays: 0,
+        };
+        let shown = format!("{entry:?}");
+        assert!(!shown.contains("secret-mppe") && !shown.contains("115, 101"));
     }
 
     #[tokio::test]

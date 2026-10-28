@@ -5,6 +5,7 @@
 # derived the Basic-Password-Auth MSK from S-IMCK[0] instead of S-IMCK[1] and
 # would report an MS-MPPE key mismatch against an RFC 9930 server. Debian bookworm's OpenSSL 3.0 does not add a
 # hybrid ML-KEM key share, so the TLS 1.3 ClientHello fits in one EAP fragment.
+# The openssl CLI signs the hand-built Access-Requests of retransmit-tests.sh.
 FROM debian:bookworm-slim AS build
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,10 +25,10 @@ RUN cd wpa_supplicant && cp ../.config .config && make -j"$(nproc)" eapol_test \
 FROM debian:bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libssl3 libnl-3-200 libnl-genl-3-200 freeradius-utils ca-certificates \
+        libssl3 libnl-3-200 libnl-genl-3-200 freeradius-utils ca-certificates openssl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/eapol_test /usr/local/bin/eapol_test
-COPY run-tests.sh /usr/local/bin/run-tests.sh
+COPY run-tests.sh retransmit-tests.sh /usr/local/bin/
 COPY *.conf /etc/eapol_test/
-RUN chmod 0755 /usr/local/bin/run-tests.sh && eapol_test 2>&1 | head -1
+RUN chmod 0755 /usr/local/bin/run-tests.sh /usr/local/bin/retransmit-tests.sh && eapol_test 2>&1 | head -1
 ENTRYPOINT ["/usr/local/bin/run-tests.sh"]

@@ -6,9 +6,12 @@
 //! The EAP handler integrates with the RADIUS server's AuthHandler trait and manages
 //! multi-round EAP authentication sessions.
 
-use radius_proto::eap::{EapCode, EapPacket, EapSessionManager, EapState, EapType, EvictionReason};
-use radius_proto::{Attribute, AttributeType, Packet};
+use radius_proto::eap::{
+    EapCode, EapPacket, EapSessionManager, EapState, EapType, EvictionReason, ResponseClaim,
+};
+use radius_proto::{Attribute, AttributeType, Code, Packet};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::{debug, error, warn};
@@ -32,6 +35,12 @@ pub static EAP_SESSIONS_EVICTED_IDLE: AtomicU64 = AtomicU64::new(0);
 /// Process-wide count of EAP sessions evicted because the store was full
 /// (exported as `radius_eap_sessions_evicted_total{reason="capacity"}`).
 pub static EAP_SESSIONS_EVICTED_CAPACITY: AtomicU64 = AtomicU64::new(0);
+
+/// Length in octets of the RADIUS State attribute that names an EAP
+/// conversation: 128 bits from the operating system's CSPRNG, never derived
+/// from the User-Name or the time, and far below the 253-octet attribute
+/// limit (RFC 2865 §5.24, §5).
+pub const STATE_LEN: usize = 16;
 
 /// Largest EAP-TLS / EAP-TEAP fragment the server sends, in bytes of
 /// EAP-TLS Type-Data (RFC 5216 §2.1.5 / RFC 9930 §3.3). 1020 keeps a fragment
@@ -85,10 +94,6 @@ pub struct EapAuthHandler {
     evicted_idle: AtomicU64,
     evicted_capacity: AtomicU64,
 
-    /// Makes session IDs unique when one user starts several conversations
-    /// within the same millisecond.
-    session_seq: AtomicU64,
-
     /// Override of the per-conversation EAP-TEAP Phase 2 round bound
     /// (`None` = `EapTeapServer::MAX_PHASE2_ROUNDS`).
     #[cfg(feature = "tls")]
@@ -127,7 +132,6 @@ impl EapAuthHandler {
             max_fragment_size: DEFAULT_MAX_FRAGMENT_SIZE,
             evicted_idle: AtomicU64::new(0),
             evicted_capacity: AtomicU64::new(0),
-            session_seq: AtomicU64::new(0),
             #[cfg(feature = "tls")]
             teap_max_phase2_rounds: None,
         }
@@ -432,39 +436,63 @@ impl EapAuthHandler {
         Ok(())
     }
 
+    /// The session ID a RADIUS State attribute names: the lowercase hex of
+    /// the State's [`STATE_LEN`] octets. `None` for a missing State or one of
+    /// any other length, which therefore never names a session.
+    fn session_id_for_state(state: Option<&[u8]>) -> Option<String> {
+        let state = state.filter(|s| s.len() == STATE_LEN)?;
+        Some(state.iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    /// The State attribute value of session `session_id` (inverse of
+    /// [`Self::session_id_for_state`]; session IDs are only ever created
+    /// from State octets by [`Self::start_session`]).
+    fn state_for(session_id: &str) -> Vec<u8> {
+        (0..session_id.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(session_id.get(i..i + 2)?, 16).ok())
+            .collect()
+    }
+
     /// Resolve the session a RADIUS State attribute refers to, without
-    /// changing its LRU position (see [`Self::finish`]). `None` when there is
-    /// no State or it names no live session (expired, evicted, finished or
-    /// never ours).
+    /// changing its LRU position. `None` when there is no State or it names
+    /// no live session (expired, evicted, finished or never ours).
+    #[cfg(test)]
     fn resolve_session(&self, state: Option<&[u8]>) -> Option<String> {
-        // State format: session_id encoded as string
-        let session_id = String::from_utf8(state?.to_vec()).ok()?;
+        let session_id = Self::session_id_for_state(state)?;
         let manager = self.session_manager.read().unwrap();
         manager.get_session(&session_id)?;
         Some(session_id)
     }
 
-    /// Get or create an EAP session for a user
-    fn get_or_create_session(&self, username: &str, state: Option<&[u8]>) -> String {
-        if let Some(session_id) = self.resolve_session(state) {
-            return session_id;
-        }
+    /// Start a new conversation bound to `binding` (see
+    /// [`conversation_binding`]) and return its session ID.
+    ///
+    /// The conversation is named by a fresh State of [`STATE_LEN`] octets
+    /// from the operating system's CSPRNG, so the State reveals nothing about
+    /// the user and cannot be predicted from earlier ones. `None` (the caller
+    /// rejects) if the CSPRNG fails or the State collides with a live
+    /// conversation, which is never replaced.
+    fn start_session(&self, binding: Vec<u8>) -> Option<String> {
+        use rand::TryRng;
 
         // Make room first: idle conversations go, then (if the store is
         // full) the least recently used one.
         self.reap_at(Self::now_secs());
 
-        // Create new session
-        let seq = self.session_seq.fetch_add(1, Ordering::Relaxed);
-        let session_id = format!(
-            "{}-{}-{}",
-            username,
-            chrono::Utc::now().timestamp_millis(),
-            seq
-        );
+        let mut state = [0u8; STATE_LEN];
+        if let Err(e) = rand::rngs::SysRng.try_fill_bytes(&mut state) {
+            error!(error = %e, "EAP: OS CSPRNG failed; cannot start a conversation");
+            return None;
+        }
+        let session_id = Self::session_id_for_state(Some(&state))?;
         let mut manager = self.session_manager.write().unwrap();
-        manager.create_session(session_id.clone());
-        session_id
+        if manager.get_session(&session_id).is_some() {
+            error!("EAP: new State collides with a live conversation; refusing");
+            return None;
+        }
+        manager.create_session(session_id.clone()).peer_binding = binding;
+        Some(session_id)
     }
 
     /// Handle EAP-Identity exchange.
@@ -683,7 +711,7 @@ impl EapAuthHandler {
                 );
                 AuthResult::Challenge {
                     message: Some("EAP-TLS authentication".to_string()),
-                    state: session_id.as_bytes().to_vec(),
+                    state: Self::state_for(session_id),
                     attributes: eap_attrs,
                 }
             }
@@ -781,7 +809,7 @@ impl EapAuthHandler {
                     );
                     return AuthResult::Challenge {
                         message: Some("EAP-TEAP authentication".to_string()),
-                        state: session_id.as_bytes().to_vec(),
+                        state: Self::state_for(session_id),
                         attributes: eap_attrs,
                     };
                 }
@@ -839,7 +867,7 @@ impl EapAuthHandler {
             match radius_proto::eap::eap_to_radius_attributes(&eap_packet) {
                 Ok(attrs) => Some(AuthResult::Challenge {
                     message: None,
-                    state: session_id.as_bytes().to_vec(),
+                    state: Self::state_for(session_id),
                     attributes: attrs,
                 }),
                 Err(e) => {
@@ -1103,7 +1131,7 @@ impl EapAuthHandler {
             match radius_proto::eap::eap_to_radius_attributes(&eap_packet) {
                 Ok(attrs) => Some(AuthResult::Challenge {
                     message: None,
-                    state: session_id.as_bytes().to_vec(),
+                    state: Self::state_for(session_id),
                     attributes: attrs,
                 }),
                 Err(e) => {
@@ -1299,12 +1327,88 @@ impl AuthHandler for EapAuthHandler {
         }
 
         // Initial request - start EAP-Identity
-        let session_id = self.get_or_create_session(username, None);
+        let mut request = Packet::new(Code::AccessRequest, 0, [0u8; 16]);
+        if let Ok(a) = Attribute::string(AttributeType::UserName as u8, username) {
+            request.add_attribute(a);
+        }
+        let Some(session_id) = self.start_session(conversation_binding(&request, None)) else {
+            return AuthResult::Reject;
+        };
         let result = self.handle_identity(username, &session_id);
         self.finish(&session_id, result)
     }
 
+    /// Without the client's address the conversation is bound to the NAS
+    /// attributes and User-Name only; the server always calls
+    /// [`Self::authenticate_request_from`].
     fn authenticate_request(&self, request: &Packet, _secret: &[u8]) -> AuthResult {
+        self.authenticate_eap(request, None)
+    }
+
+    fn authenticate_request_from(
+        &self,
+        request: &Packet,
+        _secret: &[u8],
+        client: IpAddr,
+    ) -> AuthResult {
+        self.authenticate_eap(request, Some(client))
+    }
+
+    fn get_user_password(&self, username: &str) -> Option<String> {
+        // Delegate to inner handler
+        self.inner_handler.get_user_password(username)
+    }
+
+    fn get_accept_attributes(&self, username: &str) -> Vec<Attribute> {
+        // MS-MPPE keys are not added here: they are per-request (bound to the
+        // Request Authenticator) and travel on `AuthResult::Accept::msk`.
+        self.inner_handler.get_accept_attributes(username)
+    }
+}
+
+/// Canonical encoding of who started an EAP conversation: the RADIUS client
+/// as the transport saw it (`client`, the UDP source or RadSec peer address;
+/// `None` when the caller does not know it) and the request's
+/// NAS-IP-Address, NAS-IPv6-Address, NAS-Identifier and User-Name. Every
+/// later Access-Request of the conversation must produce the same bytes, so
+/// a State replayed by another NAS, or for another user, names nothing it
+/// can use (see [`EapSessionManager::claim_response`]). Each field is a tag,
+/// a presence octet and, when present, a two-octet length and the value, so
+/// distinct tuples never encode alike.
+fn conversation_binding(request: &Packet, client: Option<IpAddr>) -> Vec<u8> {
+    fn put(out: &mut Vec<u8>, tag: u8, value: Option<&[u8]>) {
+        out.push(tag);
+        match value {
+            Some(v) => {
+                out.push(1);
+                out.extend_from_slice(&(v.len() as u16).to_be_bytes());
+                out.extend_from_slice(v);
+            }
+            None => out.push(0),
+        }
+    }
+    let mut out = Vec::with_capacity(64);
+    let client = client.map(|ip| match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.octets().to_vec(),
+        IpAddr::V6(v6) => v6.octets().to_vec(),
+    });
+    put(&mut out, 0, client.as_deref());
+    for t in [
+        AttributeType::NasIpAddress,
+        AttributeType::NasIpv6Address,
+        AttributeType::NasIdentifier,
+        AttributeType::UserName,
+    ] {
+        let value = request.find_attribute(t as u8).map(|a| a.value.as_slice());
+        put(&mut out, t as u8, value);
+    }
+    out
+}
+
+impl EapAuthHandler {
+    /// [`AuthHandler::authenticate_request_from`] body; `client` is `None`
+    /// when entered through [`AuthHandler::authenticate_request`].
+    fn authenticate_eap(&self, request: &Packet, client: Option<IpAddr>) -> AuthResult {
         // Extract username
         let username = request
             .find_attribute(1) // UserName
@@ -1328,17 +1432,24 @@ impl AuthHandler for EapAuthHandler {
         // and a late packet for it fails closed instead of reviving it.
         self.reap_idle_at(Self::now_secs());
 
-        if eap_messages.is_empty() {
-            // No EAP-Message - this is initial request, start EAP-Identity
-            let session_id = self.get_or_create_session(&username, state);
-            let result = self.handle_identity(&username, &session_id);
-            return self.finish(&session_id, result);
-        }
+        let binding = conversation_binding(request, client);
 
         // Reassemble EAP packet from EAP-Message attributes
         let mut eap_data = Vec::new();
-        for msg in eap_messages {
+        for msg in &eap_messages {
             eap_data.extend_from_slice(&msg.value);
+        }
+
+        if eap_data.is_empty() {
+            // No EAP-Message, or RFC 3579 §2.1 EAP-Start (one EAP-Message of
+            // length 2, no data): an initial request, start a new
+            // conversation. A State here is ignored; it never resumes or
+            // restarts one.
+            let Some(session_id) = self.start_session(binding) else {
+                return AuthResult::Reject;
+            };
+            let result = self.handle_identity(&username, &session_id);
+            return self.finish(&session_id, result);
         }
 
         // Parse EAP packet
@@ -1347,14 +1458,31 @@ impl AuthHandler for EapAuthHandler {
             Err(_) => return AuthResult::Reject,
         };
 
-        // An EAP-Response/Identity starts a conversation (creating the
-        // session, after the reaper has made room). Any other EAP-Response
-        // must name a live conversation through State; one that does not
-        // (expired, evicted, finished, forged) is rejected without allocating
-        // anything, so stale or bogus State cannot churn the session store.
+        // Only an EAP-Response travels from the NAS to this server. RFC 3579
+        // §2.6.2: an Access-Request encapsulating an EAP-Request (role
+        // reversal) MUST get an Access-Reject (the server attaches the Nak);
+        // a Success or Failure is no more valid. No session is looked up,
+        // created or consumed.
+        if eap_packet.code != EapCode::Response {
+            warn!(
+                username,
+                eap_code = ?eap_packet.code,
+                "Access-Request carries an EAP packet that is not a Response; rejecting"
+            );
+            return AuthResult::Reject;
+        }
+
+        // An EAP-Response/Identity always starts a new conversation (creating
+        // the session, after the reaper has made room); a State it carries is
+        // ignored, so replaying a State can never restart a live
+        // conversation. Any other EAP-Response must name a live conversation
+        // through State, come from the NAS and for the User-Name that started
+        // it, and answer the outstanding EAP-Request; see the match below.
         let session_id = match eap_packet.eap_type {
             Some(EapType::Identity) => {
-                let session_id = self.get_or_create_session(&username, state);
+                let Some(session_id) = self.start_session(binding) else {
+                    return AuthResult::Reject;
+                };
                 // RFC 3748 §4.1: the NAS chose the Identifier of its
                 // EAP-Request/Identity, which the peer echoed here; our first
                 // Request must carry a different one, so continue the NAS's
@@ -1369,18 +1497,58 @@ impl AuthHandler for EapAuthHandler {
                 }
                 session_id
             }
-            _ => match self.resolve_session(state) {
-                Some(id) => id,
-                None => {
-                    warn!(
-                        username,
-                        eap_type = ?eap_packet.eap_type,
-                        has_state = state.is_some(),
-                        "EAP-Response for no live session (expired, evicted or unknown State); rejecting"
-                    );
-                    return AuthResult::Reject;
+            _ => {
+                let claim = match Self::session_id_for_state(state) {
+                    Some(id) => {
+                        let claim = self.session_manager.write().unwrap().claim_response(
+                            &id,
+                            &binding,
+                            eap_packet.identifier,
+                        );
+                        (id, claim)
+                    }
+                    None => (String::new(), ResponseClaim::UnknownSession),
+                };
+                match claim {
+                    (id, ResponseClaim::Claimed) => id,
+                    // Expired, evicted, finished, forged or malformed State:
+                    // rejected without allocating anything, so stale or bogus
+                    // State cannot churn the session store.
+                    (_, ResponseClaim::UnknownSession) => {
+                        warn!(
+                            username,
+                            eap_type = ?eap_packet.eap_type,
+                            has_state = state.is_some(),
+                            "EAP-Response for no live session (expired, evicted or unknown State); rejecting"
+                        );
+                        return AuthResult::Reject;
+                    }
+                    // A State presented by another NAS, or for another user,
+                    // is refused without touching the live conversation
+                    // (no LRU refresh, no activity, no state change).
+                    (_, ResponseClaim::BindingMismatch) => {
+                        warn!(
+                            username,
+                            client = ?client,
+                            "EAP State presented by a different NAS or for a different User-Name; \
+                             rejecting without touching the conversation"
+                        );
+                        return AuthResult::Reject;
+                    }
+                    // RFC 3748 §4.1: a Response whose Identifier does not match
+                    // the outstanding Request is silently discarded, and so is a
+                    // duplicate of one already processed. The conversation is
+                    // untouched, so the matching Response still proceeds.
+                    (id, ResponseClaim::IdentifierMismatch) => {
+                        debug!(
+                            session_id = id,
+                            identifier = eap_packet.identifier,
+                            "EAP-Response does not answer the outstanding Request; silently discarded"
+                        );
+                        return AuthResult::Discard;
+                    }
                 }
-            },
+            }
         };
 
         // Route to appropriate EAP method handler based on type
@@ -1407,17 +1575,6 @@ impl AuthHandler for EapAuthHandler {
 
         // Release the conversation's state on Accept / Reject.
         self.finish(&session_id, result)
-    }
-
-    fn get_user_password(&self, username: &str) -> Option<String> {
-        // Delegate to inner handler
-        self.inner_handler.get_user_password(username)
-    }
-
-    fn get_accept_attributes(&self, username: &str) -> Vec<Attribute> {
-        // MS-MPPE keys are not added here: they are per-request (bound to the
-        // Request Authenticator) and travel on `AuthResult::Accept::msk`.
-        self.inner_handler.get_accept_attributes(username)
     }
 }
 
@@ -1448,8 +1605,8 @@ mod tests {
         let inner = SimpleAuthHandler::new();
         let eap_handler = EapAuthHandler::new(Arc::new(inner));
 
-        let session_id = eap_handler.get_or_create_session("testuser", None);
-        assert!(!session_id.is_empty());
+        let session_id = eap_handler.start_session(b"binding".to_vec()).unwrap();
+        assert_eq!(session_id.len(), 2 * STATE_LEN);
 
         let sessions = eap_handler.session_manager.read().unwrap();
         assert!(sessions.get_session(&session_id).is_some());
@@ -1738,13 +1895,32 @@ mod eap_tls_mppe_tests {
     /// An Access-Request carrying `eap`, the optional State, and a valid
     /// Message-Authenticator (RFC 3579 §3.2).
     fn access_request(identifier: u8, eap: &EapPacket, state: Option<&[u8]>) -> Packet {
+        access_request_from_nas(identifier, eap, state, "alice", "test-nas", None)
+    }
+
+    /// An Access-Request from a NAS identified by `nas_id` (and, if given,
+    /// NAS-IP-Address `nas_ip`) for User-Name `user`, signed with a
+    /// Message-Authenticator.
+    fn access_request_from_nas(
+        identifier: u8,
+        eap: &EapPacket,
+        state: Option<&[u8]>,
+        user: &str,
+        nas_id: &str,
+        nas_ip: Option<[u8; 4]>,
+    ) -> Packet {
         let mut p = Packet::new(
             Code::AccessRequest,
             identifier,
             generate_request_authenticator(),
         );
-        p.add_attribute(Attribute::string(AttributeType::UserName as u8, "alice").unwrap());
-        p.add_attribute(Attribute::string(AttributeType::NasIdentifier as u8, "test-nas").unwrap());
+        p.add_attribute(Attribute::string(AttributeType::UserName as u8, user).unwrap());
+        p.add_attribute(Attribute::string(AttributeType::NasIdentifier as u8, nas_id).unwrap());
+        if let Some(ip) = nas_ip {
+            p.add_attribute(
+                Attribute::new(AttributeType::NasIpAddress as u8, ip.to_vec()).unwrap(),
+            );
+        }
         if let Some(s) = state {
             p.add_attribute(Attribute::new(AttributeType::State as u8, s.to_vec()).unwrap());
         }
@@ -1753,6 +1929,12 @@ mod eap_tls_mppe_tests {
         p.add_attribute(
             Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]).unwrap(),
         );
+        resign(p)
+    }
+
+    /// Recompute the Message-Authenticator (the last attribute) of `p`.
+    fn resign(mut p: Packet) -> Packet {
+        p.attributes.last_mut().unwrap().value = vec![0u8; 16];
         let mac = calculate_message_authenticator(&p.encode().unwrap(), secret());
         p.attributes.last_mut().unwrap().value = mac.to_vec();
         p
@@ -1870,7 +2052,9 @@ mod eap_tls_mppe_tests {
                     request = answer_challenge(&mut peer, &c);
                 }
                 AuthResult::Accept { msk, .. } => break msk.expect("MSK"),
-                AuthResult::Reject => panic!("EAP-TLS rejected after the Nak"),
+                other @ (AuthResult::Reject | AuthResult::Discard) => {
+                    panic!("EAP-TLS rejected after the Nak: {other:?}")
+                }
             }
         };
         assert_eq!(msk, peer.msk());
@@ -1953,7 +2137,9 @@ mod eap_tls_mppe_tests {
                     request = answer_challenge(&mut peer, &challenge);
                 }
                 AuthResult::Accept { attributes, msk } => break (attributes, msk),
-                AuthResult::Reject => panic!("EAP-TLS rejected at id {}", request.identifier),
+                other @ (AuthResult::Reject | AuthResult::Discard) => {
+                    panic!("EAP-TLS rejected at id {}: {other:?}", request.identifier)
+                }
             }
         };
 
@@ -2023,7 +2209,9 @@ mod eap_tls_mppe_tests {
             AuthResult::Challenge {
                 state, attributes, ..
             } => (state, attributes),
-            AuthResult::Reject => panic!("server rejected a non-final ClientHello fragment"),
+            other @ (AuthResult::Reject | AuthResult::Discard) => {
+                panic!("server rejected a non-final ClientHello fragment: {other:?}")
+            }
             AuthResult::Accept { .. } => panic!("server accepted an incomplete ClientHello"),
         };
 
@@ -2064,7 +2252,9 @@ mod eap_tls_mppe_tests {
                     assert_eq!(msk.expect("missing MSK"), peer.msk());
                     return;
                 }
-                AuthResult::Reject => panic!("EAP-TLS rejected at id {}", request.identifier),
+                other @ (AuthResult::Reject | AuthResult::Discard) => {
+                    panic!("EAP-TLS rejected at id {}: {other:?}", request.identifier)
+                }
             }
         }
         panic!("fragmented EAP-TLS conversation did not complete");
@@ -2107,7 +2297,9 @@ mod eap_tls_mppe_tests {
                     request = answer_challenge(&mut peer, &challenge);
                 }
                 AuthResult::Accept { attributes, msk } => break (attributes, msk),
-                AuthResult::Reject => panic!("EAP-TLS rejected at id {}", request.identifier),
+                other @ (AuthResult::Reject | AuthResult::Discard) => {
+                    panic!("EAP-TLS rejected at id {}: {other:?}", request.identifier)
+                }
             }
         };
 
@@ -2751,7 +2943,7 @@ mod eap_tls_mppe_tests {
         let pki = gen_pki();
         let handler = teap_handler(&pki);
         let (state, start_eap) = teap_start(&handler);
-        let session_id = String::from_utf8(state.clone()).unwrap();
+        let session_id = EapAuthHandler::session_id_for_state(Some(&state)).unwrap();
         let seq_after_start = lru_seq(&handler, &session_id);
 
         assert_eq!(
@@ -2772,7 +2964,11 @@ mod eap_tls_mppe_tests {
         // neither be refreshed nor displace anything.
         let bad = EapTlsPacket::new(TlsFlags::new(false, true, false), None, vec![0x16; 10]);
         let result = handler.authenticate_request(
-            &access_request(3, &teap_raw_response(7, bad), Some(&state)),
+            &access_request(
+                3,
+                &teap_raw_response(outstanding(&handler, &state), bad),
+                Some(&state),
+            ),
             secret(),
         );
         assert!(matches!(result, AuthResult::Reject));
@@ -3084,10 +3280,27 @@ mod eap_tls_mppe_tests {
         }
     }
 
-    /// Continue conversation `state` with an empty EAP-TLS Response.
+    /// Identifier of the EAP-Request outstanding in conversation `state`
+    /// (the one a valid EAP-Response must carry), or 0 when the State names
+    /// no live conversation.
+    fn outstanding(handler: &EapAuthHandler, state: &[u8]) -> u8 {
+        EapAuthHandler::session_id_for_state(Some(state))
+            .and_then(|id| {
+                handler
+                    .session_manager
+                    .read()
+                    .unwrap()
+                    .get_session(&id)
+                    .and_then(|s| s.outstanding_identifier)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Continue conversation `state` with an empty EAP-TLS Response to its
+    /// outstanding Request, in an Access-Request with RADIUS Identifier `id`.
     fn continue_conversation(handler: &EapAuthHandler, state: &[u8], id: u8) -> AuthResult {
         let response = EapTlsPacket::new(TlsFlags::new(false, false, false), None, Vec::new())
-            .to_eap_response(id);
+            .to_eap_response(outstanding(handler, state));
         handler.authenticate_request(&access_request(id, &response, Some(state)), secret())
     }
 
@@ -3101,7 +3314,7 @@ mod eap_tls_mppe_tests {
         id: u8,
     ) -> AuthResult {
         let mut peer = Supplicant::new(pki);
-        let start = EapTlsPacket::start().to_eap_request(id);
+        let start = EapTlsPacket::start().to_eap_request(outstanding(handler, state));
         let response = peer.respond(&start);
         handler.authenticate_request(&access_request(id, &response, Some(state)), secret())
     }
@@ -3204,7 +3417,7 @@ mod eap_tls_mppe_tests {
         let mut handler = eap_handler(&pki);
         handler.set_session_limits(5, 100);
         let a = start_conversation(&handler, 1);
-        let a_id = String::from_utf8(a.clone()).unwrap();
+        let a_id = EapAuthHandler::session_id_for_state(Some(&a)).unwrap();
         assert_eq!(handler.active_session_count(), 1);
 
         // Backdate A past the idle timeout without touching the LRU order.
@@ -3242,7 +3455,7 @@ mod eap_tls_mppe_tests {
         let mut handler = eap_handler(&pki);
         handler.set_session_limits(5, 100);
         let a = start_conversation(&handler, 1);
-        let a_id = String::from_utf8(a.clone()).unwrap();
+        let a_id = EapAuthHandler::session_id_for_state(Some(&a)).unwrap();
         handler
             .session_manager
             .write()
@@ -3319,7 +3532,9 @@ mod eap_tls_mppe_tests {
                     request = answer_challenge(&mut peer, &challenge);
                 }
                 AuthResult::Accept { .. } => break,
-                AuthResult::Reject => panic!("EAP-TLS rejected"),
+                other @ (AuthResult::Reject | AuthResult::Discard) => {
+                    panic!("EAP-TLS rejected: {other:?}")
+                }
             }
         }
         assert_eq!(handler.active_session_count(), 0);
@@ -3329,7 +3544,11 @@ mod eap_tls_mppe_tests {
         let state = start_conversation(&handler, 1);
         assert_eq!(handler.active_session_count(), 1);
         let bad = EapTlsPacket::new(TlsFlags::new(false, true, false), None, vec![1, 2, 3]);
-        let request = access_request(2, &bad.to_eap_response(0), Some(&state));
+        let request = access_request(
+            2,
+            &bad.to_eap_response(outstanding(&handler, &state)),
+            Some(&state),
+        );
         assert!(matches!(
             handler.authenticate_request(&request, secret()),
             AuthResult::Reject
@@ -3344,10 +3563,551 @@ mod eap_tls_mppe_tests {
         let handler = eap_handler(&pki);
         let state = start_conversation(&handler, 1);
         let pkt = EapTlsPacket::new(TlsFlags::new(false, false, true), None, vec![0x16; 10]);
-        let request = access_request(2, &pkt.to_eap_response(0), Some(&state));
+        let request = access_request(
+            2,
+            &pkt.to_eap_response(outstanding(&handler, &state)),
+            Some(&state),
+        );
         assert!(matches!(
             handler.authenticate_request(&request, secret()),
             AuthResult::Reject
         ));
+    }
+
+    // =====================================================================
+    // Conversation correlation: random State bound to the NAS and the user,
+    // RFC 3748 §4.1 Identifier matching, and RFC 5080 §2.2.2 replay
+    // of the cached reply to a retransmitted Access-Request.
+    // =====================================================================
+
+    /// Everything about a conversation that a refused packet must not change.
+    fn session_snapshot(
+        handler: &EapAuthHandler,
+        state: &[u8],
+    ) -> (u64, u64, Option<u8>, EapState) {
+        let id = EapAuthHandler::session_id_for_state(Some(state)).unwrap();
+        let manager = handler.session_manager.read().unwrap();
+        let s = manager.get_session(&id).expect("live session");
+        (
+            s.lru_seq,
+            s.last_activity,
+            s.outstanding_identifier,
+            s.state,
+        )
+    }
+
+    /// Start an EAP-TLS conversation for `peer` from `client` and return its
+    /// State and the peer's ClientHello Response (not yet sent).
+    fn start_tls(
+        handler: &EapAuthHandler,
+        peer: &mut Supplicant,
+        client: IpAddr,
+    ) -> (Vec<u8>, EapPacket) {
+        let identity = identity_request();
+        let AuthResult::Challenge {
+            state, attributes, ..
+        } = handler.authenticate_request_from(&identity, secret(), client)
+        else {
+            panic!("expected EAP-TLS Start");
+        };
+        let start = eap_from_radius_packet(&packet_with(Code::AccessChallenge, 1, attributes))
+            .unwrap()
+            .unwrap();
+        (state, peer.respond(&start))
+    }
+
+    /// Drive the conversation from `request` to its Access-Accept and return
+    /// the MSK; every Challenge must carry the conversation's `state`.
+    fn finish_tls(
+        handler: &EapAuthHandler,
+        peer: &mut Supplicant,
+        mut request: Packet,
+        state: &[u8],
+        client: IpAddr,
+    ) -> Vec<u8> {
+        loop {
+            assert!(request.identifier < 64, "EAP-TLS did not converge");
+            match handler.authenticate_request_from(&request, secret(), client) {
+                AuthResult::Challenge {
+                    state: s,
+                    attributes,
+                    ..
+                } => {
+                    assert_eq!(s, state, "the State is fixed for the whole conversation");
+                    let mut c = packet_with(Code::AccessChallenge, request.identifier, attributes);
+                    c.add_attribute(Attribute::new(AttributeType::State as u8, s).unwrap());
+                    request = answer_challenge(peer, &c);
+                }
+                AuthResult::Accept { msk, .. } => return msk.expect("MSK"),
+                other => panic!("conversation failed: {other:?}"),
+            }
+        }
+    }
+
+    /// RFC 2865 §5.24 / §5: the State is a fixed 16 octets from the CSPRNG,
+    /// unique per conversation (even for one user within the same
+    /// millisecond), unrelated to the User-Name, and encodable for any
+    /// User-Name length (the old `username-millis-seq` State overflowed the
+    /// 253-octet limit for long names).
+    #[test]
+    fn state_is_sixteen_random_octets_unrelated_to_the_user() {
+        let pki = gen_pki();
+        let handler = eap_handler(&pki);
+        let long_user = "u".repeat(253);
+        let mut seen = std::collections::HashSet::new();
+        for (i, user) in ["alice", "alice", "alice", long_user.as_str()]
+            .into_iter()
+            .enumerate()
+        {
+            let id = i as u8;
+            let request = access_request_from_nas(
+                id,
+                &EapPacket::identity_response(id, user),
+                None,
+                user,
+                "test-nas",
+                None,
+            );
+            let AuthResult::Challenge { state, .. } =
+                handler.authenticate_request(&request, secret())
+            else {
+                panic!("expected a Challenge for user {user:.8}…");
+            };
+            assert_eq!(state.len(), STATE_LEN);
+            assert!(Attribute::new(AttributeType::State as u8, state.clone()).is_ok());
+            assert!(!state.windows(5).any(|w| w == b"alice"));
+            assert!(state.iter().any(|b| *b != 0));
+            assert!(seen.insert(state), "State repeated across conversations");
+        }
+        assert_eq!(handler.active_session_count(), 4);
+    }
+
+    /// A State is honoured only from the RADIUS client, NAS-Identifier /
+    /// NAS-IP-Address and User-Name that started the conversation. Any other
+    /// presenter gets an Access-Reject and the live conversation is left
+    /// exactly as it was, so its own NAS still completes it.
+    #[test]
+    fn state_from_another_nas_or_user_is_rejected_without_touching_the_conversation() {
+        let pki = gen_pki();
+        let handler = eap_handler(&pki);
+        let nas: IpAddr = "192.0.2.10".parse().unwrap();
+        let mut peer = Supplicant::new(&pki);
+        let (state, client_hello) = start_tls(&handler, &mut peer, nas);
+        let before = session_snapshot(&handler, &state);
+
+        let other: IpAddr = "192.0.2.11".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.0.2.11".parse().unwrap();
+        let hello = |id, user, nas_id, nas_ip| {
+            access_request_from_nas(id, &client_hello, Some(&state), user, nas_id, nas_ip)
+        };
+        let attempts = [
+            (
+                hello(2, "alice", "test-nas", None),
+                other,
+                "another client address",
+            ),
+            (
+                hello(3, "alice", "test-nas", None),
+                mapped,
+                "another client (v4-mapped)",
+            ),
+            (
+                hello(4, "alice", "other-nas", None),
+                nas,
+                "another NAS-Identifier",
+            ),
+            (
+                hello(5, "alice", "test-nas", Some([192, 0, 2, 99])),
+                nas,
+                "an added NAS-IP-Address",
+            ),
+            (
+                hello(6, "mallory", "test-nas", None),
+                nas,
+                "another User-Name",
+            ),
+        ];
+        for (request, client, what) in attempts {
+            assert_eq!(
+                handler.authenticate_request_from(&request, secret(), client),
+                AuthResult::Reject,
+                "{what}"
+            );
+            assert_eq!(
+                session_snapshot(&handler, &state),
+                before,
+                "{what} touched the conversation"
+            );
+        }
+        // Without the client address the binding differs as well.
+        assert_eq!(
+            handler.authenticate_request(&hello(7, "alice", "test-nas", None), secret()),
+            AuthResult::Reject
+        );
+        assert_eq!(session_snapshot(&handler, &state), before);
+        assert_eq!(handler.tls_sessions.read().unwrap().len(), 1);
+
+        // The NAS that started it finishes it.
+        let msk = finish_tls(
+            &handler,
+            &mut peer,
+            hello(8, "alice", "test-nas", None),
+            &state,
+            nas,
+        );
+        assert_eq!(msk, peer.msk());
+    }
+
+    /// RFC 3748 §4.1: a Response whose Identifier is not the outstanding
+    /// Request's is silently discarded (no reply), and so is a duplicate of
+    /// a Response already processed, forwarded under a new RADIUS
+    /// Identifier. Neither changes the conversation.
+    #[test]
+    fn response_to_a_request_not_outstanding_is_silently_discarded() {
+        let pki = gen_pki();
+        let handler = eap_handler(&pki);
+        let nas: IpAddr = "192.0.2.10".parse().unwrap();
+        let mut peer = Supplicant::new(&pki);
+        let (state, client_hello) = start_tls(&handler, &mut peer, nas);
+        let before = session_snapshot(&handler, &state);
+        assert_eq!(before.2, Some(client_hello.identifier));
+
+        for wrong in (0..=255u8).filter(|id| *id != client_hello.identifier) {
+            let mut forged = client_hello.clone();
+            forged.identifier = wrong;
+            let request = access_request(2, &forged, Some(&state));
+            assert_eq!(
+                handler.authenticate_request_from(&request, secret(), nas),
+                AuthResult::Discard,
+                "Identifier {wrong}"
+            );
+        }
+        assert_eq!(session_snapshot(&handler, &state), before);
+
+        // The matching Response is processed …
+        let first = access_request(3, &client_hello, Some(&state));
+        let AuthResult::Challenge { attributes, .. } =
+            handler.authenticate_request_from(&first, secret(), nas)
+        else {
+            panic!("the matching Response must advance the conversation");
+        };
+        let after = session_snapshot(&handler, &state);
+        assert_ne!(after.2, before.2, "a new Request is outstanding");
+
+        // … and a copy of it under a new RADIUS Identifier is a duplicate.
+        let duplicate = access_request(4, &client_hello, Some(&state));
+        assert_eq!(
+            handler.authenticate_request_from(&duplicate, secret(), nas),
+            AuthResult::Discard
+        );
+        assert_eq!(session_snapshot(&handler, &state), after);
+
+        let mut c = packet_with(Code::AccessChallenge, 3, attributes);
+        c.add_attribute(Attribute::new(AttributeType::State as u8, state.clone()).unwrap());
+        let next = answer_challenge(&mut peer, &c);
+        assert_eq!(
+            finish_tls(&handler, &mut peer, next, &state, nas),
+            peer.msk()
+        );
+    }
+
+    /// An EAP-Response/Identity, or an Access-Request without EAP-Message,
+    /// always starts a new conversation: presenting a live conversation's
+    /// State with it neither resumes nor restarts that conversation.
+    #[test]
+    fn identity_response_never_resumes_or_restarts_a_live_conversation() {
+        let pki = gen_pki();
+        let handler = eap_handler(&pki);
+        let a = start_conversation(&handler, 1);
+        let before = session_snapshot(&handler, &a);
+
+        let identity = access_request(2, &EapPacket::identity_response(9, "alice"), Some(&a));
+        let AuthResult::Challenge { state: b, .. } =
+            handler.authenticate_request(&identity, secret())
+        else {
+            panic!("expected a new conversation");
+        };
+        assert_ne!(b, a);
+
+        // Without EAP-Message, and with RFC 3579 §2.1 EAP-Start (an
+        // EAP-Message of length 2): new conversations as well.
+        let mut seen = vec![a.clone(), b];
+        for with_eap_start in [false, true] {
+            let mut p = Packet::new(Code::AccessRequest, 3, generate_request_authenticator());
+            p.add_attribute(Attribute::string(AttributeType::UserName as u8, "alice").unwrap());
+            p.add_attribute(
+                Attribute::string(AttributeType::NasIdentifier as u8, "test-nas").unwrap(),
+            );
+            p.add_attribute(Attribute::new(AttributeType::State as u8, a.clone()).unwrap());
+            if with_eap_start {
+                p.add_attribute(Attribute::new(AttributeType::EapMessage as u8, vec![]).unwrap());
+            }
+            let AuthResult::Challenge { state: c, .. } = handler.authenticate_request(&p, secret())
+            else {
+                panic!("expected a new conversation (EAP-Start: {with_eap_start})");
+            };
+            assert!(!seen.contains(&c));
+            seen.push(c);
+        }
+
+        assert_eq!(handler.active_session_count(), 4);
+        assert_eq!(session_snapshot(&handler, &a), before);
+    }
+
+    /// RFC 3579 §2.6.2: an Access-Request carrying an EAP-Request (role
+    /// reversal), or an EAP-Success / EAP-Failure, is rejected without
+    /// starting, consuming or touching a conversation, even when it carries
+    /// a live State and the outstanding Identifier.
+    #[test]
+    fn eap_packets_other_than_responses_are_rejected_without_touching_anything() {
+        let pki = gen_pki();
+        let handler = eap_handler(&pki);
+        let nas: IpAddr = "192.0.2.10".parse().unwrap();
+        let mut peer = Supplicant::new(&pki);
+        let (state, client_hello) = start_tls(&handler, &mut peer, nas);
+        let before = session_snapshot(&handler, &state);
+        let id = client_hello.identifier;
+
+        let packets = [
+            EapPacket::new(
+                EapCode::Request,
+                9,
+                Some(EapType::Identity),
+                b"alice".to_vec(),
+            ),
+            EapPacket::new(
+                EapCode::Request,
+                id,
+                Some(EapType::Tls),
+                client_hello.data.clone(),
+            ),
+            EapPacket::success(id),
+            EapPacket::failure(id),
+        ];
+        for (n, eap) in packets.iter().enumerate() {
+            let request = access_request(10 + n as u8, eap, Some(&state));
+            assert_eq!(
+                handler.authenticate_request_from(&request, secret(), nas),
+                AuthResult::Reject,
+                "{:?}",
+                eap.code
+            );
+            assert_eq!(session_snapshot(&handler, &state), before);
+        }
+        assert_eq!(handler.active_session_count(), 1);
+
+        let request = access_request(20, &client_hello, Some(&state));
+        assert_eq!(
+            finish_tls(&handler, &mut peer, request, &state, nas),
+            peer.msk()
+        );
+    }
+
+    /// RFC 5080 §2.2.2: packets with an invalid Message-Authenticator do not
+    /// affect the duplicate cache in any way, and RFC 3579 §2.6.2: the
+    /// Access-Reject for an encapsulated EAP-Request carries an
+    /// EAP-Response/Nak, not an EAP-Failure.
+    #[tokio::test]
+    async fn unverified_packets_leave_the_cache_alone_and_role_reversal_gets_a_nak() {
+        let pki = gen_pki();
+        let handler = Arc::new(eap_handler(&pki));
+        let cfg = server_config(Arc::clone(&handler));
+        let nas: std::net::SocketAddr = "10.0.0.1:1812".parse().unwrap();
+
+        let identity = identity_request().encode().unwrap();
+        let reply = send(&cfg, nas, &identity).await.unwrap().unwrap();
+        let cached = cfg.request_cache.len();
+
+        for n in 0..20u8 {
+            let mut forged = access_request(100 + n, &EapPacket::identity_response(1, "x"), None);
+            forged.attributes.last_mut().unwrap().value = vec![n; 16];
+            assert!(send(&cfg, nas, &forged.encode().unwrap()).await.is_err());
+        }
+        // Same Identifier and Request Authenticator as the answered request,
+        // invalid Message-Authenticator: no Conflict entry, no effect.
+        let mut forged = Packet::decode(&identity).unwrap();
+        forged.attributes.last_mut().unwrap().value = vec![0xEE; 16];
+        assert!(send(&cfg, nas, &forged.encode().unwrap()).await.is_err());
+        assert_eq!(cfg.request_cache.len(), cached);
+        assert_eq!(send(&cfg, nas, &identity).await.unwrap().unwrap(), reply);
+
+        let role_reversed = EapPacket::new(EapCode::Request, 7, Some(EapType::Identity), vec![]);
+        let reject = send(
+            &cfg,
+            nas,
+            &access_request(50, &role_reversed, None).encode().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let reject = Packet::decode(&reject).unwrap();
+        assert_eq!(reject.code, Code::AccessReject);
+        let nak = eap_from_radius_packet(&reject).unwrap().unwrap();
+        assert_eq!(
+            (nak.code, nak.identifier, nak.eap_type, nak.data),
+            (EapCode::Response, 7, Some(EapType::Nak), vec![0])
+        );
+    }
+
+    fn server_config(handler: Arc<EapAuthHandler>) -> Arc<ServerConfig> {
+        let config = Config {
+            strict_rfc_compliance: false,
+            ..Config::default()
+        };
+        Arc::new(ServerConfig::from_config(config, handler).unwrap())
+    }
+
+    async fn send(
+        cfg: &Arc<ServerConfig>,
+        from: std::net::SocketAddr,
+        bytes: &[u8],
+    ) -> Result<Option<Vec<u8>>, crate::server::ServerError> {
+        RadiusServer::process_request(bytes, from, secret(), PortRole::Auth, cfg).await
+    }
+
+    /// RFC 5080 §2.2.2: a NAS that lost a reply retransmits the identical
+    /// Access-Request and must get the identical reply, not a second
+    /// processing of the request (which would start a second conversation,
+    /// or be discarded or rejected mid-conversation). Every Challenge (each
+    /// with the conversation's random State) and the final Access-Accept,
+    /// MS-MPPE keys included, are replayed byte for byte, also after the
+    /// conversation has ended, without advancing or recreating it.
+    #[tokio::test]
+    async fn retransmitted_requests_get_the_cached_reply_byte_for_byte() {
+        let pki = gen_pki();
+        let handler = Arc::new(eap_handler(&pki));
+        let cfg = server_config(Arc::clone(&handler));
+        let nas: std::net::SocketAddr = "10.0.0.1:1812".parse().unwrap();
+        let mut peer = Supplicant::new(&pki);
+
+        let mut request = identity_request();
+        let mut exchanges = Vec::new();
+        let accept = loop {
+            assert!(request.identifier < 64, "EAP-TLS did not converge");
+            let bytes = request.encode().unwrap();
+            let reply = send(&cfg, nas, &bytes).await.unwrap().expect("a reply");
+            let live = handler.active_session_count();
+            let again = send(&cfg, nas, &bytes)
+                .await
+                .unwrap()
+                .expect("the cached reply");
+            assert_eq!(again, reply, "retransmission answered differently");
+            assert_eq!(handler.active_session_count(), live);
+            exchanges.push((bytes, reply.clone(), request.authenticator));
+            let response = Packet::decode(&reply).unwrap();
+            match response.code {
+                Code::AccessChallenge => request = answer_challenge(&mut peer, &response),
+                Code::AccessAccept => break response,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        assert!(exchanges.len() > 3);
+        assert_eq!(handler.active_session_count(), 0, "the Accept ended it");
+
+        // Within the cache TTL every request of the finished conversation
+        // still gets its own reply, the final Access-Accept included.
+        for (bytes, reply, _) in &exchanges {
+            assert_eq!(&send(&cfg, nas, bytes).await.unwrap().unwrap(), reply);
+        }
+        assert_eq!(handler.active_session_count(), 0, "nothing was recreated");
+
+        // The replayed Accept still decrypts to the supplicant's MSK under
+        // the authenticator of the request it answers.
+        let (_, reply, authenticator) = exchanges.last().unwrap();
+        let replayed = Packet::decode(reply).unwrap();
+        assert_eq!(reply, &accept.encode().unwrap());
+        let keys = MppeKeys::from_packet(&replayed, secret(), authenticator)
+            .unwrap()
+            .expect("MS-MPPE keys");
+        assert_eq!(keys.recv_key, peer.msk()[..32]);
+    }
+
+    /// The final Access-Reject is replayed like any reply; an EAP-Response
+    /// the handler discards gets no reply, and neither do its
+    /// retransmissions; a packet that reuses an answered request's
+    /// Identifier and Request Authenticator with other content is dropped,
+    /// never answered from the cache; and the conversation is bound to the
+    /// address the server received it from.
+    #[tokio::test]
+    async fn final_reject_is_replayed_and_discards_stay_silent() {
+        let pki = gen_pki();
+        let handler = Arc::new(eap_handler(&pki));
+        let cfg = server_config(Arc::clone(&handler));
+        let nas: std::net::SocketAddr = "10.0.0.1:1812".parse().unwrap();
+        let other_nas: std::net::SocketAddr = "10.0.0.2:1812".parse().unwrap();
+
+        let start = |reply: &[u8]| {
+            let p = Packet::decode(reply).unwrap();
+            assert_eq!(p.code, Code::AccessChallenge);
+            let state = p
+                .find_attribute(AttributeType::State as u8)
+                .unwrap()
+                .value
+                .clone();
+            (state, eap_from_radius_packet(&p).unwrap().unwrap())
+        };
+
+        // A conversation ending in Access-Reject (a malformed EAP-TLS packet).
+        let first = send(&cfg, nas, &identity_request().encode().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let (state, start_eap) = start(&first);
+        let bad = EapTlsPacket::new(TlsFlags::new(false, true, false), None, vec![1, 2, 3])
+            .to_eap_response(start_eap.identifier);
+        let bad = access_request(2, &bad, Some(&state)).encode().unwrap();
+        let reject = send(&cfg, nas, &bad).await.unwrap().unwrap();
+        assert_eq!(Packet::decode(&reject).unwrap().code, Code::AccessReject);
+        assert_eq!(handler.active_session_count(), 0);
+        assert_eq!(send(&cfg, nas, &bad).await.unwrap().unwrap(), reject);
+
+        // A new conversation; a Response with the wrong EAP Identifier is
+        // silently discarded, and so are its retransmissions.
+        let first = send(&cfg, nas, &identity_request().encode().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let (state, start_eap) = start(&first);
+        let mut peer = Supplicant::new(&pki);
+        let hello = peer.respond(&start_eap);
+        let mut wrong = hello.clone();
+        wrong.identifier = hello.identifier.wrapping_add(1);
+        let wrong = access_request(3, &wrong, Some(&state)).encode().unwrap();
+        assert!(send(&cfg, nas, &wrong).await.unwrap().is_none());
+        assert!(matches!(
+            send(&cfg, nas, &wrong).await,
+            Err(crate::server::ServerError::DuplicateRequest)
+        ));
+
+        // The right Response from another NAS address is rejected and the
+        // conversation survives for its own NAS.
+        let request = access_request(4, &hello, Some(&state));
+        let reply = send(&cfg, other_nas, &request.encode().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(Packet::decode(&reply).unwrap().code, Code::AccessReject);
+        let request = access_request(5, &hello, Some(&state));
+        let bytes = request.encode().unwrap();
+        let reply = send(&cfg, nas, &bytes).await.unwrap().unwrap();
+        assert_eq!(Packet::decode(&reply).unwrap().code, Code::AccessChallenge);
+
+        // Same RADIUS Identifier and Request Authenticator as that answered
+        // request, different content: dropped, not answered from the cache.
+        let mut altered = request.clone();
+        altered
+            .attributes
+            .retain(|a| a.attr_type != AttributeType::NasIdentifier as u8);
+        altered.attributes.insert(
+            0,
+            Attribute::string(AttributeType::NasIdentifier as u8, "x").unwrap(),
+        );
+        let altered = resign(altered).encode().unwrap();
+        assert_ne!(altered, bytes);
+        assert!(matches!(
+            send(&cfg, nas, &altered).await,
+            Err(crate::server::ServerError::DuplicateRequest)
+        ));
+        assert_eq!(handler.active_session_count(), 1);
     }
 }

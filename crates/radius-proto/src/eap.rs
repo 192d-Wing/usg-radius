@@ -2051,6 +2051,19 @@ pub struct EapSession {
     /// order (larger = touched more recently). Maintained by the manager.
     #[cfg_attr(feature = "serde", serde(default))]
     pub lru_seq: u64,
+    /// Identifier of the EAP-Request this server sent last and has not yet
+    /// accepted a Response to (RFC 3748 §4.1). Set by
+    /// [`next_identifier`](Self::next_identifier) and consumed by
+    /// [`EapSessionManager::claim_response`]; `None` while a Response is
+    /// being processed or before the first Request.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub outstanding_identifier: Option<u8>,
+    /// Opaque binding of the conversation to whoever started it (for the
+    /// RADIUS server: the NAS and the User-Name). A Response presented with
+    /// a different binding is refused by
+    /// [`EapSessionManager::claim_response`] without touching the session.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub peer_binding: Vec<u8>,
 }
 
 impl EapSession {
@@ -2073,6 +2086,8 @@ impl EapSession {
             last_activity: now,
             attempt_count: 0,
             lru_seq: 0,
+            outstanding_identifier: None,
+            peer_binding: Vec::new(),
         }
     }
 
@@ -2099,10 +2114,13 @@ impl EapSession {
         self.current_identifier = response_identifier.wrapping_add(1);
     }
 
-    /// Get next identifier and increment
+    /// Identifier for the next EAP-Request, which becomes the outstanding
+    /// Request: only a Response carrying this Identifier is accepted next
+    /// (RFC 3748 §4.1, see [`EapSessionManager::claim_response`]).
     pub fn next_identifier(&mut self) -> u8 {
         let id = self.current_identifier;
         self.current_identifier = self.current_identifier.wrapping_add(1);
+        self.outstanding_identifier = Some(id);
         self.update_activity();
         id
     }
@@ -2155,6 +2173,23 @@ fn unix_now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Outcome of [`EapSessionManager::claim_response`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseClaim {
+    /// The Response may be processed; the outstanding Identifier has been
+    /// consumed, so no other Response is accepted until the next Request.
+    Claimed,
+    /// No live session by that ID.
+    UnknownSession,
+    /// The session was started by someone else (different binding). The
+    /// session is left untouched.
+    BindingMismatch,
+    /// The Response does not answer the outstanding Request (stale,
+    /// duplicated or out of order, or another Response is being processed).
+    /// The session is left untouched.
+    IdentifierMismatch,
 }
 
 /// Why [`EapSessionManager`] evicted a session.
@@ -2286,6 +2321,36 @@ impl EapSessionManager {
     pub fn get_session_mut(&mut self, session_id: &str) -> Option<&mut EapSession> {
         self.touch(session_id);
         self.sessions.get_mut(session_id)
+    }
+
+    /// Admit an EAP-Response for processing.
+    ///
+    /// Checks, in this order and without changing the session's LRU
+    /// position or activity time, that `session_id` names a live session,
+    /// that the session's [`peer_binding`](EapSession::peer_binding) equals
+    /// `binding`, and that `identifier` is the Identifier of the outstanding
+    /// Request (RFC 3748 §4.1: a Response whose Identifier does not match is
+    /// silently discarded, which also catches stale duplicates). On success the
+    /// outstanding Identifier is consumed, so a second copy of the Response
+    /// (a duplicate, or one racing it) is refused until the server has sent
+    /// its next Request. Any refusal leaves the session exactly as it was.
+    pub fn claim_response(
+        &mut self,
+        session_id: &str,
+        binding: &[u8],
+        identifier: u8,
+    ) -> ResponseClaim {
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return ResponseClaim::UnknownSession;
+        };
+        if session.peer_binding != binding {
+            return ResponseClaim::BindingMismatch;
+        }
+        if session.outstanding_identifier != Some(identifier) {
+            return ResponseClaim::IdentifierMismatch;
+        }
+        session.outstanding_identifier = None;
+        ResponseClaim::Claimed
     }
 
     /// Remove a session
@@ -2921,6 +2986,67 @@ mod tests {
             session.seed_identifier_after(id);
             assert_ne!(session.next_identifier(), id);
         }
+    }
+
+    #[test]
+    fn next_identifier_marks_the_request_outstanding() {
+        let mut session = EapSession::new("test".to_string());
+        assert_eq!(session.outstanding_identifier, None);
+        session.seed_identifier_after(9);
+        assert_eq!(session.next_identifier(), 10);
+        assert_eq!(session.outstanding_identifier, Some(10));
+        assert_eq!(session.next_identifier(), 11);
+        assert_eq!(session.outstanding_identifier, Some(11));
+    }
+
+    /// RFC 3748 §4.1: only a Response carrying the outstanding
+    /// Request's Identifier, from the binding that started the session, is
+    /// admitted, once; every refusal leaves the session untouched.
+    #[test]
+    fn claim_response_checks_binding_then_identifier_and_consumes_it() {
+        let mut manager = EapSessionManager::new();
+        let session = manager.create_session("s".to_string());
+        session.peer_binding = b"nas-a/alice".to_vec();
+        let id = session.next_identifier();
+        let (seq, activity) = (session.lru_seq, session.last_activity);
+
+        assert_eq!(
+            manager.claim_response("nobody", b"nas-a/alice", id),
+            ResponseClaim::UnknownSession
+        );
+        assert_eq!(
+            manager.claim_response("s", b"nas-b/alice", id),
+            ResponseClaim::BindingMismatch
+        );
+        assert_eq!(
+            manager.claim_response("s", b"nas-a/alice", id.wrapping_add(1)),
+            ResponseClaim::IdentifierMismatch
+        );
+        let s = manager.get_session("s").unwrap();
+        assert_eq!(
+            s.outstanding_identifier,
+            Some(id),
+            "refusals consume nothing"
+        );
+        assert_eq!((s.lru_seq, s.last_activity), (seq, activity));
+
+        assert_eq!(
+            manager.claim_response("s", b"nas-a/alice", id),
+            ResponseClaim::Claimed
+        );
+        // A duplicate of the claimed Response is refused.
+        assert_eq!(
+            manager.claim_response("s", b"nas-a/alice", id),
+            ResponseClaim::IdentifierMismatch
+        );
+        assert_eq!(manager.get_session("s").unwrap().lru_seq, seq);
+
+        // The next Request re-arms it.
+        let next = manager.get_session_mut("s").unwrap().next_identifier();
+        assert_eq!(
+            manager.claim_response("s", b"nas-a/alice", next),
+            ResponseClaim::Claimed
+        );
     }
 
     #[test]
