@@ -1473,7 +1473,11 @@ mod tests {
 
         // And the home server's view: the MAC verifies under "radsec" only.
         assert!(verify_message_authenticator(&packet, secret, 22));
-        assert!(!verify_message_authenticator(&packet, b"radsec2", 22));
+        assert!(!verify_message_authenticator(
+            &packet,
+            home_secret().as_bytes(),
+            22
+        ));
     }
 
     #[test]

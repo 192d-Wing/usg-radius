@@ -1916,15 +1916,21 @@ mod tests {
             response.add_attribute(
                 Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]).unwrap(),
             );
+            // Salts and the tunnel password are generated at runtime: the
+            // values do not matter here, only that they survive the re-key.
+            let salts = generate_salts(3);
             for attr in test_keys()
-                .to_attributes_with_salts(RADSEC_SECRET, &REQUEST_AUTH, [0x80, 0x01], [0x80, 0x02])
+                .to_attributes_with_salts(RADSEC_SECRET, &REQUEST_AUTH, salts[0], salts[1])
                 .unwrap()
             {
                 response.add_attribute(attr);
             }
-            let tp = test_tunnel_passwords().remove(0);
+            let tp = TunnelPassword {
+                tag: 0x01,
+                password: rand::random::<[u8; 19]>().to_vec(),
+            };
             response.add_attribute(
-                tp.to_attribute_with_salt(RADSEC_SECRET, &REQUEST_AUTH, [0x80, 0x10])
+                tp.to_attribute_with_salt(RADSEC_SECRET, &REQUEST_AUTH, salts[2])
                     .unwrap(),
             );
             let home_response = home_response_under_radsec(response);
@@ -1948,9 +1954,11 @@ mod tests {
             let forwarded_tp = relayed
                 .find_attribute(AttributeType::TunnelPassword as u8)
                 .unwrap();
-            assert_eq!(
-                TunnelPassword::from_attribute(forwarded_tp, CLIENT_SECRET, &REQUEST_AUTH).unwrap(),
-                tp
+            let decrypted =
+                TunnelPassword::from_attribute(forwarded_tp, CLIENT_SECRET, &REQUEST_AUTH).unwrap();
+            assert!(
+                decrypted == tp,
+                "Tunnel-Password must decrypt under the client pair to the home server's value"
             );
             assert!(
                 relayed

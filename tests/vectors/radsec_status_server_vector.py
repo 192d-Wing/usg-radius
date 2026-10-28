@@ -62,7 +62,7 @@ def main(argv):
         print(f'    const KAT_MESSAGE_AUTHENTICATOR: &str = "{mac.hex()}";')
         print(f'    const KAT_PACKET: &str = "{packet.hex()}";')
     else:
-        print(f"secret                = {RADSEC_SECRET!r}")
+        print("secret                = the RFC 6614 section 2.3 fixed secret (see RADSEC_SECRET above)")
         print(f"identifier            = 0x{IDENTIFIER:02x}")
         print(f"request authenticator = {REQUEST_AUTHENTICATOR.hex()}")
         print(f"message authenticator = {mac.hex()}")
