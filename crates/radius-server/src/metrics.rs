@@ -139,6 +139,9 @@ impl MetricsState {
         // EAP session store evictions
         Self::collect_eap_session_metrics(&mut metrics);
 
+        // Retransmissions answered from the reply cache
+        Self::collect_retransmission_metrics(&mut metrics);
+
         metrics
     }
 
@@ -155,6 +158,17 @@ impl MetricsState {
                 (&[("reason", "capacity")], capacity),
             ],
             "EAP conversations evicted from the session store, by reason",
+        );
+    }
+
+    /// Retransmitted Access-Requests answered from the reply cache
+    /// (RFC 5080 §2.2.2), process-wide counter kept by `cache`.
+    fn collect_retransmission_metrics(metrics: &mut PrometheusMetrics) {
+        use std::sync::atomic::Ordering;
+        metrics.add_counter(
+            "radius_retransmissions_replayed_total",
+            crate::cache::RETRANSMISSIONS_REPLAYED.load(Ordering::Relaxed),
+            "Retransmitted Access-Requests answered with the cached reply",
         );
     }
 

@@ -73,6 +73,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   FIPS provider for RadSec — so no second crypto implementation is
   introduced.
 
+- **EAP conversations are named by an unpredictable State bound to the NAS
+  and the user.** The RADIUS State of an EAP conversation used to be
+  `username-millis-sequence`: predictable, usable from any NAS, able to
+  restart a live conversation when sent with a new Identity Response, and
+  longer than the 253-octet attribute limit for long User-Names (RFC 2865
+  §5.24, §5). It is now 16 octets from the operating system's CSPRNG
+  (`getrandom`), fixed for the conversation and never derived from the
+  User-Name or the time. Each conversation is bound to the RADIUS client
+  address that started it (UDP source / RadSec peer) and to the request's
+  NAS-IP-Address, NAS-IPv6-Address, NAS-Identifier and User-Name; a State
+  presented by anyone else gets an Access-Reject and leaves the live
+  conversation exactly as it was. An EAP-Response/Identity, or an
+  Access-Request without EAP-Message, always starts a new conversation and
+  ignores any State it carries.
+- **EAP-Responses must answer the outstanding EAP-Request (RFC 3748 §4.1).** Each conversation tracks the Identifier of the Request it sent last
+  and accepts one Response carrying it. A Response with another Identifier, or
+  a duplicate of one already processed that the NAS forwards under a new
+  RADIUS Identifier, is silently discarded (no RADIUS reply) without
+  advancing or refreshing the conversation; concurrent copies cannot both be
+  processed.
+
+- **The proxy verifies the NAS's Message-Authenticator before forwarding.**
+  The routing decision ran before the Message-Authenticator check, and the
+  proxy re-signs a forwarded request under the home server's secret, so an
+  EAP Access-Request with a missing or invalid Message-Authenticator from a
+  spoofed client address reached the home server validly signed (RFC 3579
+  §3.2, "Blast-RADIUS"). Access-Requests and Status-Server are now
+  authenticated before anything else, so a packet failing the check also
+  leaves the duplicate cache untouched (RFC 5080 §2.2.2).
+
+### Added
+
+- **Retransmitted Access-Requests get the cached reply (RFC 5080 §2.2.2).**
+  A NAS retransmits an Access-Request when it lost the reply; the duplicate
+  cache used to drop the retransmission, so the NAS never got an answer (and
+  past the cache TTL an EAP retransmission was rejected). The request cache
+  now keeps the encoded reply of every locally answered Access-Request (PAP,
+  CHAP, EAP) and answers a byte-identical retransmission, under the same
+  shared secret and from the same source address and port, within
+  `request_cache_ttl` with the identical reply, final Access-Accept /
+  Access-Reject included, without processing the request again. The replay
+  re-sends bytes already computed for exactly that request, at most 8 times.
+  A duplicate still in progress, one that got no reply, or a packet that
+  reuses an answered request's Identifier and Request Authenticator with
+  different content is dropped as before. At most `request_cache_max_entries`
+  replies (each at most 4096 octets) are kept. New counter
+  `radius_retransmissions_replayed_total`. Proxied requests (answered
+  asynchronously), Accounting-Request and Status-Server retransmissions are
+  still dropped.
+- Interop scenario 15 (77 assertions, up from 67): a bash NAS signs its own
+  Access-Requests and sends each twice from one socket; the retransmitted
+  EAP Identity Response gets the identical Access-Challenge (same random
+  State) and the retransmitted final request the identical Access-Reject.
+- `AuthHandler::authenticate_request_from(request, secret, client)`: the
+  server now passes the RADIUS client address to the handler (default
+  implementation delegates to `authenticate_request`), and
+  `AuthResult::Discard` lets a handler send no reply at all.
+
 ### Fixed
 
 - The OCSP response parser compared ASN.1 tag numbers with raw identifier
@@ -85,6 +143,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   revoked; RSA PKCS#1 v1.5 and PSS) and RSA CRLs are pinned as known-answer
   fixtures.
 
+- RFC 3579 §2.6.2: an Access-Request carrying an EAP-Request (role
+  reversal), EAP-Success or EAP-Failure is rejected without touching any
+  conversation, the Reject for an EAP-Request carrying an EAP-Response/Nak;
+  it used to be processed as a Response.
+- RFC 3579 §2.1 EAP-Start (an EAP-Message of length 2) starts a
+  conversation; it used to be rejected.
+- `Debug` of `AuthResult` and of the request cache's entries shows key and
+  reply lengths only, never the MSK or a cached reply's MS-MPPE values.
+- The request cache deadlocked the request task once it held
+  `request_cache_max_entries` entries: the eviction path kept a DashMap
+  iterator (and its shard lock) alive across `remove`. The test for the bound
+  had been ignored as "hangs"; it runs again.
+
 ### Changed
 
 - `radius_proto::revocation`: `RevocationError::InvalidSignature` now carries a
@@ -96,6 +167,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `with_signature_verification_algorithms` selects the provider's algorithms;
   `OcspResponse::parse_verified` and `OcspRequestBuilder::cert_id` replace the
   unimplemented `OcspResponse::verify_signature`.
+
+- **The interop harness runs concurrently on one Docker host.**
+  `tests/interop/run.sh` gives every run its own compose project
+  (`INTEROP_PROJECT`, default `usg-radius-interop-<checkout path hash>-<pid>`),
+  image tag, `10.77.N.0/24` network (`INTEROP_NET`; the first free one, since
+  Docker refuses overlapping subnets) and run directory
+  (`tests/interop/.runs/<project>/`: test PKI, configs rendered for that /24,
+  server logs). Teardown, also on failure, `^C` or `SIGTERM`, removes only that
+  run's containers, network, volumes and images. Two worktrees sharing the
+  Lima VM no longer tear down or reuse each other's containers. CI pins
+  `INTEROP_PROJECT` so its log-collection step finds the containers.
 
 ### Testing
 
@@ -117,10 +199,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keyCertSign linked; CertID, ResponderID, nonce,
   future thisUpdate, maximum age (overflow-safe) and unknown-critical-extension
   checks; the bounded HTTP body reader.
-- Interop scenario 15: `gen-certs.sh` writes `ca-wrongkey.crl` (the CA's Name,
+- Interop scenario 16: `gen-certs.sh` writes `ca-wrongkey.crl` (the CA's Name,
   nothing revoked, signed by another key) and a third usg-radius instance,
   `usg-home-badcrl`, rejects the otherwise valid supplicant with EAP-Failure
-  under `fail_closed` (70 assertions), and `run.sh` checks that server's log
+  under `fail_closed` (80 assertions with scenario 15), and `run.sh` checks that server's log
   names the CRL signature failure as the reason.
 - The interop usg-radius image touches the workspace sources before
   `cargo build`: its target cache mount is shared by every checkout built on

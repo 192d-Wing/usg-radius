@@ -267,7 +267,15 @@ printf 'Acct-Status-Type = Start\nAcct-Session-Id = "interop-acct-0002"\nUser-Na
 check "Accounting-Request to the authentication port with a dedicated accounting socket: silently discarded" grep -q 'No reply' "$LOG"
 
 # ---------------------------------------------------------------------------
-section "15. EAP-TLS: valid supplicant -> usg-radius home server whose CRL is signed by the wrong key (fail-closed)"
+section "15. Retransmitted Access-Requests get the cached reply (RFC 5080 2.2.2): bash NAS -> usg-radius home server"
+# retransmit-tests.sh builds, signs and sends each request twice from one
+# socket (radclient and eapol_test never resend an answered request) and
+# exits with its number of failed checks.
+USG_HOME=$USG_HOME NAS_USGHOME_SECRET=$NAS_USGHOME_SECRET retransmit-tests.sh
+failures=$((failures + $?))
+
+# ---------------------------------------------------------------------------
+section "16. EAP-TLS: valid supplicant -> usg-radius home server whose CRL is signed by the wrong key (fail-closed)"
 # usg-home-badcrl's only CRL names the test CA and revokes nothing, but is not
 # signed by the CA's key. Trusting it would admit everyone; verifying it
 # (RFC 5280 6.3.3) leaves the status undeterminable, so fail-closed rejects the
