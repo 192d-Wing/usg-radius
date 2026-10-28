@@ -17,9 +17,23 @@ pub enum RevocationError {
     #[error("Certificate revoked: serial={0}")]
     CertificateRevoked(String),
 
-    /// CRL signature is invalid
-    #[error("CRL signature invalid")]
-    InvalidSignature,
+    /// A CRL, OCSP response or certificate signature did not verify, or was
+    /// made by a key that is not authorized to make it (RFC 5280 §6.3.3,
+    /// RFC 6960 §3.2)
+    #[error("signature verification failed: {0}")]
+    InvalidSignature(String),
+
+    /// Linking the peer's chain to the configured issuers exceeded the
+    /// work budget (signature verifications, path extensions or paths); the
+    /// peer controls the intermediates, so this rejects regardless of the
+    /// fail policy
+    #[error("certification path building budget exceeded: {0}")]
+    PathBudgetExceeded(String),
+
+    /// A CRL is older (lower crlNumber) than one already accepted for the
+    /// same issuer (RFC 5280 §5.2.3)
+    #[error("stale CRL: {0}")]
+    StaleCrl(String),
 
     /// CRL has expired (nextUpdate < current time)
     #[error("CRL expired: nextUpdate={0}")]

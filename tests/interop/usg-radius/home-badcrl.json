@@ -1,0 +1,31 @@
+{
+  "_comment": "usg-radius as an EAP-TLS home server whose static CRL (certs/ca-wrongkey.crl) names the test CA as issuer and revokes nothing, but is signed by a different key. The CRL signature must be verified against the CA (RFC 5280 6.3.3), so the forged CRL is unusable and, fail-closed, even the valid supplicant certificate is rejected.",
+  "listen_address": "0.0.0.0",
+  "listen_port": 1812,
+  "accounting_port": 1813,
+  "transport": "udp-insecure",
+  "secret": "unused-default-secret",
+  "clients": [
+    { "name": "nas (eapol_test)", "address": "10.77.0.40/32", "secret": "nas-usghome-secret-3" }
+  ],
+  "verbose": true,
+  "log_level": "debug",
+  "strict_rfc_compliance": true,
+  "eap": {
+    "enable_tls": true,
+    "tls": {
+      "cert_path": "/certs/usg-home-server.crt",
+      "key_path": "/certs/usg-home-server.key",
+      "ca_path": "/certs/ca.crt",
+      "require_client_cert": true,
+      "revocation": {
+        "mode": "crl_only",
+        "on_error": "fail_closed",
+        "crl": {
+          "static_files": ["/certs/ca-wrongkey.crl"],
+          "fetch": false
+        }
+      }
+    }
+  }
+}

@@ -103,6 +103,10 @@ impl CrlFetcher {
         super::ensure_default_crypto_provider();
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
+            // A redirect would let whoever answers on the path send the
+            // server to an arbitrary (internal) URL; Distribution Points are
+            // fetched as named in the certificate.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| {
                 RevocationError::HttpError(format!("Failed to create HTTP client: {}", e))
@@ -182,18 +186,28 @@ impl CrlFetcher {
             ));
         }
 
-        // Read response body with size limit
-        let bytes = response
-            .bytes()
-            .map_err(|e| RevocationError::HttpError(format!("Failed to read response: {}", e)))?;
-
-        // Check actual size
-        if bytes.len() > self.max_size {
-            return Err(RevocationError::CrlTooLarge(bytes.len(), self.max_size));
-        }
-
-        Ok(bytes.to_vec())
+        // Read at most max_size + 1 bytes: a body without Content-Length
+        // (chunked) must not be buffered whole before the limit applies.
+        read_body_limited(response, self.max_size)?.ok_or(RevocationError::CrlTooLarge(
+            self.max_size + 1,
+            self.max_size,
+        ))
     }
+}
+
+/// Read an HTTP body, stopping one byte past `max`. Returns `None` when the
+/// body is larger than `max`, without reading more of it.
+pub(crate) fn read_body_limited(
+    body: impl std::io::Read,
+    max: usize,
+) -> Result<Option<Vec<u8>>, RevocationError> {
+    use std::io::Read;
+
+    let mut buf = Vec::new();
+    body.take(max as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| RevocationError::HttpError(format!("Failed to read response: {}", e)))?;
+    Ok((buf.len() <= max).then_some(buf))
 }
 
 /// Extract CRL distribution points from a certificate
@@ -262,6 +276,21 @@ pub fn extract_crl_distribution_points(cert_der: &[u8]) -> Result<Vec<String>, R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_body_limited_stops_one_byte_past_the_limit() {
+        let body = vec![0xAB; 100];
+        assert_eq!(
+            read_body_limited(std::io::Cursor::new(&body), 100).unwrap(),
+            Some(body.clone())
+        );
+        assert_eq!(
+            read_body_limited(std::io::Cursor::new(&body), 99).unwrap(),
+            None
+        );
+        // An endless body is not read to its end.
+        assert_eq!(read_body_limited(std::io::repeat(0), 1024).unwrap(), None);
+    }
 
     #[test]
     fn test_fetcher_new() {

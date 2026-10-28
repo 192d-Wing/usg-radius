@@ -236,10 +236,13 @@
 //! │   (implements rustls::ClientCertVerifier)                    │
 //! ├──────────────────────────────────────────────────────────────┤
 //! │  1. WebPkiClientVerifier (standard TLS validation)           │
-//! │  2. Extract CRL distribution points from cert                │
-//! │  3. Check cache for CRL                                      │
-//! │  4. If miss: HTTP fetch → parse → validate → cache           │
-//! │  5. Check if cert serial is in revoked set                   │
+//! │  2. Link the chain to the configured issuer certificates     │
+//! │     (name + signature); for every link below the anchor:     │
+//! │  3. Static CRL, else cache, else fetch the CRL DP            │
+//! │  4. Verify the CRL signature with the issuer's key, check    │
+//! │     freshness and crlNumber, then cache                      │
+//! │  5. Check if cert serial is in revoked set (or ask OCSP and  │
+//! │     verify the response's signer and CertID)                 │
 //! │  6. Apply fail-open/fail-closed policy on errors             │
 //! └──────────────────────────────────────────────────────────────┘
 //!         │                    │                    │
@@ -260,6 +263,13 @@
 //! - **`CrlExpired`**: CRL `nextUpdate` has passed (fail-open/closed applies)
 //! - **`HttpTimeout`**: HTTP request timed out (fail-open/closed applies)
 //! - **`CrlTooLarge`**: CRL exceeds size limit (fail-open/closed applies)
+//! - **`InvalidSignature`**: a CRL or OCSP response is not signed by the
+//!   issuing CA or an authorized responder (fail-open/closed applies; never
+//!   read as "not revoked")
+//! - **`StaleCrl`**: a CRL older than one already accepted (fail-open/closed
+//!   applies)
+//! - **`PathBudgetExceeded`**: linking the peer's chain needed more
+//!   signature checks or paths than budgeted (always rejected)
 //!
 //! # Phase 1: CRL Support (v0.6.0) ✅ Complete
 //!
@@ -282,7 +292,7 @@
 //! - OCSP stapling
 //! - Hybrid CRL + OCSP modes
 //! - Delta CRL support
-//! - CRL signing chain validation
+//! - Indirect / Issuing Distribution Point CRLs
 
 pub mod config;
 pub mod error;
@@ -298,6 +308,10 @@ pub(crate) mod fetch;
 pub mod ocsp;
 #[cfg(feature = "revocation")]
 pub mod ocsp_cache;
+#[cfg(feature = "revocation")]
+pub(crate) mod signature;
+#[cfg(all(test, feature = "revocation"))]
+pub(crate) mod test_pki;
 #[cfg(feature = "revocation")]
 pub mod verifier;
 

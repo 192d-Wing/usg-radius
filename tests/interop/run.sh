@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Interop test driver. Generates the test PKI, builds the three images, starts
-# FreeRADIUS and both usg-radius instances, runs the checks in the `nas`
+# FreeRADIUS and the usg-radius instances (proxy, home, home with a forged CRL), runs the checks in the `nas`
 # container (eapol_test + radclient) and tears everything down.
 #
 #   tests/interop/run.sh            # build, run, tear down; exit 0 iff all checks pass
@@ -42,8 +42,8 @@ compose() { ${DOCKER} compose -f "$PWD/compose.yaml" "$@"; }
 cleanup() {
     status=$?
     if [[ $status -ne 0 || -n "${LOGS:-}" ]]; then
-        echo; echo "===== server logs (freeradius, usg-proxy, usg-home) ====="
-        compose logs --no-color --tail="${LOG_TAIL:-400}" freeradius usg-proxy usg-home || true
+        echo; echo "===== server logs (freeradius, usg-proxy, usg-home, usg-home-badcrl) ====="
+        compose logs --no-color --tail="${LOG_TAIL:-400}" freeradius usg-proxy usg-home usg-home-badcrl || true
     fi
     if [[ -z "${KEEP:-}" ]]; then
         compose --profile test down --remove-orphans --timeout 2 >/dev/null 2>&1 || true
@@ -56,12 +56,25 @@ trap cleanup EXIT
 
 echo "== building images"
 compose --profile test build
-echo "== starting FreeRADIUS, usg-radius proxy, usg-radius home"
-# --force-recreate: a fresh container per run, so the probe check below reads
-# this run's proxy log and not a kept container's earlier lines.
-compose up -d --force-recreate freeradius usg-proxy usg-home
+echo "== starting FreeRADIUS, usg-radius proxy, usg-radius home (and home with a forged CRL)"
+# --force-recreate: a fresh container per run, so the log checks below read
+# this run's logs and not a kept container's earlier lines.
+compose up -d --force-recreate freeradius usg-proxy usg-home usg-home-badcrl
 echo "== running checks in the nas container"
 compose run --rm --no-deps nas
+
+# Scenario 15's reason, from the server side: usg-home-badcrl must have refused
+# the forged CRL because its signature does not verify with the CA key, not
+# for some other reason (unreadable file, bad ca_path) that also ends in an
+# EAP-Failure. Scraped from its log, which the nas container cannot see.
+echo "== checking usg-home-badcrl rejected the CRL for its signature"
+badcrl_log=$(compose logs --no-color usg-home-badcrl 2>/dev/null | perl -pe 's/\e\[[0-9;]*m//g') || true
+if grep -q "ca-wrongkey.crl: CRL from .*: signature does not verify with the issuer's key" <<<"$badcrl_log"; then
+    echo "PASS  usg-home-badcrl logged the CRL signature failure (RFC 5280 6.3.3)"
+else
+    echo "FAIL  usg-home-badcrl log has no 'signature does not verify with the issuer's key' line for ca-wrongkey.crl" >&2
+    exit 1
+fi
 
 # The proxy's own RFC 5997 probes against real home servers: proxy.json enables
 # health checks, so usg-proxy sends a signed Status-Server to FreeRADIUS and to

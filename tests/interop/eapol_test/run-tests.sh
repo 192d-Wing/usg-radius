@@ -6,6 +6,7 @@ set -u
 
 PROXY=${PROXY:-10.77.0.20}
 USG_HOME=${USG_HOME:-10.77.0.30}
+USG_HOME_BADCRL=${USG_HOME_BADCRL:-10.77.0.31}
 FREERADIUS=${FREERADIUS:-10.77.0.10}
 NAS_PROXY_SECRET=${NAS_PROXY_SECRET:-nas-proxy-secret-1}
 NAS_USGHOME_SECRET=${NAS_USGHOME_SECRET:-nas-usghome-secret-3}
@@ -44,6 +45,7 @@ summarize_eapol() {
 section "readiness"
 wait_ready usg-proxy "$PROXY" "$NAS_PROXY_SECRET" || exit 2
 wait_ready usg-home "$USG_HOME" "$NAS_USGHOME_SECRET" || exit 2
+wait_ready usg-home-badcrl "$USG_HOME_BADCRL" "$NAS_USGHOME_SECRET" || exit 2
 # FreeRADIUS only accepts the proxy as a client; probe it through nothing and
 # just give it a moment to finish starting (the proxy test below covers it).
 sleep 1
@@ -263,6 +265,21 @@ LOG=$LOGDIR/acct-start-on-1812.log
 printf 'Acct-Status-Type = Start\nAcct-Session-Id = "interop-acct-0002"\nUser-Name = "teapuser@usg.test"\nNAS-Identifier = "interop-nas"\n' |
     radclient -x -t 2 -r 1 "$USG_HOME:1812" acct "$NAS_USGHOME_SECRET" >"$LOG" 2>&1
 check "Accounting-Request to the authentication port with a dedicated accounting socket: silently discarded" grep -q 'No reply' "$LOG"
+
+# ---------------------------------------------------------------------------
+section "15. EAP-TLS: valid supplicant -> usg-radius home server whose CRL is signed by the wrong key (fail-closed)"
+# usg-home-badcrl's only CRL names the test CA and revokes nothing, but is not
+# signed by the CA's key. Trusting it would admit everyone; verifying it
+# (RFC 5280 6.3.3) leaves the status undeterminable, so fail-closed rejects the
+# same certificate that scenario 4 accepts.
+LOG=$LOGDIR/eap-tls-forged-crl-usg-home.log
+eapol_test -c /etc/eapol_test/eap-tls-usg.conf -a "$USG_HOME_BADCRL" -p 1812 \
+    -s "$NAS_USGHOME_SECRET" -r 0 -t 15 -e >"$LOG" 2>&1
+rc=$?
+summarize_eapol "$LOG"
+check "eapol_test exit status non-zero (rc=$rc)" test "$rc" -ne 0
+check "eapol_test printed FAILURE, not SUCCESS" sh -c "grep -qx 'FAILURE' '$LOG' && ! grep -qx 'SUCCESS' '$LOG'"
+check "EAP-Failure received (rejected, not timed out)" grep -q 'EAP: Status notification: completion (param=failure)' "$LOG"
 
 # ---------------------------------------------------------------------------
 section "result"

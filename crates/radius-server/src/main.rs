@@ -429,11 +429,6 @@ async fn main() {
                         rev.crl.static_files.len(),
                         if rev.crl.fetch { "on" } else { "off" }
                     );
-                    if rev.mode.uses_ocsp() {
-                        warn!(
-                            "OCSP mode selected: OCSP response signatures are not verified in this release; prefer crl_only unless the responder path is trusted"
-                        );
-                    }
                 }
                 Arc::new(eap)
             }

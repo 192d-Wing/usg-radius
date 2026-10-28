@@ -101,6 +101,10 @@ pub struct OcspCache {
 
     /// Maximum number of cache entries
     max_entries: usize,
+
+    /// Upper bound on how long any response is cached (the configured
+    /// `cache_ttl_secs`); `None` = until nextUpdate
+    max_ttl: Option<Duration>,
 }
 
 impl OcspCache {
@@ -117,6 +121,17 @@ impl OcspCache {
         Arc::new(Self {
             cache: Arc::new(DashMap::new()),
             max_entries,
+            max_ttl: None,
+        })
+    }
+
+    /// Like [`OcspCache::new`], but no response is cached for longer than
+    /// `max_ttl`, even if its nextUpdate is later.
+    pub fn with_max_ttl(max_entries: usize, max_ttl: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            cache: Arc::new(DashMap::new()),
+            max_entries,
+            max_ttl: Some(max_ttl),
         })
     }
 
@@ -182,8 +197,11 @@ impl OcspCache {
             self.evict_oldest();
         }
 
-        // Calculate TTL from response's cache_ttl() method
-        let ttl = response.cache_ttl();
+        // Until nextUpdate (or the default), capped by the configured TTL
+        let ttl = match self.max_ttl {
+            Some(max) => response.cache_ttl().min(max),
+            None => response.cache_ttl(),
+        };
 
         let cached = CachedOcspResponse {
             response,

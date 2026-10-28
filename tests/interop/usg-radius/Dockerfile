@@ -10,12 +10,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY . .
-# Cache mounts keep the registry and target dir across builds so a source
-# change only rebuilds the crates that changed.
+# Cache mounts keep the registry and target dir across builds so dependencies
+# compile once. The target cache is shared by every checkout built on the same
+# docker host, and cargo decides whether a path crate is fresh by mtime: a
+# worktree whose sources are older than another worktree's last build would get
+# that build's radius-proto/radius-server. Touch the workspace sources so the
+# binary is always built from the files copied above.
 ARG CARGO_BUILD_JOBS=2
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release -p radius-server --no-default-features \
+    find crates -type f -exec touch {} + \
+    && cargo build --release -p radius-server --no-default-features \
         --features observability,tls,revocation --bin usg-radius \
     && cp target/release/usg-radius /usr/local/bin/usg-radius
 

@@ -14,7 +14,7 @@ See [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md) for detailed gap analysis
 - ❌ No DTLS transport; RadSec is TLS 1.3 only
 - ❌ CoA/Disconnect only over RadSec (no UDP/3799 path)
 - ❌ No certificate hot-rotation for RadSec or EAP-TLS
-- ⚠️ CRL and OCSP response signatures are not verified by the revocation checker
+- ⚠️ Revocation: no delta or Issuing Distribution Point CRLs, static CRLs not hot-reloaded (CRL and OCSP signatures are verified since the unreleased revocation-signature change)
 - ⚠️ EAP-TEAP has only the Basic-Password-Auth inner method (zero IMSK); no EAP-MSCHAPv2 or inner EAP-TLS
 
 ### Completed Features (v0.1.0 through v0.13.0)
@@ -1197,7 +1197,7 @@ let config = RevocationConfig::disabled();
 
 **Known Limitations** (Deferred to future releases):
 
-- [ ] OCSP signature verification (optional - most deployments trust HTTPS)
+- [x] OCSP signature verification (RFC 6960 §3.2 / §4.2.2.2; done after v0.13.0, together with CRL signature verification)
 - [ ] OCSP stapling (RFC 6066) - deferred to v0.8+
 - [ ] Request signing (optional feature)
 - [ ] Batch requests (multiple certificates)
@@ -1362,9 +1362,8 @@ let config = RevocationConfig::disabled();
 
 ### Remaining Work (post v0.13.0)
 
-1. Verify CRL and OCSP response signatures in the revocation checker
-2. EAP-TEAP inner methods with real keying material (EAP-MSCHAPv2)
-3. Administrative enable/disable switch for Status-Server acceptance (RFC 5997 §4.2 SHOULD)
+1. EAP-TEAP inner methods with real keying material (EAP-MSCHAPv2)
+2. Administrative enable/disable switch for Status-Server acceptance (RFC 5997 §4.2 SHOULD)
 
 ### Nice to Have
 
