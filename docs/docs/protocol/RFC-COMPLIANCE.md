@@ -4,7 +4,7 @@ This document identifies gaps between the current USG RADIUS implementation and 
 
 ## Summary
 
-**Overall Status**: Production-ready for modern enterprise authentication with EAP-TLS over RadSec, server-originated CoA/Disconnect, certificate revocation checking, comprehensive rate limiting, accounting, and security features. Reflects the code at **v0.12.0**.
+**Overall Status**: Production-ready for modern enterprise authentication with EAP-TLS over RadSec, server-originated CoA/Disconnect, certificate revocation checking, comprehensive rate limiting, accounting, and security features. Reflects the code at **v0.13.0**.
 
 **Implemented**: Core RADIUS authentication (RFC 2865, PAP + CHAP), Accounting (RFC 2866) on a dedicated 1813/udp socket, Message-Authenticator (RFC 2869 / RFC 3579), EAP-TLS (RFC 5216 / RFC 9190), EAP-TEAP (RFC 9930, Basic-Password-Auth inner method, interoperable with wpa_supplicant), EAP-Nak method negotiation (RFC 3748 §5.3.1), MS-MPPE key delivery (RFC 2548), RadSec (RFC 6614), Status-Server (RFC 5997), CoA/Disconnect (RFC 5176), certificate revocation checking (RFC 5280 CRL, RFC 6960 OCSP) for EAP-TLS supplicant and RadSec NAS certificates, RADIUS proxy with secret re-keying on both legs, Rate Limiting, DoS Protection
 **Partial**: EAP-TEAP inner methods that derive keying material (EAP-MSCHAPv2, inner EAP-TLS), OCSP response signature verification
@@ -24,6 +24,7 @@ This document identifies gaps between the current USG RADIUS implementation and 
 - ✅ v0.10.1: Container image built with the `tls` feature (RadSec / EAP-TLS fix)
 - ✅ v0.11.0: MS-MPPE-Send/Recv-Key (RFC 2548) on EAP Access-Accepts, RFC 9190 TLS 1.3 exporter labels + EAP-Key-Name, RFC 7170 §5.2 IMCK/CMK and §5.4 MSK, Vendor-Specific and Tunnel-Password codecs, proxy re-keying of User-Password / Message-Authenticator / MS-MPPE / Tunnel-Password
 - ✅ v0.12.0: CRL/OCSP revocation checking wired into EAP-TLS and RadSec client-certificate verification (`revocation` block, fail-closed default), EAP-Failure on every EAP Access-Reject, interop harness (24 assertions incl. a revoked supplicant) running in CI
+- ✅ v0.13.0: EAP-TEAP (RFC 9930) interoperable with wpa_supplicant (Crypto-Binding TLV, key schedule, fragmentation, EAP-Nak negotiation, `eap.teap_tls`), bounded EAP session store, Basic-Password-Auth fails closed, `eap.enable_teap` off by default; Status-Server per RFC 5997 with conformant health probes; dedicated 1813/udp accounting socket (`accounting_port`); interop harness at 67 assertions
 
 ---
 
@@ -227,7 +228,7 @@ correct stripping of server-added Proxy-State on the response leg.
 }
 ```
 
-### ✅ Transport (unreleased)
+### ✅ Transport (v0.13.0)
 
 **Status**: ✅ Dedicated UDP accounting socket on 1813
 **Current**: In `udp-insecure` mode the server binds a second UDP socket on `listen_address:accounting_port` (default 1813, RFC 2866 §2) next to the authentication socket, with the same dual-stack (`::`) binding and IPv4-mapped source canonicalisation. Accounting-Response leaves through the socket that received the request, so its source port is 1813. The `accounting_port` key takes three forms:
@@ -519,7 +520,7 @@ See EAP-TLS section under RFC 2869 for complete details.
 
 ## RFC 9930 - Tunnel EAP (TEAP) Version 1 (obsoletes RFC 7170)
 
-### ✅ Implemented (Basic-Password-Auth inner method; unreleased)
+### ✅ Implemented (Basic-Password-Auth inner method; v0.13.0)
 
 **Status**: ✅ Interoperable with wpa_supplicant 2.12's `eapol_test` (the first
 release whose TEAP follows RFC 9930): the interop harness runs EAP-TEAP with
@@ -631,7 +632,7 @@ the in-memory `users` list does.
 
 ## RFC 5997 - Status-Server
 
-### ✅ Implemented (unreleased)
+### ✅ Implemented (v0.13.0)
 
 **Status**: ✅ Server and client (health-probe) behaviour per RFC 5997 over UDP and RadSec
 
@@ -1043,7 +1044,7 @@ Total:         156+ tests
 
 1. ✅ **EAP-TLS** (v0.5.0) - Complete
 2. ✅ **EAP-TEAP** (RFC 9930; v0.7.x Phase 1+2, completion and interop
-   unreleased) - Phase 1 tunnel and Phase 2 TLV protocol through the RADIUS
+   v0.13.0) - Phase 1 tunnel and Phase 2 TLV protocol through the RADIUS
    handler: §3.3 fragmentation in both phases and directions, §3.1 version
    negotiation, §4.2.13 Crypto-Binding TLV with §6.3 Compound-MACs over the
    BUFFER, §6.2 / §6.4 key schedule with the negotiated cipher suite's hash,
@@ -1060,7 +1061,7 @@ Total:         156+ tests
    regression test on the Status-Server path only (Access-Accept/Reject
    ordering tests pending)
 4. ❌ **Hot Configuration Reload** - Deferred (only the mgmt access policy reloads on SIGHUP)
-5. ✅ **Health Monitoring** - Status-Server per RFC 5997 (Message-Authenticator required and verified, reply code by port, Proxy-State echoed, proxy answers locally) and conformant home-server probes (unreleased); replies are not tied to backend health
+5. ✅ **Health Monitoring** - Status-Server per RFC 5997 (Message-Authenticator required and verified, reply code by port, Proxy-State echoed, proxy answers locally) and conformant home-server probes (v0.13.0); replies are not tied to backend health
 6. ✅ **Certificate Revocation (CRL/OCSP)** - CRL (static files + Distribution Points) and OCSP checking of EAP-TLS supplicant and RadSec NAS certificates via the `revocation` block, fail-closed by default (v0.12.0); CRL/OCSP signature verification still pending
 7. ✅ **MS-MPPE Keys** - MS-MPPE-Send/Recv-Key (RFC 2548 §2.4) attached to EAP Access-Accepts (v0.11.0)
 
@@ -1070,7 +1071,7 @@ Total:         156+ tests
 2. ⚠️ **Tunnel Attributes** - Tunnel-Password (69) codec + proxy re-encryption only; the rest is a future enhancement
 3. ❌ **CoA/Disconnect over UDP** - Only the RadSec path shipped (v0.10.0)
 4. ❌ **DTLS (RFC 7360)** - Not planned; RadSec is TLS-only
-5. ✅ **Accounting on a dedicated 1813 socket** - `accounting_port` (integer, default 1813 | `"shared"` | `"disabled"`); Accounting-Response from source port 1813 (unreleased)
+5. ✅ **Accounting on a dedicated 1813 socket** - `accounting_port` (integer, default 1813 | `"shared"` | `"disabled"`); Accounting-Response from source port 1813 (v0.13.0)
 
 ---
 
@@ -1096,7 +1097,7 @@ Total:         156+ tests
 | Audit Logging | - | ✅ Complete | v0.1.1+ | HIGH | Compliance |
 | LDAP Backend | - | ✅ Complete | - | MEDIUM | Enterprise auth |
 | PostgreSQL Backend | - | ✅ Complete | - | MEDIUM | Database auth |
-| Status-Server | 5997 | ✅ Complete | unreleased | LOW | Message-Authenticator required and verified, Access-Accept / Accounting-Response by port, Proxy-State echoed, proxy answers locally, probes conformant; reply not tied to backend health, no enable/disable switch |
+| Status-Server | 5997 | ✅ Complete | v0.13.0 | LOW | Message-Authenticator required and verified, Access-Accept / Accounting-Response by port, Proxy-State echoed, proxy answers locally, probes conformant; reply not tied to backend health, no enable/disable switch |
 | CHAP | 2865 | ✅ Complete | v0.3.0 | LOW | CHAP-Challenge or Request Authenticator |
 | Message-Authenticator | 2869 / 3579 | ✅ Complete | v0.3.0 / v0.10.0 | HIGH | Required on EAP requests since v0.10.0 |
 | RadSec | 6614 | ✅ Complete | v0.10.0 | HIGH | TLS 1.3 + ML-KEM-1024 mTLS; no DTLS |
@@ -1104,10 +1105,10 @@ Total:         156+ tests
 | NAS Identification | 2865 | ✅ Complete | v0.2.0 | MEDIUM | NAS-IP-Address or NAS-Identifier enforced |
 | Enumerated Values | 2865 | ✅ Strict mode | v0.2.0 | LOW | Lenient mode accepts unknown values |
 | Certificate Revocation | 5280 / 6960 | ✅ Integrated | v0.7.x / v0.12.0 | HIGH | `revocation` block for EAP-TLS + RadSec, fail-closed default; CRL/OCSP signatures not verified |
-| Accounting Port 1813 | 2866 | ✅ Bound | unreleased | - | `accounting_port`: 1813 (default) / `"shared"` / `"disabled"`; replies from 1813; wrong-port codes discarded |
+| Accounting Port 1813 | 2866 | ✅ Bound | v0.13.0 | - | `accounting_port`: 1813 (default) / `"shared"` / `"disabled"`; replies from 1813; wrong-port codes discarded |
 | Proxy-State | 2865 | ⚠️ Echoed | v0.x | MEDIUM | Ordering test on the Status-Server path; Access-Accept/Reject ordering tests pending |
 | Hot Reload | - | ❌ Deferred | - | MEDIUM | Only mgmt access policy reloads on SIGHUP |
-| EAP-TEAP | 9930 (obsoletes 7170) | ✅ Basic-Password-Auth, off by default | v0.7.x / unreleased | MEDIUM | §4.2.13 Crypto-Binding TLV, §6.2–§6.4 key schedule (KATs + eapol_test interop over TLS 1.3 and 1.2, direct and via proxy), §3.3 fragmentation both ways (L only on fragmented messages), §3.6.6 protected termination, EAP-Nak switching; Basic-Password-Auth fails closed, Phase 2 rounds bounded; inner methods with real IMSK pending |
+| EAP-TEAP | 9930 (obsoletes 7170) | ✅ Basic-Password-Auth, off by default | v0.7.x / v0.13.0 | MEDIUM | §4.2.13 Crypto-Binding TLV, §6.2–§6.4 key schedule (KATs + eapol_test interop over TLS 1.3 and 1.2, direct and via proxy), §3.3 fragmentation both ways (L only on fragmented messages), §3.6.6 protected termination, EAP-Nak switching; Basic-Password-Auth fails closed, Phase 2 rounds bounded; inner methods with real IMSK pending |
 
 ---
 
@@ -1256,7 +1257,7 @@ The current implementation is **PRODUCTION-READY** for:
    - ⚠️ EAP Identifier not matched on responses and State = `username-millis-sequence` (predictable, unbound to the peer, can restart a live conversation, may exceed 253 octets); redesign as random peer-bound IDs is a tracked follow-up (see RFC 3748 above)
 
 5. **EAP-TEAP Inner Authentication**
-   - ✅ Basic-Password-Auth fails closed: no stored password, empty stored password or empty supplied password → Result=Failure inside the tunnel and Access-Reject; constant-time password comparison. An unreleased build (after v0.12.0, before this fix) accepted an empty password for any user without a stored password
+   - ✅ Basic-Password-Auth fails closed: no stored password, empty stored password or empty supplied password → Result=Failure inside the tunnel and Access-Reject; constant-time password comparison. An unreleased build (after v0.12.0, before v0.13.0) accepted an empty password for any user without a stored password
    - ⚠️ Basic-Password-Auth needs the inner handler to supply the user's cleartext password (`get_user_password`): only the in-memory `users` list does; the PostgreSQL and LDAP handlers reject every TEAP authentication. `eap.enable_teap` therefore defaults to `false`
    - ⚠️ Inner methods with real keying material (EAP-MSCHAPv2, inner EAP-TLS) pending; current inner methods use the zero IMSK of RFC 9930 §6.2.1
 
@@ -1315,9 +1316,9 @@ The USG RADIUS server is **production-ready** for modern enterprise deployments 
 - **v0.10.1**: Container image built with the `tls` feature
 - **v0.11.0**: **MS-MPPE-Send/Recv-Key (RFC 2548)** on EAP Access-Accepts, RFC 9190 TLS 1.3 exporter labels + EAP-Key-Name, EAP-TEAP IMCK/CMK (RFC 7170 §5.2) and MSK (§5.4), Vendor-Specific and Tunnel-Password codecs, proxy re-keying of User-Password / Message-Authenticator (request leg) and MS-MPPE / Tunnel-Password / Message-Authenticator (response leg), signed proxy timeout rejects
 - **v0.12.0**: **Certificate revocation checking (RFC 5280 / RFC 6960)** wired into EAP-TLS and RadSec via the `revocation` block, fail-closed by default; EAP-Failure on every EAP Access-Reject (RFC 3579 §2.6.3); interop harness (revoked supplicant, 24 assertions) running in CI
-- **Unreleased**: **EAP-TEAP interoperable with wpa_supplicant (RFC 9930)**: §4.2.13 Crypto-Binding TLV with §6.3 Compound-MACs, §6.2 / §6.4 key schedule with the negotiated cipher suite's hash (pinned by independent known-answer vectors), §3.1 version bits, §3.6.6 Intermediate-Result + Result + Crypto-Binding termination, §4.2.15 one-octet Basic-Password-Auth-Resp lengths, RFC 3748 §5.3.1 EAP-Nak method switching, `eap.teap_tls`; interop harness on wpa_supplicant 2.12 with four TEAP scenarios (57 assertions). EAP-TEAP fragmentation in both phases and directions (§3.3) through the bounded reassembler, L flag only on fragmented TEAP messages, Phase 2 opened with the handshake flight, EAP-Success Identifier echoing the peer's last Response (RFC 3748 §4.2), first EAP-Request Identifier following the NAS's Identity Request (RFC 3748 §4.1); bounded EAP session store (idle timeout enforced on every packet + LRU cap, released on Accept/Reject, fail closed, `radius_eap_sessions_evicted_total`); `eap` block documented; EAP-TEAP Basic-Password-Auth fails closed (fixes an unreleased empty-password bypass), Phase 2 rounds bounded, `eap.enable_teap` default `false`. **Status-Server per RFC 5997**: Message-Authenticator required and verified with silent discard (§4.1), Access-Accept on the authentication port / Accounting-Response on the accounting port (§4.2), Message-Authenticator on every reply, Proxy-State echoed, proxy answers locally and never forwards (§4.3); **dedicated accounting socket** (`accounting_port`: 1813 default / `"shared"` / `"disabled"`, RFC 2866 §2) with per-socket code admission and Accounting-Response from 1813; home-server health probes made RFC 5997 clients (random Request Authenticator, signed, reply source / Identifier / Response Authenticator / Message-Authenticator verified, per-probe socket — fixes probes that conformant home servers discarded and concurrent probes sharing one socket); constant-time authenticator comparison; interop scenario 14 (Status-Server and the accounting port against radclient, proxy probes against FreeRADIUS and usg-home)
+- **v0.13.0**: **EAP-TEAP interoperable with wpa_supplicant (RFC 9930)**: §4.2.13 Crypto-Binding TLV with §6.3 Compound-MACs, §6.2 / §6.4 key schedule with the negotiated cipher suite's hash (pinned by independent known-answer vectors), §3.1 version bits, §3.6.6 Intermediate-Result + Result + Crypto-Binding termination, §4.2.15 one-octet Basic-Password-Auth-Resp lengths, RFC 3748 §5.3.1 EAP-Nak method switching, `eap.teap_tls`; interop harness on wpa_supplicant 2.12 with four TEAP scenarios (57 assertions). EAP-TEAP fragmentation in both phases and directions (§3.3) through the bounded reassembler, L flag only on fragmented TEAP messages, Phase 2 opened with the handshake flight, EAP-Success Identifier echoing the peer's last Response (RFC 3748 §4.2), first EAP-Request Identifier following the NAS's Identity Request (RFC 3748 §4.1); bounded EAP session store (idle timeout enforced on every packet + LRU cap, released on Accept/Reject, fail closed, `radius_eap_sessions_evicted_total`); `eap` block documented; EAP-TEAP Basic-Password-Auth fails closed (fixes an unreleased empty-password bypass), Phase 2 rounds bounded, `eap.enable_teap` default `false`. **Status-Server per RFC 5997**: Message-Authenticator required and verified with silent discard (§4.1), Access-Accept on the authentication port / Accounting-Response on the accounting port (§4.2), Message-Authenticator on every reply, Proxy-State echoed, proxy answers locally and never forwards (§4.3); **dedicated accounting socket** (`accounting_port`: 1813 default / `"shared"` / `"disabled"`, RFC 2866 §2) with per-socket code admission and Accounting-Response from 1813; home-server health probes made RFC 5997 clients (random Request Authenticator, signed, reply source / Identifier / Response Authenticator / Message-Authenticator verified, per-probe socket — fixes probes that conformant home servers discarded and concurrent probes sharing one socket); constant-time authenticator comparison; interop scenario 14 (Status-Server and the accounting port against radclient, proxy probes against FreeRADIUS and usg-home)
 
 ---
 
 *Last Updated: 2026-10-28*
-*Document Version: 3.4 (unreleased: RFC 5997 Status-Server conformance, dedicated 1813/udp accounting socket, conformant health probes)*
+*Document Version: 3.5 (v0.13.0 release: EAP-TEAP interop with wpa_supplicant, bounded EAP session store, RFC 5997 Status-Server conformance, dedicated 1813/udp accounting socket, conformant health probes)*

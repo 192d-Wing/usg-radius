@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-28
+
+EAP-TEAP now interoperates with wpa_supplicant: the RFC 9930 Crypto-Binding
+TLV, key schedule and protected termination are implemented and pinned by
+independent known-answer vectors, fragmentation works in both phases and
+directions, EAP-Nak method negotiation lets EAP-TLS and TEAP coexist, and four
+TEAP scenarios run in the interop harness. EAP session handling is hardened:
+the session store is bounded by an idle timeout and an LRU cap, TEAP Phase 2
+is bounded per conversation, Basic-Password-Auth fails closed (an empty-password
+bypass that existed only in unreleased builds is fixed), and `eap.enable_teap`
+now defaults to `false`. Status-Server follows RFC 5997 (Message-Authenticator
+required, reply code by port, conformant proxy health probes) and accounting
+gets its own 1813/udp socket through the new `accounting_port` key.
+
 ### Added
 
 - **EAP-TEAP interoperates with wpa_supplicant (RFC 9930).** The TEAP server
@@ -121,6 +135,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+**Two defaults change in this release.** `eap.enable_teap` is now `false`
+(TEAP must be enabled explicitly), and Accounting-Request is answered on a
+dedicated socket on port 1813 (`accounting_port`, default `1813`) instead of
+on `listen_port`; a NAS that sends accounting to 1812 gets no reply until it
+is pointed at 1813 or `"accounting_port": "shared"` is set. Details below.
+
 - **`eap.enable_teap` now defaults to `false`** (it defaulted to `true`).
   EAP-TEAP is opt-in: its only inner method, Basic-Password-Auth, needs the
   inner handler to supply the user's password (the in-memory `users` list
@@ -158,6 +178,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Access-Accept). A monitor that sends a bare 20-octet Status-Server now gets
   no reply; radclient's `status` command and FreeRADIUS proxies already sign
   theirs, as RFC 5997 §4.1 requires.
+- `EapTlsContext` and `CryptoBinding` no longer derive `Debug`: their
+  implementations print the lengths of the master secret, MSK, EMSK, IMCK and
+  CMK, never the bytes (as `MppeKeys` already did).
 
 ### Security
 
@@ -263,12 +286,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`0.0.0.0:0` or `[::]:0`, matching the listener's address family) and
   checks the reply's source address and Identifier; `HealthChecker::new` is
   now synchronous.
-
-### Changed
-
-- `EapTlsContext` and `CryptoBinding` no longer derive `Debug`: their
-  implementations print the lengths of the master secret, MSK, EMSK, IMCK and
-  CMK, never the bytes (as `MppeKeys` already did).
 
 ### Documentation
 
