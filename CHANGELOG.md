@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The interop harness runs concurrently on one Docker host.**
+  `tests/interop/run.sh` gives every run its own compose project
+  (`INTEROP_PROJECT`, default `usg-radius-interop-<checkout path hash>-<pid>`),
+  image tag, `10.77.N.0/24` network (`INTEROP_NET`; the first free one, since
+  Docker refuses overlapping subnets) and run directory
+  (`tests/interop/.runs/<project>/`: test PKI, configs rendered for that /24,
+  server logs). Teardown, also on failure, `^C` or `SIGTERM`, removes only that
+  run's containers, network, volumes and images. Two worktrees sharing the
+  Lima VM no longer tear down or reuse each other's containers. CI pins
+  `INTEROP_PROJECT` so its log-collection step finds the containers.
+
 ## [0.13.0] - 2026-10-28
 
 EAP-TEAP now interoperates with wpa_supplicant: the RFC 9930 Crypto-Binding
