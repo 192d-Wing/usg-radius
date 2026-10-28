@@ -567,7 +567,7 @@ RadSec (RADIUS over TLS, RFC 6614) shipped in v0.10.0 and is the **default trans
 | `"radsec"` (default for config files) | 2083/tcp, TLS 1.3 mTLS | NAS client certificate | Requires the `tls` cargo feature (built into the container image since v0.10.1) |
 | `"udp-insecure"` | `listen_port`/udp (1812) | Shared secret + source IP | **Not FIPS-approved**, spoofable; logs a prominent startup warning. Only for development against legacy NASes |
 
-Limitations: no DTLS (RFC 7360); no certificate hot-rotation for the listener or the proxy's outbound client certificate (restart the pod to pick up renewed certificates); no certificate pinning or TLS-PSK trust; CRL/OCSP checking of NAS certificates (`radsec.revocation`, v0.12.0) and of RadSec home-server certificates (`tls.revocation` on the home server) does not verify CRL/OCSP signatures, ignores stapled OCSP and runs its network fetches inside the handshake; the proxy components run only under the `udp-insecure` NAS listener, so RadSec-in → RadSec-out proxying is not available; the proxy forwards NAS Identifiers unchanged on its upstream hop (RFC 6613 §2.6).
+Limitations: no DTLS (RFC 7360); no certificate hot-rotation for the listener or the proxy's outbound client certificate (restart the pod to pick up renewed certificates); no certificate pinning or TLS-PSK trust. NAS client certificates can be checked for revocation with a `radsec.revocation` block, and RadSec home-server certificates with `tls.revocation` on the home server (CRL and/or OCSP, fail-closed by default; see [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md#certificate-revocation-crlocsp--integrated)). Both use the same revocation module: CRLs and OCSP responses are trusted only when signed by the CA that issued the certificate (or, for OCSP, a delegated responder it authorized with id-kp-OCSPSigning), and every certificate in the chain except the trust anchor is checked. Stapled OCSP is ignored and network fetches run inside the handshake. The proxy components run only under the `udp-insecure` NAS listener, so RadSec-in → RadSec-out proxying is not available; the proxy forwards NAS Identifiers unchanged on its upstream hop (RFC 6613 §2.6).
 
 ## Management API Authentication
 
@@ -605,9 +605,10 @@ See [Management API Authentication](mgmt-api-auth.md) for the policy schema, con
 
 Remaining security work:
 
-1. **RadSec**: DTLS transport, certificate hot-rotation and pinning, proxying under the inbound RadSec listener, Identifier rewriting on the proxy's upstream hop, CRL/OCSP signature verification and revocation fetches off the handshake path
+1. **RadSec**: DTLS transport, certificate hot-rotation and pinning, proxying under the inbound RadSec listener, Identifier rewriting on the proxy's upstream hop
 2. **EAP**: EAP-TEAP inner methods with real IMSK
-3. **Modern Crypto for UDP**: the UDP transport is bound to MD5 by RFC 2865; prefer RadSec rather than waiting for stronger UDP primitives
+3. **Revocation**: delta and Issuing Distribution Point CRLs, hot reload of static CRL files, non-blocking CRL/OCSP fetches (off the handshake path, inbound and outbound)
+4. **Modern Crypto for UDP**: the UDP transport is bound to MD5 by RFC 2865; prefer RadSec rather than waiting for stronger UDP primitives
 
 ## Security Checklist
 

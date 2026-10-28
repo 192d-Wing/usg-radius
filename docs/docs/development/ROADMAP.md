@@ -14,7 +14,7 @@ See [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md) for detailed gap analysis
 - ❌ No DTLS transport; RadSec is TLS 1.3 only
 - ❌ CoA/Disconnect only over RadSec (no UDP/3799 path)
 - ❌ No certificate hot-rotation for RadSec (listener or proxy client certificate) or EAP-TLS
-- ⚠️ CRL and OCSP response signatures are not verified by the revocation checker
+- ⚠️ Revocation: no delta or Issuing Distribution Point CRLs, static CRLs not hot-reloaded (CRL and OCSP signatures are verified since the unreleased revocation-signature change, for the inbound listeners and the proxy's outbound RadSec link alike)
 - ⚠️ EAP-TEAP has only the Basic-Password-Auth inner method (zero IMSK); no EAP-MSCHAPv2 or inner EAP-TLS
 - ⚠️ The proxy forwards NAS Identifiers unchanged on its upstream hop (UDP socket or RadSec connection), so two NASes using the same Identifier at the same time collide at a home server that deduplicates on Identifier (RFC 6613 §2.6); the proxy runs only under the `udp-insecure` NAS listener
 
@@ -1203,7 +1203,7 @@ let config = RevocationConfig::disabled();
 
 **Known Limitations** (Deferred to future releases):
 
-- [ ] OCSP signature verification (optional - most deployments trust HTTPS)
+- [x] OCSP signature verification (RFC 6960 §3.2 / §4.2.2.2; done after v0.13.0, together with CRL signature verification)
 - [ ] OCSP stapling (RFC 6066) - deferred to v0.8+
 - [ ] Request signing (optional feature)
 - [ ] Batch requests (multiple certificates)
@@ -1246,7 +1246,7 @@ let config = RevocationConfig::disabled();
 - [x] TLS 1.3 support (TLS 1.2 intentionally excluded by the FIPS posture; ML-KEM-1024-only key exchange)
 - [x] Certificate-based authentication (NAS client certificate is the authenticated identity)
 - [x] RADIUS over TLS (RadSec) on 2083/tcp, default transport for config files
-- [x] Outbound RadSec from the proxy to `transport: "radsec"` home servers (unreleased): one persistent mutually authenticated connection per home server, fixed `"radsec"` hop secret, RFC 6613 connection rules (no retransmission on a connection, close on protocol violation, Status-Server watchdog, Identifier tracking, `max_outstanding ≤ 255`), home-server certificate revocation via `tls.revocation`; interop scenario 15 against FreeRADIUS 3.2.7 over RadSec
+- [x] Outbound RadSec from the proxy to `transport: "radsec"` home servers (unreleased): one persistent mutually authenticated connection per home server, fixed `"radsec"` hop secret, RFC 6613 connection rules (no retransmission on a connection, close on protocol violation, Status-Server watchdog, Identifier tracking, `max_outstanding ≤ 255`), home-server certificate revocation via `tls.revocation`; interop scenario 17 against FreeRADIUS 3.2.7 over RadSec
 - [ ] DTLS support (RFC 7360) - **not shipped**
 - [x] Perfect Forward Secrecy (ephemeral ML-KEM key exchange)
 
@@ -1370,9 +1370,8 @@ let config = RevocationConfig::disabled();
 
 ### Remaining Work (post v0.13.0)
 
-1. Verify CRL and OCSP response signatures in the revocation checker
-2. EAP-TEAP inner methods with real keying material (EAP-MSCHAPv2)
-3. Administrative enable/disable switch for Status-Server acceptance (RFC 5997 §4.2 SHOULD)
+1. EAP-TEAP inner methods with real keying material (EAP-MSCHAPv2)
+2. Administrative enable/disable switch for Status-Server acceptance (RFC 5997 §4.2 SHOULD)
 
 ### Nice to Have
 

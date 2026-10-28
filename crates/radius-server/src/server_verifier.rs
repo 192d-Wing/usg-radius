@@ -7,8 +7,9 @@
 //! as RFC 6614 §2.3 items 2–3 require of a RadSec client: mutual
 //! authentication, RFC 5280 validation, expected DNS name), and when the home
 //! server's `tls.revocation` block is configured that verifier is followed by
-//! `radius_proto::revocation::RevocationCheckingVerifier::check_revocation`,
-//! so static CRLs, CRL Distribution Points, OCSP and the fail-open/closed
+//! `radius_proto::revocation::RevocationCheckingVerifier::check_chain`
+//! (every certificate of the chain but the anchor, with CRL and OCSP
+//! signatures verified against the CA bundle), so static CRLs, CRL Distribution Points, OCSP and the fail-open/closed
 //! policy behave exactly as they do for `eap.tls.revocation` and
 //! `radsec.revocation`. Without the block the plain WebPKI verifier is used
 //! unchanged.
@@ -18,7 +19,7 @@
 //! it as unvalidated at trace level) and the revocation checker fetches its
 //! own status. Revocation is decided solely by the `tls.revocation` block.
 //!
-//! **Blocking fetches inside the handshake.** `check_revocation` is a
+//! **Blocking fetches inside the handshake.** `check_chain` is a
 //! synchronous rustls callback; with `crl.fetch = true` or any OCSP mode it
 //! performs a blocking HTTP fetch from inside the TLS handshake future, on the
 //! tokio worker that runs the link task, and the link's `connect_timeout`
@@ -119,8 +120,10 @@ pub fn build_server_verifier(
             use rustls::pki_types::CertificateDer;
             use rustls::server::WebPkiClientVerifier;
 
-            // The CA certificates double as issuer candidates for OCSP requests
-            // (a home server rarely sends its issuer as an intermediate).
+            // The CA certificates anchor the chain the revocation checks walk:
+            // CRL and OCSP signatures are trusted only when they chain to one,
+            // and they are the OCSP request issuer (a home server rarely sends
+            // its issuer as an intermediate).
             let issuers: Vec<Vec<u8>> = CertificateDer::pem_file_iter(ca_path)?
                 .map(|c| c.map(|c| c.as_ref().to_vec()))
                 .collect::<Result<_, _>>()?;
@@ -128,6 +131,8 @@ pub fn build_server_verifier(
             // the adapter below never invokes it (WebPKI validation of the
             // *server* certificate is done by `webpki` above, name check
             // included). It only exists to satisfy the constructor.
+            // CRL/OCSP signatures are verified with the link's algorithms.
+            let signature_algorithms = provider.signature_verification_algorithms;
             let inner = WebPkiClientVerifier::builder_with_provider(roots, provider)
                 .build()
                 .map_err(|e| ServerVerifierError::Build(e.to_string()))?;
@@ -137,7 +142,8 @@ pub fn build_server_verifier(
                     inner,
                 )
                 .map_err(|e| ServerVerifierError::Revocation(e.to_string()))?
-                .with_issuer_certificates(issuers);
+                .with_issuer_certificates(issuers)
+                .with_signature_verification_algorithms(signature_algorithms);
             Ok(ServerVerifier::RevocationChecking(Arc::new(
                 RevocationCheckingServerVerifier { webpki, revocation },
             )))
@@ -191,7 +197,7 @@ impl ServerCertVerifier for RevocationCheckingServerVerifier {
         let intermediates: Vec<&[u8]> = intermediates.iter().map(|c| c.as_ref()).collect();
         match self
             .revocation
-            .check_revocation(end_entity.as_ref(), &intermediates)
+            .check_chain(end_entity.as_ref(), &intermediates, now)
         {
             Ok(()) => Ok(rustls::client::danger::ServerCertVerified::assertion()),
             Err(radius_proto::revocation::RevocationError::CertificateRevoked(_)) => Err(

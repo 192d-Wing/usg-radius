@@ -9,6 +9,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **CRL signatures are verified (RFC 5280 §6.3.3).** The revocation checker
+  used to trust any CRL as delivered, so anyone on the path to a CRL
+  Distribution Point could serve an empty CRL and un-revoke every certificate.
+  A CRL — static file or Distribution Point alike — is now used only if its
+  issuer Name equals the issuing CA's subject, the CA's keyUsage (when present)
+  asserts cRLSign, `TBSCertList.signature` equals `signatureAlgorithm`, and the
+  signature verifies with the CA's public key. An unsigned, wrongly signed or
+  tampered CRL is unusable and the `on_error` policy applies (rejected under the
+  default `fail_closed`); it is never read as "not revoked". Delta CRLs, CRLs
+  with an Issuing Distribution Point and CRLs with unrecognized critical
+  (entry) extensions are rejected rather than misread, and so is a CRL
+  without nextUpdate (RFC 5280 §5.1.2.5), which used to be current forever.
+- **crlNumber is tracked per issuer (RFC 5280 §5.2.3).** A CRL older than one
+  already accepted for the same CA (Name and key) is refused, so a replayed, still-unexpired
+  CRL cannot hide a later revocation. Of several static CRL files for one CA
+  the highest crlNumber is consulted first.
+- **OCSP responses are verified (RFC 6960 §3.2, §4.2.2.2).** A response must
+  carry a SingleResponse for exactly the requested CertID and be signed by the
+  CA that issued the certificate, or by a delegated responder certificate that
+  CA issued directly with id-kp-OCSPSigning (keyUsage permitting signing, no
+  unrecognized critical extension, within its validity period); ResponderID
+  byName must name the signer.
+  id-pkix-ocsp-nocheck exempts only the responder certificate; without it the
+  responder is checked against the CA's CRL, and in `ocsp_only` mode such a
+  response is unusable. thisUpdate may lead the local clock by at most five
+  minutes, an expired nextUpdate is refused, and a response without
+  nextUpdate is refused once its thisUpdate is older than `ocsp.cache_ttl_secs`
+  (§3.2 item 5), on first use and on every cache hit, so a recorded
+  nonce-less response cannot be replayed indefinitely after revocation. Unrecognized critical response extensions are refused. The
+  request nonce is now 32 octets, as RFC 8954 §2.1 requires (it was 16). The
+  OCSP cache is keyed by the full CertID rather than the serial number alone,
+  and `ocsp.cache_ttl_secs` now caps how long a response is cached (it was
+  accepted but ignored). The startup warning about unverified OCSP
+  signatures is gone.
+- **Intermediates are checked as well as the end entity.** After WebPKI
+  validation the verifier links the peer's certificate through its
+  intermediates to a certificate in `ca_path`, each step by issuer Name and
+  signature, and checks every certificate except the trust anchor against its
+  own issuer. Peer intermediates count only if they are CA certificates valid
+  at the time (WebPKI's criteria), so an expired twin cannot hide a revoked
+  one; when several paths link through intermediates (a same-key renewal,
+  cross-certificates) every such path is checked and any revoked link
+  rejects. Because the peer controls the
+  intermediates, path building is budgeted (each certificate parsed once,
+  each link verified once, at most 64 signature verifications, 32 path
+  extensions and 8 paths) and exceeding it rejects regardless of
+  `on_error` — a large `ca_path` bundle (many same-key renewals, bridge
+  cross-certificates) can exceed it, see RFC-COMPLIANCE.md. An issuing CA
+  listed in `ca_path` next to its root is checked
+  against the root's CRL instead of being trusted as an anchor, and a root the
+  peer appends behind a configured issuing CA is ignored. Deployments
+  with intermediate CAs now need a CRL (static or Distribution Point) or an
+  OCSP responder for each of them; a chain that cannot be linked to `ca_path`
+  is undeterminable (rejected under `fail_closed`).
+- **CRL and OCSP fetches are bounded and do not follow redirects.** The HTTP
+  body was read whole before the size limit was checked, so a party on the
+  path could stream an unbounded body into memory; now at most the limit plus
+  one byte is read. Redirects (up to 10 by default, including to internal
+  addresses and from https to http) are no longer followed.
+- All signature checks use the rustls `CryptoProvider`'s signature
+  algorithms — the process default (aws-lc-rs) for EAP-TLS and the listener's
+  FIPS provider for RadSec — so no second crypto implementation is
+  introduced.
+
 - **EAP conversations are named by an unpredictable State bound to the NAS
   and the user.** The RADIUS State of an EAP conversation used to be
   `username-millis-sequence`: predictable, usable from any NAS, able to
@@ -96,12 +160,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `examples/configs/proxy-radsec-upstream.json`; `examples/proxy_config.json`
   gains a `radsec_pool`. The Status-Server probe under `"radsec"` is pinned by
   an independent Python known-answer vector
-  (`tests/vectors/radsec_status_server_vector.py`). Interop: scenario 16
-  (nine assertions, 86 in total across sixteen scenarios) proxies EAP-TLS
+  (`tests/vectors/radsec_status_server_vector.py`). Interop: scenario 17
+  (nine assertions, 89 in total across seventeen scenarios) proxies EAP-TLS
   (eapol_test) and PAP (radclient) through
   usg-radius to FreeRADIUS 3.2.7 over RadSec with a different secret on the
   NAS hop (the supplicant's MS-MPPE keys match, the wrong password gets an
-  Access-Reject), and twelve host-side checks confirm from the FreeRADIUS and
+  Access-Reject), and nine host-side checks (13 in all) confirm from the FreeRADIUS and
   proxy logs that the connection negotiated TLS 1.3, `TLS_AES_256_GCM_SHA384`
   and ML-KEM-1024 (`group=Some(MLKEM1024)`), that FreeRADIUS verified the
   proxy's client certificate, and that the RadSec realm never reached UDP
@@ -112,6 +176,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proxy is active only under the `udp-insecure` NAS listener, as before.
 
 ### Fixed
+
+- The OCSP response parser compared ASN.1 tag numbers with raw identifier
+  octets, so it could not decode a real responder's certStatus, version or
+  response extensions (including the nonce), and parsed GeneralizedTime with a
+  format chrono rejects. It is replaced by a DER reader over the signed bytes
+  (definite minimal lengths, no trailing data in the structures that carry
+  meaning); OCSP requests are byte-identical to `openssl ocsp -sha256` and
+  OpenSSL-issued responses (ECDSA CA-signed, delegated-responder-signed,
+  revoked; RSA PKCS#1 v1.5 and PSS) and RSA CRLs are pinned as known-answer
+  fixtures.
 
 - RFC 3579 §2.6.2: an Access-Request carrying an EAP-Request (role
   reversal), EAP-Success or EAP-Failure is rejected without touching any
@@ -149,6 +223,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `radius_proto::revocation`: `RevocationError::InvalidSignature` now carries a
+  reason, `RevocationError::StaleCrl` and `RevocationError::PathBudgetExceeded`
+  are new, `RevocationError::kind()` names the variant without its message, `CrlInfo` gains `issuer_raw` and
+  `verified_with` and its `crl_number` is a `BigUint`;
+  `RevocationCheckingVerifier::with_issuer_certificates` is now required for
+  any revocation checking (it anchors the chain), and
+  `with_signature_verification_algorithms` selects the provider's algorithms;
+  `OcspResponse::parse_verified` and `OcspRequestBuilder::cert_id` replace the
+  unimplemented `OcspResponse::verify_signature`.
+
 - **The interop harness runs concurrently on one Docker host.**
   `tests/interop/run.sh` gives every run its own compose project
   (`INTEROP_PROJECT`, default `usg-radius-interop-<checkout path hash>-<pid>`),
@@ -176,6 +260,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   image build asserts that `openssl list -tls-groups` contains `MLKEM1024`.
   The eapol_test image stays on bookworm. Harness only; the shipping image is
   unchanged.
+
+### Testing
+
+- rcgen fixtures for: a signed CRL accepted (ECDSA P-256, P-384, Ed25519); a
+  CRL signed by the wrong key, a tampered CRL, a CRL from an issuer without
+  cRLSign and one with a mismatched signatureAlgorithm rejected; delta, IDP
+  and unrecognized-critical-extension CRLs rejected; a stale or missing
+  crlNumber rejected; a revoked intermediate rejected (also behind an expired
+  same-key twin and as an issuing CA in the bundle) and a made-up
+  intermediate refused; OCSP responses signed by the CA and by a
+  delegated responder accepted; a delegated responder without the EKU, with a
+  non-signing keyUsage, outside its validity or with an unknown critical
+  extension, an unrelated key and an impostor CA's responder rejected; an
+  expired copy of the responder certificate not masking the current one;
+  every same-key path checked in either order and under fail-open; chain
+  padding (extra paths, and dead-end certificates exhausting the signature
+  budget) rejected under fail-open; a peer-appended root ignored; an expired
+  configured issuing CA still anchoring; a peer intermediate without
+  keyCertSign linked; CertID, ResponderID, nonce,
+  future thisUpdate, maximum age (overflow-safe) and unknown-critical-extension
+  checks; the bounded HTTP body reader.
+- Interop scenario 16: `gen-certs.sh` writes `ca-wrongkey.crl` (the CA's Name,
+  nothing revoked, signed by another key) and a third usg-radius instance,
+  `usg-home-badcrl`, rejects the otherwise valid supplicant with EAP-Failure
+  under `fail_closed` (80 assertions with scenario 15), and `run.sh` checks that server's log
+  names the CRL signature failure as the reason.
+- The interop usg-radius image touches the workspace sources before
+  `cargo build`: its target cache mount is shared by every checkout built on
+  the same docker host, and cargo's mtime-based freshness check could
+  otherwise ship another checkout's newer build of radius-proto.
 
 ## [0.13.0] - 2026-10-28
 

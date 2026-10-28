@@ -26,6 +26,7 @@ nas 10.77.0.40 ──[nas-proxy-secret-1]──▶ usg-proxy 10.77.0.20 ──[p
                                                                ──[RadSec 2083: TLS 1.3, ML-KEM-1024, mTLS, "radsec"]──▶ freeradius 10.77.0.10  (realm radsec.test)
                                                                ──[proxy-usghome-secret-4, UDP 1812]────▶ usg-home 10.77.0.30    (realm usg.test)
 nas 10.77.0.40 ──[nas-usghome-secret-3]─▶ usg-home 10.77.0.30   (usg-radius as EAP-TLS / EAP-TEAP home server, no proxy)
+nas 10.77.0.40 ──[nas-usghome-secret-3]─▶ usg-home-badcrl 10.77.0.31 (EAP-TLS home server whose CRL is signed by the wrong key)
 ```
 
 On the RadSec hop the secret is the fixed `"radsec"` of RFC 6614 §2.3 and the
@@ -120,7 +121,8 @@ The job fails when any assertion fails (`run.sh` exits non-zero as soon as one
 check does). On failure it uploads an `interop-logs` artifact holding
 `run.log` (the full `run.sh` output: the PASS/FAIL line per assertion, the
 eapol_test and radclient summaries and the per-check log tails) and the
-complete `freeradius.log`, `usg-proxy.log` and `usg-home.log`.
+complete `freeradius.log`, `usg-proxy.log`, `usg-home.log` and
+`usg-home-badcrl.log`.
 
 The three harness images build from public Debian and `rust:*-slim-bookworm`
 images, not from the Iron Bank base the shipping `Dockerfile` uses, so the job
@@ -138,10 +140,10 @@ image build (default 2).
 
 ## What is checked
 
-Eighty-six assertions across sixteen scenarios inside the `nas` container,
-plus twelve host-side checks in `run.sh` (the proxy's probes to its three home
-servers, §14, and the RadSec hop, §16). All pass on the current tree (run
-`tests/interop/run.sh`).
+Eighty-nine assertions across seventeen scenarios inside the `nas` container,
+plus thirteen host-side checks in `run.sh` (the proxy's probes to its three
+home servers, §14; usg-home-badcrl's CRL signature failure, §16; and the RadSec
+hop, §17). All pass on the current tree (run `tests/interop/run.sh`).
 
 ### 1 & 2 — EAP-TLS through the proxy to FreeRADIUS
 
@@ -377,7 +379,33 @@ the State to the NAS and User-Name, are covered by unit tests in
 `crates/radius-server/src/eap_auth.rs` (`retransmitted_requests_get_the_cached_reply_byte_for_byte`,
 `state_from_another_nas_or_user_is_rejected_without_touching_the_conversation`).
 
-### 16 — EAP-TLS and PAP through the proxy to FreeRADIUS over RadSec (RFC 6614)
+### 16 — CRL signed by the wrong key (fail-closed)
+
+`gen-certs.sh` also writes `ca-wrongkey.crl`: an OpenSSL CRL whose issuer is
+the test CA's Name, with a higher crlNumber and **no** revoked certificates,
+signed by an unrelated key (the script checks the issuer Name matches and that
+`openssl crl -CAfile ca.crt` refuses it). A third usg-radius instance,
+`usg-home-badcrl` (`home-badcrl.json`, same image and server certificate as
+usg-home), loads it as its only static CRL with `on_error` `fail_closed`.
+eapol_test authenticates as `eaptls@usg.test`, the certificate scenario 4
+accepts:
+
+- eapol_test exits non-zero and prints `FAILURE`, never `SUCCESS`: the CRL
+  signature does not verify with the CA's key (RFC 5280 §6.3.3), so the CRL is
+  unusable, the status is undeterminable and fail-closed aborts the handshake.
+  Without signature verification this forged "nothing is revoked" CRL would
+  have admitted every certificate the CA issued, including the revoked one.
+- `EAP: Status notification: completion (param=failure)`: rejected with
+  EAP-Failure, not by timeout.
+- Host side, from `run.sh`: usg-home-badcrl's log carries `ca-wrongkey.crl:
+  CRL from …: signature does not verify with the issuer's key`, so the
+  rejection is for the forged signature and not for a configuration mistake
+  that would also end in EAP-Failure.
+
+Scenario 4's success doubles as the positive control: the OpenSSL-signed
+`ca.crl` verifies with the CA key in usg-radius.
+
+### 17 — EAP-TLS and PAP through the proxy to FreeRADIUS over RadSec (RFC 6614)
 
 `proxy.json` routes realm `radsec.test` to the same FreeRADIUS as scenarios
 1–3, but through a home server entry with `"transport": "radsec"` and a `tls`

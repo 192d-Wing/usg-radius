@@ -2009,6 +2009,7 @@ dependencies = [
  "md-5 0.11.0",
  "md5",
  "rand 0.10.3",
+ "rcgen",
  "reqwest",
  "rustls",
  "rustls-pki-types",
