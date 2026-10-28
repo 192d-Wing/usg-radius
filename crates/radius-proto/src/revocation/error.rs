@@ -84,6 +84,33 @@ pub enum RevocationError {
     OcspError(String),
 }
 
+impl RevocationError {
+    /// The variant's name, without its message: for logs and test failures
+    /// that must not echo certificate- or response-derived text.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::FetchError(_) => "FetchError",
+            Self::ParseError(_) => "ParseError",
+            Self::CertificateRevoked(_) => "CertificateRevoked",
+            Self::InvalidSignature(_) => "InvalidSignature",
+            Self::PathBudgetExceeded(_) => "PathBudgetExceeded",
+            Self::StaleCrl(_) => "StaleCrl",
+            Self::CrlExpired(_) => "CrlExpired",
+            Self::CrlNotYetValid(_) => "CrlNotYetValid",
+            Self::HttpError(_) => "HttpError",
+            Self::HttpTimeout(_) => "HttpTimeout",
+            Self::InvalidUrl(_) => "InvalidUrl",
+            Self::CrlTooLarge(_, _) => "CrlTooLarge",
+            Self::DistributionPointError(_) => "DistributionPointError",
+            Self::IoError(_) => "IoError",
+            Self::CertificateError(_) => "CertificateError",
+            Self::CacheError(_) => "CacheError",
+            Self::ConfigError(_) => "ConfigError",
+            Self::OcspError(_) => "OcspError",
+        }
+    }
+}
+
 impl From<RevocationError> for crate::eap::EapError {
     fn from(err: RevocationError) -> Self {
         crate::eap::EapError::TlsError(format!("Revocation check failed: {}", err))

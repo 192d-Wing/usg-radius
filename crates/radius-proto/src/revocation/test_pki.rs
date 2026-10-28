@@ -378,10 +378,14 @@ impl<'a> OcspResponseSpec<'a> {
         const NONCE_OID: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02];
         const BASIC_OID: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
 
-        let mut serial = self.cert_id.serial_number.clone();
-        if serial.first().is_none_or(|b| b & 0x80 != 0) {
-            serial.insert(0, 0x00);
-        }
+        // INTEGER contents: prefix 0x00 when empty or the top bit is set.
+        let magnitude = self.cert_id.serial_number.as_slice();
+        let pad: &[u8] = if magnitude.first().is_none_or(|b| b & 0x80 != 0) {
+            &[0x00]
+        } else {
+            &[]
+        };
+        let serial = [pad, magnitude].concat();
         let cert_id = seq(&[
             &seq(&[&tlv(0x06, SHA256_OID), &[0x05, 0x00]]),
             &tlv(0x04, &self.cert_id.issuer_name_hash),

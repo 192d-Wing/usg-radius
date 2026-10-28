@@ -160,7 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `radius_proto::revocation`: `RevocationError::InvalidSignature` now carries a
   reason, `RevocationError::StaleCrl` and `RevocationError::PathBudgetExceeded`
-  are new, `CrlInfo` gains `issuer_raw` and
+  are new, `RevocationError::kind()` names the variant without its message, `CrlInfo` gains `issuer_raw` and
   `verified_with` and its `crl_number` is a `BigUint`;
   `RevocationCheckingVerifier::with_issuer_certificates` is now required for
   any revocation checking (it anchors the chain), and

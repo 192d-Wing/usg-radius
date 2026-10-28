@@ -74,6 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let response_bytes = client.query(&ocsp_url, &request, 10 * 1024 * 1024)?; // 10 MB max
     let response = OcspResponse::parse(&response_bytes)?;
+    println!("Response Size: {} bytes", response_bytes.len());
 
     // Display response
     println!("\nOCSP Response");
@@ -140,12 +141,8 @@ fn display_response(response: &OcspResponse, expected_nonce: &[u8]) -> Result<()
         }
     }
 
-    // Time information
-    println!("Produced At: {:?}", response.produced_at);
-    println!("This Update: {:?}", response.this_update);
-    if let Some(next_update) = response.next_update {
-        println!("Next Update: {:?}", next_update);
-
+    // Validity window (thisUpdate / nextUpdate); only the outcome is printed
+    if response.next_update.is_some() {
         // Calculate freshness
         let now = std::time::SystemTime::now();
         if now < response.this_update {
@@ -171,9 +168,6 @@ fn display_response(response: &OcspResponse, expected_nonce: &[u8]) -> Result<()
     } else {
         println!("Nonce: not present ⚠️  (no replay protection)");
     }
-
-    // Response size
-    println!("Response Size: {} bytes", response.raw_bytes.len());
 
     Ok(())
 }

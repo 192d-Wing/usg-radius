@@ -574,7 +574,7 @@ mod tests {
         let algorithms = crate::revocation::signature::default_algorithms();
         for (name, der, number) in [("PKCS#1", RSA_CRL, 1u32), ("PSS", RSA_PSS_CRL, 2)] {
             let crl = CrlInfo::parse_and_verify(der, RSA_CA, &algorithms)
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
+                .unwrap_or_else(|e| panic!("{name}: {}", e.kind()));
             assert!(crl.is_revoked(&[0x5A, 0x5A]), "{name}");
             assert_eq!(crl.crl_number, Some(BigUint::from(number)), "{name}");
             crl.validate_current(Utc::now()).unwrap();

@@ -1449,7 +1449,9 @@ mod tests {
         let (response, _) = kat_verify(KAT_CA_REVOKED).unwrap();
         match response.cert_status {
             Some(CertificateStatus::Revoked { reason, .. }) => assert_eq!(reason, Some(1)),
-            other => panic!("expected revoked, got {other:?}"),
+            Some(CertificateStatus::Good) => panic!("expected revoked, got good"),
+            Some(CertificateStatus::Unknown) => panic!("expected revoked, got unknown"),
+            None => panic!("expected revoked, got no status"),
         }
     }
 
@@ -1530,7 +1532,7 @@ mod tests {
                 SystemTime::now(),
                 Duration::from_secs(3600),
             )
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            .unwrap_or_else(|e| panic!("{name}: {}", e.kind()));
             assert_eq!(authorization, ResponderAuthorization::Issuer, "{name}");
             assert!(parsed.is_revoked(), "{name}");
         }

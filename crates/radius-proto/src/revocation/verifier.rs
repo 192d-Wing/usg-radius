@@ -1257,7 +1257,11 @@ mod tests {
         );
         let err = RevocationCheckingVerifier::with_webpki_verifier(config, accept_all())
             .expect_err("missing CRL file must fail at construction");
-        assert!(matches!(err, RevocationError::ConfigError(_)), "{err}");
+        assert!(
+            matches!(err, RevocationError::ConfigError(_)),
+            "{}",
+            err.kind()
+        );
     }
 
     #[test]
@@ -1389,7 +1393,11 @@ mod tests {
 
         let (verifier, _files) = crl_verifier(&[&forged], &[&ca]);
         let err = check(&verifier, &leaf, &[]).expect_err("forged CRL must not vouch for anyone");
-        assert!(matches!(err, RevocationError::InvalidSignature(_)), "{err}");
+        assert!(
+            matches!(err, RevocationError::InvalidSignature(_)),
+            "{}",
+            err.kind()
+        );
 
         // Fail-open lets the handshake through, as for any unusable CRL; it
         // never treats the forged CRL as a positive answer either way.
@@ -1432,7 +1440,8 @@ mod tests {
         let err = check(&verifier, &leaf, &[]).unwrap_err();
         assert!(
             matches!(&err, RevocationError::InvalidSignature(why) if why.contains("cRLSign")),
-            "{err}"
+            "{}",
+            err.kind()
         );
     }
 
@@ -1452,7 +1461,11 @@ mod tests {
         verifier.accept_crl(&verified(6), &spki, now).unwrap();
         // An older (still unexpired, correctly signed) CRL is a replay.
         let err = verifier.accept_crl(&verified(5), &spki, now).unwrap_err();
-        assert!(matches!(err, RevocationError::StaleCrl(_)), "{err}");
+        assert!(
+            matches!(err, RevocationError::StaleCrl(_)),
+            "{}",
+            err.kind()
+        );
     }
 
     #[test]
@@ -1616,7 +1629,8 @@ mod tests {
         let err = evaluate(&verifier, &spec.build(), &leaf, &ca, None).unwrap_err();
         assert!(
             matches!(&err, RevocationError::InvalidSignature(why) if why.contains("OCSPSigning")),
-            "{err}"
+            "{}",
+            err.kind()
         );
     }
 
@@ -1644,7 +1658,8 @@ mod tests {
         let err = evaluate(&verifier, &spec.build(), &leaf, &ca, None).unwrap_err();
         assert!(
             matches!(&err, RevocationError::InvalidSignature(why) if why.contains("not issued")),
-            "{err}"
+            "{}",
+            err.kind()
         );
 
         // A responder from an unrelated CA.
@@ -1696,7 +1711,8 @@ mod tests {
         let err = evaluate(&verifier, &response, &leaf, &ca, None).unwrap_err();
         assert!(
             matches!(&err, RevocationError::OcspError(why) if why.contains("revoked")),
-            "{err}"
+            "{}",
+            err.kind()
         );
     }
 
@@ -1710,7 +1726,8 @@ mod tests {
         let err = evaluate(&ocsp_verifier(&ca), &response, &leaf, &ca, None).unwrap_err();
         assert!(
             matches!(&err, RevocationError::OcspError(why) if why.contains("CertID")),
-            "{err}"
+            "{}",
+            err.kind()
         );
     }
 
@@ -1772,7 +1789,11 @@ mod tests {
     fn parse_err_contains(crl: &[u8], needle: &str) {
         match CrlInfo::parse_der(crl) {
             Err(RevocationError::ParseError(why)) => assert!(why.contains(needle), "{why}"),
-            other => panic!("expected ParseError containing {needle:?}, got {other:?}"),
+            Err(other) => panic!(
+                "expected ParseError containing {needle:?}, got {}",
+                other.kind()
+            ),
+            Ok(_) => panic!("expected ParseError containing {needle:?}, got a parsed CRL"),
         }
     }
 
@@ -1867,7 +1888,7 @@ mod tests {
             let bad = ca.leaf("revoked@usg.test", &[0x41, 0x02]);
             let crl = ca.crl(1, &[&bad]);
             let (verifier, _files) = crl_verifier(&[&crl], &[&ca]);
-            check(&verifier, &good, &[]).unwrap_or_else(|e| panic!("{alg:?}: {e}"));
+            check(&verifier, &good, &[]).unwrap_or_else(|e| panic!("{alg:?}: {}", e.kind()));
             assert!(matches!(
                 check(&verifier, &bad, &[]),
                 Err(RevocationError::CertificateRevoked(_))
@@ -2025,7 +2046,8 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(&err, RevocationError::OcspError(why) if why.contains("nextUpdate")),
-            "{err}"
+            "{}",
+            err.kind()
         );
     }
 
@@ -2110,7 +2132,8 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(&err, RevocationError::InvalidSignature(why) if why.contains("keyUsage")),
-            "{err}"
+            "{}",
+            err.kind()
         );
 
         let err = evaluate_delegated(&ca, &leaf, |p| {
@@ -2120,7 +2143,8 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(&err, RevocationError::InvalidSignature(why) if why.contains("validity")),
-            "{err}"
+            "{}",
+            err.kind()
         );
 
         let err = evaluate_delegated(&ca, &leaf, |p| {
@@ -2131,7 +2155,8 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(&err, RevocationError::InvalidSignature(why) if why.contains("critical")),
-            "{err}"
+            "{}",
+            err.kind()
         );
     }
 
@@ -2157,7 +2182,8 @@ mod tests {
         let err = evaluate(&ocsp_verifier(&ca), &spec.build(), &leaf, &ca, None).unwrap_err();
         assert!(
             matches!(&err, RevocationError::InvalidSignature(why) if why.contains("validity")),
-            "{err}"
+            "{}",
+            err.kind()
         );
     }
 
