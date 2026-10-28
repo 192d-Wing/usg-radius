@@ -1199,6 +1199,71 @@ mod tests {
         assert!(seen >= 8, "expected the example configs, found {seen}");
     }
 
+    #[test]
+    fn example_proxy_config_json_radsec_pool_parses_and_validates() {
+        // `examples/proxy_config.json` lives outside `examples/configs`, so the
+        // loop above does not see it. Its `proxy` block must parse, its RadSec
+        // pool must be a secret-less `transport = "radsec"` server with the
+        // documented `tls.revocation` block, and the pre-RadSec pools must still
+        // read as UDP.
+        use crate::proxy::ProxyConfig;
+        use crate::proxy::home_server::HomeServerTransport;
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/proxy_config.json"
+        );
+        let contents = fs::read_to_string(path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        let proxy: ProxyConfig = serde_json::from_value(value["proxy"].clone())
+            .unwrap_or_else(|e| panic!("proxy_config.json: proxy block does not parse: {e}"));
+        assert!(proxy.enabled);
+
+        let pool = proxy
+            .pools
+            .iter()
+            .find(|p| p.name == "radsec_pool")
+            .expect("radsec_pool");
+        assert_eq!(pool.servers.len(), 1);
+        let server = &pool.servers[0];
+        assert_eq!(server.transport, HomeServerTransport::Radsec);
+        assert!(
+            server.secret.is_empty(),
+            "a RadSec home server carries no secret (RFC 6614 §2.3)"
+        );
+        let tls = server.tls.as_ref().expect("tls block");
+        assert_eq!(tls.server_name, "radius.partner.example.net");
+        assert!(tls.revocation.is_some(), "the example documents revocation");
+        assert!(
+            proxy.realms.iter().any(|r| r.pool == "radsec_pool"),
+            "a realm routes to the RadSec pool"
+        );
+
+        let result = server.validate();
+        if cfg!(all(feature = "tls", feature = "revocation")) {
+            result.expect("the example RadSec home server validates");
+        } else {
+            // Fail closed when either feature is compiled out.
+            assert!(result.is_err());
+        }
+
+        for server in proxy
+            .pools
+            .iter()
+            .filter(|p| p.name != "radsec_pool")
+            .flat_map(|p| &p.servers)
+        {
+            assert_eq!(
+                server.transport,
+                HomeServerTransport::Udp,
+                "{}",
+                server.address
+            );
+            assert!(server.tls.is_none());
+            assert!(!server.secret.is_empty());
+        }
+    }
+
     // --- proxy block validation at config load ---
 
     /// A full config whose proxy has one home server with the given JSON.

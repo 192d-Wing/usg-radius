@@ -1564,6 +1564,56 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn probe_over_the_link_rejects_a_reply_with_a_bad_message_authenticator() {
+            // RFC 5997 §4.4 / RFC 3579 §3.2: the Response Authenticator verifies
+            // under "radsec" but the Message-Authenticator does not. The TLS
+            // peer is authenticated; the RADIUS-layer check still applies and
+            // the probe fails.
+            let chain = gen_chain();
+            let paths = chain.write_to_tempdir();
+            let addr = spawn_fake_tls_home(&chain, |_, request| {
+                FakeAction::Reply(vec![reply_with_bad_message_authenticator(
+                    request,
+                    Code::AccessAccept,
+                    request.identifier,
+                    RADSEC_SECRET,
+                )])
+            })
+            .await;
+            let server = radsec_home_server(addr, &paths);
+            attach_connected_link(&server).await;
+
+            probe_expecting_failure(&server).await;
+            assert_eq!(server.health_stats().consecutive_failures(), 1);
+            assert_eq!(server.health_stats().consecutive_successes(), 0);
+            assert!(server.is_connected(), "a bad reply does not drop the link");
+        }
+
+        #[tokio::test]
+        async fn probe_over_the_link_rejects_an_access_challenge() {
+            // RFC 5997 §4.2: only Access-Accept / Access-Reject (or
+            // Accounting-Response) answer a Status-Server; a correctly signed
+            // Access-Challenge is not a healthy reply.
+            let chain = gen_chain();
+            let paths = chain.write_to_tempdir();
+            let addr = spawn_fake_tls_home(&chain, |_, request| {
+                FakeAction::Reply(vec![signed_reply(
+                    request,
+                    Code::AccessChallenge,
+                    request.identifier,
+                    RADSEC_SECRET,
+                )])
+            })
+            .await;
+            let server = radsec_home_server(addr, &paths);
+            attach_connected_link(&server).await;
+
+            probe_expecting_failure(&server).await;
+            assert_eq!(server.health_stats().consecutive_failures(), 1);
+            assert_eq!(server.health_stats().consecutive_successes(), 0);
+        }
+
+        #[tokio::test]
         async fn probe_fails_when_the_link_drops_while_waiting() {
             let chain = gen_chain();
             let paths = chain.write_to_tempdir();

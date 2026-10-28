@@ -1931,6 +1931,63 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn link_response_with_a_malformed_missing_or_unknown_proxy_state_is_rejected() {
+            // The link delivers any frame carrying a Proxy-State; the handler
+            // owns the length check (16 octets, RFC 2865 §5.33 as we encode it)
+            // and the cache lookup. None of these may touch the live entry.
+            let cache = Arc::new(ProxyCache::new(Duration::from_secs(60), 1000));
+            let handler = ProxyHandler::new(cache.clone(), "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let entry = radsec_entry("192.168.1.100:12345".parse().unwrap());
+            let hs = Arc::clone(&entry.home_server);
+            cache.insert(entry).unwrap();
+
+            // 4-octet Proxy-State.
+            let mut response = Packet::new(Code::AccessAccept, 7, [0u8; 16]);
+            response.add_attribute(
+                Attribute::new(AttributeType::ProxyState as u8, vec![0x50; 4]).unwrap(),
+            );
+            response.authenticator =
+                calculate_response_authenticator(&response, &REQUEST_AUTH, RADSEC_SECRET);
+            let err = handler
+                .handle_link_response(response, Arc::clone(&hs))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ProxyError::CorrelationFailed), "{err}");
+
+            // No Proxy-State at all (a Status-Server reply that reached the
+            // wrong path, say).
+            let mut response = Packet::new(Code::AccessAccept, 7, [0u8; 16]);
+            response.authenticator =
+                calculate_response_authenticator(&response, &REQUEST_AUTH, RADSEC_SECRET);
+            let err = handler
+                .handle_link_response(response, Arc::clone(&hs))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ProxyError::CorrelationFailed), "{err}");
+
+            // Well-formed but unknown Proxy-State.
+            let mut response = Packet::new(Code::AccessAccept, 7, [0u8; 16]);
+            response.add_attribute(
+                Attribute::new(AttributeType::ProxyState as u8, vec![0x51; 16]).unwrap(),
+            );
+            response.authenticator =
+                calculate_response_authenticator(&response, &REQUEST_AUTH, RADSEC_SECRET);
+            let err = handler
+                .handle_link_response(response, Arc::clone(&hs))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ProxyError::CorrelationFailed), "{err}");
+
+            assert!(
+                cache.get(&PROXY_STATE).is_some(),
+                "none of these may consume the live entry"
+            );
+            assert_eq!(cache.len(), 1);
+        }
+
+        #[tokio::test]
         async fn send_to_home_server_without_a_link_is_link_down() {
             let cache = Arc::new(ProxyCache::new(Duration::from_secs(60), 1000));
             let handler = ProxyHandler::new(cache, "127.0.0.1:0".parse().unwrap())

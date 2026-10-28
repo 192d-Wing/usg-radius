@@ -996,6 +996,219 @@ mod tests {
         assert!(!hs.is_connected());
     }
 
+    /// An Access-Accept for `request` whose only Proxy-State is `proxy_state`
+    /// (any length), Response Authenticator under `"radsec"`.
+    fn accept_with_proxy_state(request: &Packet, proxy_state: &[u8]) -> Vec<u8> {
+        let mut reply = Packet::new(Code::AccessAccept, request.identifier, [0u8; 16]);
+        reply.add_attribute(
+            Attribute::new(AttributeType::ProxyState as u8, proxy_state.to_vec()).unwrap(),
+        );
+        reply.authenticator =
+            calculate_response_authenticator(&reply, &request.authenticator, RADSEC_SECRET);
+        reply.encode().unwrap()
+    }
+
+    #[tokio::test]
+    async fn unsolicited_frames_are_dropped_and_the_link_stays_up() {
+        // Before the genuine echo the home server sends two frames nobody asked
+        // for: an Access-Accept without Proxy-State under an Identifier no probe
+        // is registered for, and a CoA-Request (RFC 6614 §2.5 permits it; the
+        // proxy does not relay it). Neither reaches the response channel, no
+        // probe table entry appears, and the connection is kept.
+        let chain = gen_chain();
+        let paths = chain.write_to_tempdir();
+        let addr = spawn_fake_tls_home(&chain, |_, request| {
+            let mut stray = Packet::new(
+                Code::AccessAccept,
+                request.identifier.wrapping_add(100),
+                [0u8; 16],
+            );
+            stray.authenticator =
+                calculate_response_authenticator(&stray, &request.authenticator, RADSEC_SECRET);
+            let mut coa = Packet::new(Code::CoaRequest, 200, generate_request_authenticator());
+            coa.add_attribute(Attribute::string(AttributeType::UserName as u8, "alice").unwrap());
+            FakeAction::Reply(vec![
+                stray.encode().unwrap(),
+                coa.encode().unwrap(),
+                echo_accept(request),
+            ])
+        })
+        .await;
+        let hs = home_server(addr, tls_block(&paths, "localhost"));
+        let (tx, mut rx) = mpsc::channel(4);
+        let link = connected_link(&hs, tx, fast()).await;
+
+        link.send(forwarded_access_request(5, &password())).unwrap();
+        let response = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("response within 5 s")
+            .expect("channel open");
+        assert_eq!(response.packet.code, Code::AccessAccept);
+        assert_eq!(response.packet.identifier, 5);
+        assert!(
+            response
+                .packet
+                .find_attribute(AttributeType::ProxyState as u8)
+                .is_some(),
+            "only the proxied response is delivered"
+        );
+
+        time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "stray frames must not be delivered as proxied responses"
+        );
+        assert!(link.probes.is_empty(), "stray frames register nothing");
+        assert!(link.is_connected());
+        assert_eq!(
+            link.connections(),
+            1,
+            "unsolicited frames do not drop the connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_with_a_malformed_proxy_state_is_routed_to_the_handler_not_dropped() {
+        // The link routes on the *presence* of Proxy-State; a 4-octet value is
+        // the handler's `CorrelationFailed` (tested in `handler.rs`), delivered
+        // with the link's own home server attached, and no reason to drop the
+        // connection.
+        let chain = gen_chain();
+        let paths = chain.write_to_tempdir();
+        let addr = spawn_fake_tls_home(&chain, |_, request| {
+            FakeAction::Reply(vec![accept_with_proxy_state(request, &[0x11; 4])])
+        })
+        .await;
+        let hs = home_server(addr, tls_block(&paths, "localhost"));
+        let (tx, mut rx) = mpsc::channel(4);
+        let link = connected_link(&hs, tx, fast()).await;
+
+        link.send(forwarded_access_request(6, &password())).unwrap();
+        let response = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("response within 5 s")
+            .expect("channel open");
+        assert!(Arc::ptr_eq(&response.home_server, &hs));
+        assert_eq!(
+            response
+                .packet
+                .find_attribute(AttributeType::ProxyState as u8)
+                .unwrap()
+                .value
+                .len(),
+            4
+        );
+        assert!(link.is_connected());
+        assert_eq!(link.connections(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_bad_length_on_the_stream_closes_the_connection_and_the_link_reconnects() {
+        // RFC 2865 §3 / RFC 6614 §2.5: a Length outside 20..=4096 means the
+        // stream has lost synchronisation. Connection 1 answers with Length 19,
+        // connection 2 with Length 4097; each time the link drops the
+        // connection without delivering anything and reconnects. Connection 3
+        // behaves and its reply is delivered.
+        let chain = gen_chain();
+        let paths = chain.write_to_tempdir();
+        let addr = spawn_fake_tls_home(&chain, |connection, request| {
+            let mut frame = echo_accept(request);
+            match connection {
+                1 => {
+                    frame[2..4].copy_from_slice(&19u16.to_be_bytes());
+                }
+                2 => {
+                    frame[2..4].copy_from_slice(&4097u16.to_be_bytes());
+                }
+                _ => {}
+            }
+            FakeAction::Reply(vec![frame])
+        })
+        .await;
+        let hs = home_server(addr, tls_block(&paths, "localhost"));
+        let (tx, mut rx) = mpsc::channel(4);
+        let link = connected_link(&hs, tx, fast()).await;
+        assert_eq!(link.connections(), 1);
+
+        link.send(forwarded_access_request(1, &password())).unwrap();
+        wait_for(
+            || link.connections() == 2 && link.is_connected(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(link.connections(), 2, "Length 19 must drop the connection");
+
+        link.send(forwarded_access_request(2, &password())).unwrap();
+        wait_for(
+            || link.connections() == 3 && link.is_connected(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            link.connections(),
+            3,
+            "Length 4097 must drop the connection"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing from a desynchronised stream may be delivered"
+        );
+
+        link.send(forwarded_access_request(3, &password())).unwrap();
+        let response = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("response within 5 s")
+            .expect("channel open");
+        assert_eq!(response.packet.identifier, 3);
+        assert!(Arc::ptr_eq(&response.home_server, &hs));
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_but_well_framed_frame_is_dropped_and_the_connection_kept() {
+        // Length is a valid 24, but the trailing attribute header claims 16
+        // octets and carries 2: `Packet::decode` fails, the frame is discarded
+        // (the stream is still in sync), and the genuine reply that follows on
+        // the same connection is delivered.
+        let chain = gen_chain();
+        let paths = chain.write_to_tempdir();
+        let addr = spawn_fake_tls_home(&chain, |_, request| {
+            let mut junk = Packet::new(Code::AccessAccept, request.identifier, [0u8; 16])
+                .encode()
+                .unwrap();
+            junk.extend_from_slice(&[AttributeType::ProxyState as u8, 16, 0xaa, 0xbb]);
+            junk[2..4].copy_from_slice(&24u16.to_be_bytes());
+            assert_eq!(junk.len(), 24);
+            FakeAction::Reply(vec![junk, echo_accept(request)])
+        })
+        .await;
+        let hs = home_server(addr, tls_block(&paths, "localhost"));
+        let (tx, mut rx) = mpsc::channel(4);
+        let link = connected_link(&hs, tx, fast()).await;
+
+        link.send(forwarded_access_request(7, &password())).unwrap();
+        let response = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("response within 5 s")
+            .expect("channel open");
+        assert_eq!(response.packet.identifier, 7);
+        assert_eq!(
+            response
+                .packet
+                .find_attribute(AttributeType::ProxyState as u8)
+                .unwrap()
+                .value,
+            PROXY_STATE.to_vec(),
+            "the genuine echo, not the junk, is what arrives"
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(link.is_connected());
+        assert_eq!(
+            link.connections(),
+            1,
+            "an undecodable frame does not drop the connection"
+        );
+    }
+
     #[tokio::test]
     async fn link_task_ends_when_the_home_server_is_dropped() {
         let chain = gen_chain();
