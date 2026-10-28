@@ -4,13 +4,33 @@
 //! The mirror image of [`crate::client_verifier`]: the home server's
 //! certificate is verified against a CA bundle with rustls's
 //! `WebPkiServerVerifier` (chain, validity, and the configured `server_name`,
-//! as RFC 6614 §2.3 requires of a RadSec client), and when the home server's
-//! `tls.revocation` block is configured that verifier is followed by
+//! as RFC 6614 §2.3 items 2–3 require of a RadSec client: mutual
+//! authentication, RFC 5280 validation, expected DNS name), and when the home
+//! server's `tls.revocation` block is configured that verifier is followed by
 //! `radius_proto::revocation::RevocationCheckingVerifier::check_revocation`,
 //! so static CRLs, CRL Distribution Points, OCSP and the fail-open/closed
 //! policy behave exactly as they do for `eap.tls.revocation` and
 //! `radsec.revocation`. Without the block the plain WebPKI verifier is used
 //! unchanged.
+//!
+//! A stapled OCSP response (RFC 6066 §8) on the home server's certificate is
+//! **ignored**: rustls's `WebPkiServerVerifier` does not validate it (it logs
+//! it as unvalidated at trace level) and the revocation checker fetches its
+//! own status. Revocation is decided solely by the `tls.revocation` block.
+//!
+//! **Blocking fetches inside the handshake.** `check_revocation` is a
+//! synchronous rustls callback; with `crl.fetch = true` or any OCSP mode it
+//! performs a blocking HTTP fetch from inside the TLS handshake future, on the
+//! tokio worker that runs the link task, and the link's `connect_timeout`
+//! cannot pre-empt it. The effective handshake deadline is therefore
+//! `connect_timeout + revocation.http_timeout_secs` (and the CRL fetch
+//! timeout), and that worker is pinned for the duration — the same pattern
+//! as the inbound listener's client verifier, now also on every reconnect of
+//! an outbound link. Static CRLs (`crl.static_files`, what the examples and
+//! the interop harness use) are loaded at build time and never block.
+//! TODO(gap): run the revocation fetch off the handshake path (pre-fetched
+//! CRL-DP / OCSP material refreshed by a background task, or
+//! `spawn_blocking`) for both the inbound and the outbound verifier.
 
 use std::sync::Arc;
 
@@ -135,8 +155,10 @@ pub fn build_server_verifier(
 /// a positive "revoked" is `CertificateError::Revoked`, an inconclusive check
 /// under fail-closed is `CertificateError::Other` carrying the reason.
 ///
-/// A stapled OCSP response (`ocsp_response`) is passed through to WebPKI and
-/// not consulted by the revocation checker, which fetches its own.
+/// A stapled OCSP response (`ocsp_response`) is ignored: rustls's WebPKI
+/// verifier logs it as unvalidated and does not act on it, and the revocation
+/// checker fetches its own status. Revocation is decided solely by the
+/// `tls.revocation` block.
 #[cfg(feature = "revocation")]
 #[derive(Debug)]
 pub struct RevocationCheckingServerVerifier {
@@ -154,8 +176,10 @@ impl ServerCertVerifier for RevocationCheckingServerVerifier {
         ocsp_response: &[u8],
         now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // RFC 6614 §2.3: the client MUST verify the server certificate; chain,
-        // validity and name first, so a wrong name never reaches a fetch.
+        // RFC 6614 §2.3 items 2–3: mutual authentication is REQUIRED and the
+        // certificate MUST be validated per RFC 5280 against the expected
+        // name; chain, validity and name first, so a wrong name never reaches
+        // a (possibly blocking, see the module docs) revocation fetch.
         self.webpki.verify_server_cert(
             end_entity,
             intermediates,

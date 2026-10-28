@@ -56,6 +56,13 @@ pub struct ProxyCacheEntry {
     pub proxy_state: ProxyStateKey,
     /// Client secret for response authentication
     pub client_secret: Vec<u8>,
+    /// For a RadSec home server: the link's connection generation
+    /// (`RadsecLinkHandle::connections()`) the request was last written on.
+    /// RFC 6613 §2.6.1: a request MUST NOT be retransmitted over the TCP
+    /// connection it was sent on, so the retry manager resends it only once
+    /// the link is on a different connection. `None` for UDP (connectionless)
+    /// and for a RadSec server without a link attached.
+    pub sent_on_connection: Option<u64>,
 }
 
 /// Proxy cache for tracking in-flight requests
@@ -256,6 +263,7 @@ mod tests {
             retry_count: 0,
             proxy_state: generate_proxy_state_key(),
             client_secret: b"test_secret".to_vec(),
+            sent_on_connection: None,
         }
     }
 

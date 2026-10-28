@@ -106,6 +106,14 @@ absent() { ! grep -qx "$1" <<<"$2"; }                     # <line> <text>: line 
 link_established() { # <proxy log>: one line has both the message and the server field
     grep "RadSec link established" <<<"$1" | grep -q "server=freeradius-radsec"
 }
+# The same line carries the negotiated key-exchange group as rustls renders
+# `Option<NamedGroup>` in Debug: `group=Some(MLKEM1024)` (an unknown code point
+# would render `NamedGroup(0x...)`). ML-KEM-1024 is the only group the proxy
+# offers, so anything else here means the FIPS/PQ gate did not run.
+link_negotiated_mlkem1024() { # <proxy log>
+    grep "RadSec link established" <<<"$1" | grep "server=freeradius-radsec" \
+        | grep -q 'group=Some(MLKEM1024)'
+}
 # FreeRADIUS (-fxx) logs one block per accepted TLS connection: the handshake
 # summary, the TLS-Session-* and TLS-Client-Cert-* attributes it derived, then
 # "(TLS) RADIUS/TLS - Connection Established".
@@ -145,3 +153,5 @@ host_check "control: papuser@freeradius.test still arrives on UDP 1812" \
     grep -qx 'papuser@freeradius.test' <<<"$on_1812"
 host_check "usg-proxy logged the RadSec link to freeradius-radsec as established" \
     link_established "$proxy_log"
+host_check "usg-proxy negotiated ML-KEM-1024 on that link (group=Some(MLKEM1024), FIPS 203)" \
+    link_negotiated_mlkem1024 "$proxy_log"

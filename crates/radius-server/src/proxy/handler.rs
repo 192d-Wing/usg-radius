@@ -127,7 +127,9 @@ impl ProxyHandler {
             );
         })?;
 
-        // Create cache entry
+        // Create cache entry. The link generation is read here, just before
+        // the send below, so the retry manager can tell whether the link is
+        // still on the connection this request went out on (RFC 6613 §2.6.1).
         let entry = ProxyCacheEntry {
             original_request: request.clone(),
             original_source: source,
@@ -136,6 +138,7 @@ impl ProxyHandler {
             retry_count: 0,
             proxy_state,
             client_secret,
+            sent_on_connection: home_server.link_generation(),
         };
 
         // Store in cache (before sending to avoid race condition)
@@ -286,6 +289,36 @@ impl ProxyHandler {
             );
             return Err(ProxyError::CorrelationFailed);
         }
+
+        // RFC 2865 §3 / RFC 5080 §2.2.2: authenticate the reply under the
+        // home server's secret and the NAS's Request Authenticator *before*
+        // the entry is consumed, so a datagram with a guessed Proxy-State and
+        // a garbage Response Authenticator (the UDP origin's address is
+        // spoofable) cannot evict a live entry. `rewrite_response_for_nas`
+        // checks it again on the removed entry; the check is cheap.
+        if !verify_response_authenticator(
+            &response,
+            &entry.original_request.authenticator,
+            entry.home_server.secret(),
+        ) {
+            warn!(
+                home_server = %entry.home_server.name,
+                origin = %origin,
+                identifier = response.identifier,
+                "Response authenticator from home server is invalid; dropping response"
+            );
+            // RFC 6613 §2.6.4: on a TCP connection a failed Response
+            // Authenticator MUST close the connection. The entry stays; the
+            // retry manager resends it on the next connection.
+            #[cfg(feature = "tls")]
+            if let ResponseOrigin::Link(home_server) = &origin
+                && let Some(link) = home_server.link()
+            {
+                link.reset("response failed the Response Authenticator check (RFC 6613 §2.6.4)");
+            }
+            return Err(ProxyError::InvalidResponseAuthenticator);
+        }
+
         let entry = self
             .cache
             .remove(&proxy_state)
@@ -729,6 +762,7 @@ mod tests {
             retry_count: 0,
             proxy_state: PROXY_STATE,
             client_secret: CLIENT_SECRET.to_vec(),
+            sent_on_connection: None,
         }
     }
 
@@ -1637,6 +1671,58 @@ mod tests {
     // ---- Response origin: UDP address vs. RadSec link identity -------------
 
     #[tokio::test]
+    async fn response_with_a_bad_response_authenticator_leaves_the_entry_in_the_cache() {
+        // RFC 2865 §3 / RFC 5080 §2.2.2: a datagram from the home server's
+        // address with the right Proxy-State but a Response Authenticator that
+        // does not verify is dropped *without* consuming the entry, so the
+        // genuine reply (or the retry manager) can still answer the NAS.
+        let cache = Arc::new(ProxyCache::new(Duration::from_secs(60), 1000));
+        let handler = ProxyHandler::new(cache.clone(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        // A loopback socket stands in for the NAS.
+        let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let entry = create_test_entry(nas.local_addr().unwrap());
+        let home_addr = entry.home_server.address;
+        let home_server = Arc::clone(&entry.home_server);
+        cache.insert(entry).unwrap();
+
+        let mut forged = Packet::new(Code::AccessReject, 7, [0u8; 16]);
+        forged.add_attribute(
+            Attribute::new(AttributeType::ProxyState as u8, PROXY_STATE.to_vec()).unwrap(),
+        );
+        forged.authenticator = [0xee; 16];
+        let err = handler
+            .handle_response(forged, home_addr)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProxyError::InvalidResponseAuthenticator),
+            "{err}"
+        );
+        assert!(
+            cache.get(&PROXY_STATE).is_some(),
+            "a response that fails verification must not evict the entry"
+        );
+        assert_eq!(home_server.stats().responses_received(), 0);
+
+        // The genuine reply still goes through.
+        let genuine = finalize_home_response(Packet::new(Code::AccessAccept, 7, [0u8; 16]));
+        handler.handle_response(genuine, home_addr).await.unwrap();
+        assert!(cache.get(&PROXY_STATE).is_none(), "entry consumed");
+        assert_eq!(home_server.stats().responses_received(), 1);
+        let mut buf = [0u8; 4096];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(5), nas.recv_from(&mut buf))
+            .await
+            .expect("relayed reply within 5 s")
+            .unwrap();
+        assert_eq!(
+            Packet::decode(&buf[..len]).unwrap().code,
+            Code::AccessAccept
+        );
+    }
+
+    #[tokio::test]
     async fn udp_response_for_another_server_at_a_different_address_is_rejected() {
         let cache = Arc::new(ProxyCache::new(Duration::from_secs(60), 1000));
         let handler = ProxyHandler::new(cache.clone(), "127.0.0.1:0".parse().unwrap())
@@ -1985,6 +2071,111 @@ mod tests {
                 "none of these may consume the live entry"
             );
             assert_eq!(cache.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn bad_response_authenticator_over_the_link_resets_the_connection() {
+            // RFC 6613 §2.6.4: a response on the TCP connection whose Response
+            // Authenticator fails validation MUST close the connection. The
+            // entry stays cached (the retry manager resends it on the new
+            // connection) and the link reconnects.
+            use crate::proxy::radsec_client::{LinkParams, spawn_link};
+            use crate::test_pki::{FakeAction, gen_chain, spawn_fake_tls_home};
+
+            let chain = gen_chain();
+            let paths = chain.write_to_tempdir();
+            let addr = spawn_fake_tls_home(&chain, |_, _| FakeAction::Reply(vec![])).await;
+            let hs = Arc::new(
+                HomeServer::new(HomeServerConfig {
+                    name: Some("home-radsec".to_string()),
+                    timeout: 2,
+                    ..HomeServerConfig::radsec(
+                        addr.to_string(),
+                        HomeServerTlsConfig {
+                            ca_path: paths.ca.clone(),
+                            cert_path: paths.client_cert.clone(),
+                            key_path: paths.client_key.clone(),
+                            server_name: "localhost".to_string(),
+                            revocation: None,
+                        },
+                    )
+                })
+                .unwrap(),
+            );
+            let (tx, _rx) = tokio::sync::mpsc::channel(4);
+            let params = LinkParams {
+                connect_timeout: Duration::from_secs(2),
+                initial_backoff: Duration::from_millis(40),
+                max_backoff: Duration::from_millis(160),
+                ..LinkParams::default()
+            };
+            let link = spawn_link(Arc::clone(&hs), tx, params).unwrap();
+            hs.attach_link(link.clone());
+            async fn wait_for(mut cond: impl FnMut() -> bool) {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !cond() && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+            wait_for(|| link.is_connected()).await;
+            assert_eq!(link.connections(), 1);
+
+            let cache = Arc::new(ProxyCache::new(Duration::from_secs(60), 1000));
+            let handler = ProxyHandler::new(cache.clone(), "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            // A loopback socket stands in for the NAS.
+            let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut entry = create_test_entry(nas.local_addr().unwrap());
+            entry.home_server = Arc::clone(&hs);
+            entry.sent_on_connection = Some(1);
+            cache.insert(entry).unwrap();
+
+            // Signed under some other secret, delivered as if read off the link.
+            let bad = finalize_home_response(Packet::new(Code::AccessAccept, 7, [0u8; 16]));
+            let err = handler
+                .handle_link_response(bad, Arc::clone(&hs))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ProxyError::InvalidResponseAuthenticator),
+                "{err}"
+            );
+            assert!(
+                cache.get(&PROXY_STATE).is_some(),
+                "entry kept for the retry"
+            );
+
+            wait_for(|| link.connections() == 2 && link.is_connected()).await;
+            assert_eq!(
+                link.connections(),
+                2,
+                "a failed Response Authenticator must close the connection"
+            );
+            assert!(hs.is_connected());
+
+            // The same reply signed under "radsec" is relayed to the NAS
+            // without touching the new connection.
+            let good = home_response_under_radsec(Packet::new(Code::AccessAccept, 7, [0u8; 16]));
+            handler
+                .handle_link_response(good, Arc::clone(&hs))
+                .await
+                .unwrap();
+            assert!(
+                cache.get(&PROXY_STATE).is_none(),
+                "the genuine reply consumes the entry"
+            );
+            let mut buf = [0u8; 4096];
+            let (len, _) = tokio::time::timeout(Duration::from_secs(5), nas.recv_from(&mut buf))
+                .await
+                .expect("relayed reply within 5 s")
+                .unwrap();
+            assert_eq!(
+                Packet::decode(&buf[..len]).unwrap().code,
+                Code::AccessAccept
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(link.connections(), 2);
         }
 
         #[tokio::test]

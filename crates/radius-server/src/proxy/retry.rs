@@ -15,6 +15,7 @@
 use crate::proxy::cache::{ProxyCache, ProxyCacheEntry};
 use crate::proxy::error::{ProxyError, ProxyResult};
 use crate::proxy::handler::ProxyHandler;
+use crate::proxy::home_server::{HomeServer, HomeServerTransport};
 use radius_proto::attributes::{Attribute, AttributeType};
 use radius_proto::auth::calculate_response_authenticator;
 use radius_proto::{Code, Packet};
@@ -206,15 +207,37 @@ impl RetryManager {
         // Record timeout for old server
         entry.home_server.stats().record_timeout();
 
+        // RFC 6613 §2.6.1: "Clients MUST NOT retransmit RADIUS request packets
+        // over a given TCP connection"; a request on a connection that was
+        // broken or closed MAY go out over a new one. Over UDP every retry is
+        // a retransmission. Over RadSec the request is written again only
+        // when the link is down (the send then fails fast and the entry just
+        // waits) or when it is on a different connection from the one the
+        // request was last written on; otherwise the deadline keeps running
+        // and the Access-Reject follows after `max_retries` as before.
+        let resend = Self::may_resend(&home_server, entry.sent_on_connection);
+
         // Update entry with new home server and timestamp, and re-insert it
         // before the resend (see the method docs).
         entry.home_server = home_server.clone();
         entry.sent_at = std::time::Instant::now();
+        if resend {
+            entry.sent_on_connection = home_server.link_generation();
+        }
         let request_data = entry.original_request.encode()?;
         cache.insert(entry)?;
 
-        // In the cache ⇒ in flight, whatever the send below does.
+        // In the cache ⇒ in flight, whatever the send below does (and
+        // whether or not it happens): balances the `record_timeout` above.
         home_server.stats().record_request();
+
+        if !resend {
+            debug!(
+                home_server = %home_server.name,
+                "not retransmitting over the same RadSec connection (RFC 6613 §2.6.1)"
+            );
+            return Ok(());
+        }
 
         // Re-forward the request (keeping the same Proxy-State; it is already
         // in the packet, as is the re-keying for the home server secret).
@@ -230,6 +253,31 @@ impl RetryManager {
         }
 
         Ok(())
+    }
+
+    /// Whether a timed-out request to `home_server`, last written on link
+    /// connection `sent_on`, may be written again now (RFC 6613 §2.6.1): always
+    /// over UDP; over RadSec only when the link is down or has moved to a new
+    /// connection since.
+    fn may_resend(home_server: &HomeServer, sent_on: Option<u64>) -> bool {
+        match home_server.transport() {
+            HomeServerTransport::Udp => true,
+            HomeServerTransport::Radsec => {
+                #[cfg(feature = "tls")]
+                {
+                    match home_server.link() {
+                        // No link: the send fails with `LinkDown`, as today.
+                        None => true,
+                        Some(link) => !link.is_connected() || Some(link.connections()) != sent_on,
+                    }
+                }
+                #[cfg(not(feature = "tls"))]
+                {
+                    let _ = sent_on;
+                    true
+                }
+            }
+        }
     }
 
     /// Send Access-Reject to NAS
@@ -284,7 +332,7 @@ impl Drop for RetryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::home_server::{HomeServer, HomeServerConfig};
+    use crate::proxy::home_server::HomeServerConfig;
     use radius_proto::auth::verify_response_authenticator;
     use std::net::SocketAddr;
     use std::time::Instant;
@@ -385,6 +433,7 @@ mod tests {
             retry_count: 0,
             proxy_state: [0x50; 16],
             client_secret: CLIENT_SECRET.to_vec(),
+            sent_on_connection: None,
         }
     }
 
@@ -507,6 +556,125 @@ mod tests {
             &REQUEST_AUTH,
             b"radsec"
         ));
+    }
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn timed_out_request_is_not_retransmitted_over_the_same_radsec_connection() {
+        // RFC 6613 §2.6.1: a request MUST NOT be retransmitted over the TCP
+        // connection it was sent on, and MAY be sent over a new one. The fake
+        // home server counts the frames it receives and never answers.
+        use crate::proxy::home_server::HomeServerTlsConfig;
+        use crate::proxy::radsec_client::{LinkParams, spawn_link};
+        use crate::test_pki::{FakeAction, gen_chain, spawn_fake_tls_home};
+        use std::sync::atomic::AtomicUsize;
+
+        let chain = gen_chain();
+        let paths = chain.write_to_tempdir();
+        let frames = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&frames);
+        let addr = spawn_fake_tls_home(&chain, move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            FakeAction::Reply(vec![])
+        })
+        .await;
+        let home_server = Arc::new(
+            HomeServer::new(HomeServerConfig {
+                name: Some("home-radsec".to_string()),
+                timeout: 2,
+                ..HomeServerConfig::radsec(
+                    addr.to_string(),
+                    HomeServerTlsConfig {
+                        ca_path: paths.ca.clone(),
+                        cert_path: paths.client_cert.clone(),
+                        key_path: paths.client_key.clone(),
+                        server_name: "localhost".to_string(),
+                        revocation: None,
+                    },
+                )
+            })
+            .unwrap(),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let params = LinkParams {
+            connect_timeout: Duration::from_secs(2),
+            initial_backoff: Duration::from_millis(40),
+            max_backoff: Duration::from_millis(160),
+            ..LinkParams::default()
+        };
+        let link = spawn_link(Arc::clone(&home_server), tx, params).unwrap();
+        home_server.attach_link(link.clone());
+        async fn wait_for(mut cond: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !cond() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        wait_for(|| link.is_connected()).await;
+        assert_eq!(link.connections(), 1);
+
+        let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cache = Arc::new(ProxyCache::new(Duration::from_secs(60), 100));
+        let handler = Arc::new(
+            ProxyHandler::new(cache.clone(), "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let config = RetryConfig {
+            max_retries: 5,
+            retry_interval: 1,
+            failover_on_timeout: true,
+        };
+
+        // As forward_request left it: written on connection 1, cached, counted.
+        let mut entry = entry_for(nas.local_addr().unwrap(), Arc::clone(&home_server));
+        entry.sent_on_connection = Some(link.connections());
+        let proxy_state = entry.proxy_state;
+        cache.insert(entry).unwrap();
+        home_server.stats().record_request();
+
+        // Timed out on the same connection: the attempt is counted, nothing
+        // is written.
+        let entry = cache.get(&proxy_state).unwrap();
+        RetryManager::handle_timeout(&cache, &handler, &config, entry)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            frames.load(Ordering::SeqCst),
+            0,
+            "no retransmission over the connection the request went out on"
+        );
+        let entry = cache.get(&proxy_state).expect("entry re-inserted");
+        assert_eq!(entry.retry_count, 1);
+        assert_eq!(entry.sent_on_connection, Some(1));
+        assert_eq!(home_server.stats().outstanding(), 1);
+
+        // The link moves to a new connection: the next timeout resends once.
+        link.reset("test");
+        wait_for(|| link.connections() == 2 && link.is_connected()).await;
+        assert_eq!(link.connections(), 2);
+        RetryManager::handle_timeout(&cache, &handler, &config, entry)
+            .await
+            .unwrap();
+        wait_for(|| frames.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(
+            frames.load(Ordering::SeqCst),
+            1,
+            "resent on the new connection"
+        );
+        let entry = cache.get(&proxy_state).unwrap();
+        assert_eq!(entry.retry_count, 2);
+        assert_eq!(entry.sent_on_connection, Some(2));
+
+        // And not again while the link stays on connection 2.
+        RetryManager::handle_timeout(&cache, &handler, &config, entry)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(frames.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.get(&proxy_state).unwrap().retry_count, 3);
+        assert_eq!(home_server.stats().outstanding(), 1);
     }
 
     #[tokio::test]

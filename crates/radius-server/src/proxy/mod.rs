@@ -160,6 +160,28 @@ impl ProxyConfig {
             ));
         }
 
+        // RFC 6613 §2.6 (via RFC 6614 §2.3 item 1): a RADIUS/TCP connection
+        // MUST be watched by the RFC 3539 §3.4 application-layer watchdog,
+        // with Status-Server as the watchdog message. The Status-Server
+        // probe *is* that watchdog for a RadSec link, so a RadSec home server
+        // without probes is a configuration error, not a quiet degradation.
+        if !self.health_check.enabled {
+            let radsec_server = self
+                .pools
+                .iter()
+                .flat_map(|p| p.servers.iter().map(move |s| (p, s)))
+                .find(|(_, s)| s.transport == HomeServerTransport::Radsec);
+            if let Some((pool, server)) = radsec_server {
+                return Err(ProxyError::Configuration(format!(
+                    "pool '{}' home server '{}': RadSec home servers require \
+                     health_check.enabled: the Status-Server probe is the RFC 6613 §2.6 \
+                     watchdog (RFC 3539 §3.4) of the connection",
+                    pool.name,
+                    server.name.as_deref().unwrap_or(&server.address)
+                )));
+            }
+        }
+
         for pool in &self.pools {
             pool.validate()?;
         }
@@ -220,5 +242,72 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    /// A pool with one RadSec home server and one UDP home server.
+    fn mixed_pool() -> HomeServerPoolConfig {
+        HomeServerPoolConfig {
+            name: "home".to_string(),
+            strategy: Default::default(),
+            servers: vec![
+                HomeServerConfig::udp("10.0.0.1:1812", "home-secret"),
+                HomeServerConfig {
+                    name: Some("home-radsec".to_string()),
+                    ..HomeServerConfig::radsec(
+                        "10.0.0.2:2083",
+                        HomeServerTlsConfig {
+                            ca_path: "/etc/radius/home-ca.pem".to_string(),
+                            cert_path: "/etc/radius/proxy.pem".to_string(),
+                            key_path: "/etc/radius/proxy.key".to_string(),
+                            server_name: "home.test".to_string(),
+                            revocation: None,
+                        },
+                    )
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn radsec_home_server_requires_health_checks() {
+        // RFC 6613 §2.6: the Status-Server probe is the mandatory watchdog of
+        // a RADIUS/TCP connection, so a RadSec home server with
+        // health_check.enabled = false is a configuration error, named.
+        let config = ProxyConfig {
+            enabled: true,
+            pools: vec![mixed_pool()],
+            health_check: HealthCheckConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("health_check.enabled"), "{err}");
+        assert!(err.contains("home-radsec"), "{err}");
+        assert!(err.contains("RFC 6613"), "{err}");
+
+        // A UDP-only pool may still run without probes.
+        let mut udp_only = mixed_pool();
+        udp_only.servers.truncate(1);
+        let config = ProxyConfig {
+            enabled: true,
+            pools: vec![udp_only],
+            health_check: HealthCheckConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        // With probes on, the RadSec server is accepted (given the `tls`
+        // feature; without it `HomeServerConfig::validate` refuses it).
+        let config = ProxyConfig {
+            enabled: true,
+            pools: vec![mixed_pool()],
+            ..Default::default()
+        };
+        assert_eq!(config.validate().is_ok(), cfg!(feature = "tls"));
     }
 }

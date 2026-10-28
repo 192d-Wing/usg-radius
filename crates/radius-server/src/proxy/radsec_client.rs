@@ -2,27 +2,43 @@
 //! proxy to a `transport = "radsec"` home server (RFC 6614).
 //!
 //! One link task per RadSec home server owns **one persistent TLS connection**
-//! (RFC 6614 §2.5: every RADIUS code travels on the same connection; §3.4:
-//! long-lived connections watched by Status-Server). The connection is built
-//! with the same [`usg_fips_tls`] provider the inbound listener uses — TLS 1.3
-//! only, ML-KEM-1024-only key exchange, AES-256-GCM-SHA384 — and is mutually
-//! authenticated: our client certificate from `tls.cert_path`/`tls.key_path`,
-//! the home server's chain against `tls.ca_path` and `tls.server_name`
-//! (RFC 6614 §2.3: the client MUST verify the server certificate), optionally
-//! with CRL/OCSP revocation checking. The negotiated parameters are re-checked
-//! with `enforce_fips_parameters` after every handshake and the connection is
-//! dropped if anything falls outside the allow-list. There is no fallback to
-//! UDP anywhere: a link that cannot be established stays down.
+//! (RFC 6614 §2.5: every RADIUS code travels on the same connection; the
+//! connection is established and kept "as per RFC 6613", §2.3 item 1, and
+//! watched by the RFC 3539 §3.4 application-layer watchdog that RFC 6613 §2.6
+//! mandates, with Status-Server as the watchdog message — see `health.rs`).
+//! The connection is built with the same [`usg_fips_tls`] provider the inbound
+//! listener uses — TLS 1.3 only, ML-KEM-1024-only key exchange,
+//! AES-256-GCM-SHA384 — and is mutually authenticated: our client certificate
+//! from `tls.cert_path`/`tls.key_path`, the home server's chain against
+//! `tls.ca_path` and `tls.server_name` (RFC 6614 §2.3 item 2: mutual
+//! authentication is REQUIRED; item 3: RFC 5280 validation and the expected
+//! DNS name), optionally with CRL/OCSP revocation checking. The negotiated
+//! parameters are re-checked with `enforce_fips_parameters` after every
+//! handshake and the connection is dropped if anything falls outside the
+//! allow-list. There is no fallback to UDP anywhere: a link that cannot be
+//! established stays down.
 //!
 //! Inside the tunnel the bytes are the same RADIUS packets the UDP path sends,
-//! delimited by `Length` (RFC 6614 §2.5, shared [`take_frame`]) and keyed by
-//! the fixed secret `"radsec"` (RFC 6614 §2.3) — `HomeServer::secret()`
-//! returns it, so the proxy's re-keying code is untouched.
+//! delimited by `Length` (RFC 6614 §3.4 item 1, receiver rules RFC 6613
+//! §2.6.4; shared [`take_frame`]) and keyed by the fixed secret `"radsec"`
+//! (RFC 6614 §2.3 item 4) — `HomeServer::secret()` returns it, so the proxy's
+//! re-keying code is untouched.
 //!
 //! **Disconnected ⇒ fail fast, no queue.** [`RadsecLinkHandle::send`] returns
 //! [`LinkSendError::Down`] while the connection is down; the caller's entry
 //! stays in the proxy cache and the retry manager resends it, so the only
-//! queue is the one that already exists and is already bounded.
+//! queue is the one that already exists and is already bounded. A frame that
+//! was queued for a connection that died is discarded, never written to the
+//! next connection (the retry manager re-sends it there if it is still due).
+//!
+//! **The connection is closed when the peer breaks the protocol** (RFC 6613
+//! §2.6.4): a frame whose `Length` is out of range or that does not decode as
+//! a RADIUS packet ends the connection from inside the task; a response whose
+//! Response Authenticator or Message-Authenticator fails verification is
+//! detected by the handler / the probe and ends it through
+//! [`RadsecLinkHandle::reset`], as does the watchdog after two unanswered
+//! Status-Server probes (RFC 3539 §3.4). Every close goes through the same
+//! backoff-and-reconnect path.
 //!
 //! The link task **verifies nothing**: a frame carrying a Proxy-State is a
 //! proxied response and is delivered as a [`LinkResponse`] for
@@ -30,15 +46,30 @@
 //! re-keying — exactly as for UDP, with the home server matched by `Arc`
 //! identity instead of source address); a frame without one is a Status-Server
 //! reply and is handed to the probe registered under its Identifier, where
-//! `health.rs` applies the same checks as the UDP probe.
+//! `health.rs` applies the same checks as the UDP probe. A CoA-Request or
+//! Disconnect-Request from the home server is answered with a CoA-NAK /
+//! Disconnect-NAK carrying `Error-Cause 406` (RFC 6614 §2.5, RFC 5176 §3.5);
+//! the proxy does not relay dynamic authorization to the NAS.
 //!
-//! RFC 6613 §2.6 / RFC 6614 §2.5 give one connection a single 256-value
-//! Identifier space. The proxy forwards the NAS Identifier unchanged (as it
-//! does over UDP), so two NASes using the same Identifier at the same time
-//! collide on the link exactly as they would on the UDP socket; correlation
-//! is by Proxy-State, not Identifier, so the collision only matters to a home
-//! server that deduplicates on Identifier.
-//! TODO(gap): Identifier management on the upstream hop (RFC 6613 §2.6).
+//! **Identifier space.** RFC 6613 §2.6 / §2.6.5 give one connection a single
+//! 256-value Identifier space, with one Identifier reserved for the watchdog
+//! and no more than 256 requests outstanding. The link tracks the Identifiers
+//! of the requests it has written on the current connection
+//! ([`RadsecLinkHandle::send`] records them, a frame coming back with that
+//! Identifier releases it, a reconnect clears them) and the Status-Server
+//! probe takes its Identifier from the ones that are free
+//! ([`RadsecLinkHandle::free_identifier`]), so a probe never shares an
+//! Identifier with a forwarded request; `max_outstanding` is bounded to 255
+//! for a RadSec home server at config load.
+//! TODO(gap): the proxy forwards the NAS Identifier unchanged over the link
+//! (as it does over the UDP socket) — there is no Identifier rewriting on the
+//! upstream hop. Two NASes using the same Identifier at the same time
+//! therefore collide on the one connection exactly as they would on the UDP
+//! socket; correlation on our side is by Proxy-State, not Identifier, so the
+//! collision only matters to a home server that deduplicates on
+//! (connection, Identifier) and may discard the older of the two requests
+//! (RFC 6613 §2.6.1 "Servers SHOULD still perform duplicate detection"). An
+//! accepted gap for this release.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -46,9 +77,12 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use radius_proto::attributes::AttributeType;
-use radius_proto::{Code, Packet};
+use dashmap::mapref::entry::Entry;
+use radius_proto::attributes::{Attribute, AttributeType};
+use radius_proto::auth::calculate_response_authenticator;
+use radius_proto::{Code, ErrorCause, Packet, PacketError, calculate_message_authenticator};
 use rand::RngExt;
+use rand::seq::IndexedRandom;
 use rustls::ClientConfig;
 use rustls::client::Resumption;
 use rustls::pki_types::ServerName;
@@ -62,7 +96,7 @@ use tracing::{debug, info, warn};
 
 use crate::proxy::error::ProxyError;
 use crate::proxy::home_server::{HomeServer, HomeServerTlsConfig};
-use crate::radsec_frame::{FrameError, RADIUS_MAX_LEN, take_frame};
+use crate::radsec_frame::{FrameError, RADIUS_MAX_LEN, RADSEC_SECRET, take_frame};
 use crate::server_verifier::ServerVerifierError;
 
 /// A proxied response read off a RadSec link, for
@@ -95,8 +129,24 @@ pub enum RadsecClientError {
     DisallowedParameters(usg_fips_tls::error::FipsError),
     #[error("{0}")]
     Frame(#[from] FrameError),
+    /// A correctly framed frame that is not a RADIUS packet. RFC 6613 §2.6.4:
+    /// the connection MUST be closed.
+    #[error("malformed RADIUS packet on the connection: {0}")]
+    Malformed(String),
+    /// Building a reply (CoA-NAK / Disconnect-NAK) failed.
+    #[error("packet error: {0}")]
+    Packet(#[from] PacketError),
     #[error("{0} timed out")]
     Timeout(&'static str),
+}
+
+/// Why [`RadsecLinkHandle::register_probe`] refused a registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ProbeRegistrationError {
+    /// A probe with this Identifier is already waiting on this link
+    /// (RFC 5997 §3: one Identifier, one outstanding probe).
+    #[error("a Status-Server probe with Identifier {0} is already outstanding")]
+    Duplicate(u8),
 }
 
 impl From<RadsecClientError> for ProxyError {
@@ -135,6 +185,12 @@ pub struct LinkParams {
     pub max_backoff: Duration,
     /// A connection that lived at least this long resets the backoff.
     pub stable_after: Duration,
+    /// How long an Identifier written on the connection counts as in flight
+    /// when no frame with that Identifier comes back (a request the home
+    /// server never answers). Keeps the free-Identifier pool for the watchdog
+    /// from draining one unanswered request at a time; a reconnect clears
+    /// the pool outright.
+    pub identifier_ttl: Duration,
 }
 
 impl Default for LinkParams {
@@ -144,6 +200,7 @@ impl Default for LinkParams {
             initial_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(30),
             stable_after: Duration::from_secs(10),
+            identifier_ttl: Duration::from_secs(60),
         }
     }
 }
@@ -152,27 +209,43 @@ impl Default for LinkParams {
 /// token so a probe deregisters only its own registration.
 type ProbeTable = DashMap<u8, (u64, mpsc::Sender<Packet>)>;
 
+/// Identifiers of requests written on the current connection and not yet
+/// answered, with the time they were written (RFC 6613 §2.6 / §2.6.5: one
+/// Identifier space per connection).
+type InFlight = DashMap<u8, Instant>;
+
 /// Handle to a running link: send frames, register Status-Server probes, read
 /// the connection state. Cheap to clone; the `HomeServer` holds one.
 #[derive(Clone)]
 pub struct RadsecLinkHandle {
     outbound: mpsc::Sender<Vec<u8>>,
+    /// One pending reset at most; the task drains it on every (re)connect.
+    reset: mpsc::Sender<String>,
     connected: Arc<AtomicBool>,
     probes: Arc<ProbeTable>,
+    in_flight: Arc<InFlight>,
+    identifier_ttl: Duration,
     connections: Arc<AtomicU64>,
 }
 
 impl RadsecLinkHandle {
     /// Queue one RADIUS frame for the connection. Fails immediately when the
     /// link is down (nothing is queued) or the bounded outbound queue is full.
+    /// The frame's Identifier (octet 1) is recorded as in flight on this
+    /// connection until a frame with that Identifier comes back.
     pub fn send(&self, frame: Vec<u8>) -> Result<(), LinkSendError> {
         if !self.connected.load(Ordering::Acquire) {
             return Err(LinkSendError::Down);
         }
+        let identifier = frame.get(1).copied();
         self.outbound.try_send(frame).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => LinkSendError::Busy,
             mpsc::error::TrySendError::Closed(_) => LinkSendError::Down,
-        })
+        })?;
+        if let Some(identifier) = identifier {
+            self.in_flight.insert(identifier, Instant::now());
+        }
+        Ok(())
     }
 
     /// Whether the TLS connection is currently established.
@@ -183,18 +256,62 @@ impl RadsecLinkHandle {
     /// Register to receive frames without a Proxy-State that carry
     /// `identifier` — a Status-Server reply (RFC 5997). Register **before**
     /// sending the probe. The registration is removed when the receiver is
-    /// dropped, and the receiver yields `None` when the link is lost.
-    pub fn register_probe(&self, identifier: u8) -> ProbeReceiver {
+    /// dropped, and the receiver yields `None` when the link is lost. A
+    /// second registration for an Identifier that already has a probe
+    /// waiting is refused rather than stealing its replies.
+    pub fn register_probe(&self, identifier: u8) -> Result<ProbeReceiver, ProbeRegistrationError> {
         static TOKEN: AtomicU64 = AtomicU64::new(1);
         let token = TOKEN.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(8);
-        self.probes.insert(identifier, (token, tx));
-        ProbeReceiver {
+        match self.probes.entry(identifier) {
+            Entry::Occupied(_) => return Err(ProbeRegistrationError::Duplicate(identifier)),
+            Entry::Vacant(slot) => {
+                slot.insert((token, tx));
+            }
+        }
+        Ok(ProbeReceiver {
             identifier,
             token,
             rx,
             probes: Arc::clone(&self.probes),
+            in_flight: Arc::clone(&self.in_flight),
+        })
+    }
+
+    /// An Identifier not in flight on the current connection and not held by
+    /// a waiting probe, chosen at random among the free ones; `None` when all
+    /// 256 are taken (RFC 6613 §2.6: one Identifier per connection is
+    /// reserved for the watchdog, so the probe never shares one with a
+    /// forwarded request). An Identifier unanswered for longer than
+    /// [`LinkParams::identifier_ttl`] counts as free again.
+    pub fn free_identifier(&self) -> Option<u8> {
+        let now = Instant::now();
+        let free: Vec<u8> = (0..=u8::MAX)
+            .filter(|id| !self.identifier_busy(*id, now))
+            .collect();
+        free.choose(&mut rand::rng()).copied()
+    }
+
+    fn identifier_busy(&self, identifier: u8, now: Instant) -> bool {
+        if self.probes.contains_key(&identifier) {
+            return true;
         }
+        self.in_flight
+            .get(&identifier)
+            .is_some_and(|sent| now.duration_since(*sent) < self.identifier_ttl)
+    }
+
+    /// Close the current connection and reconnect with backoff, because the
+    /// peer broke the protocol on it (RFC 6613 §2.6.4: failed Response
+    /// Authenticator or Message-Authenticator) or the watchdog gave up on it
+    /// (RFC 3539 §3.4). A no-op while the link is down; `reason` goes into
+    /// the "RadSec link lost" log line.
+    pub fn reset(&self, reason: &str) {
+        if !self.connected.load(Ordering::Acquire) {
+            return;
+        }
+        // Full ⇒ a reset is already pending for this connection.
+        let _ = self.reset.try_send(reason.to_string());
     }
 
     /// Number of TLS connections established so far (for tests and stats).
@@ -208,6 +325,7 @@ impl std::fmt::Debug for RadsecLinkHandle {
         f.debug_struct("RadsecLinkHandle")
             .field("connected", &self.is_connected())
             .field("connections", &self.connections())
+            .field("in_flight", &self.in_flight.len())
             .finish()
     }
 }
@@ -218,6 +336,7 @@ pub struct ProbeReceiver {
     token: u64,
     rx: mpsc::Receiver<Packet>,
     probes: Arc<ProbeTable>,
+    in_flight: Arc<InFlight>,
 }
 
 impl ProbeReceiver {
@@ -230,8 +349,15 @@ impl ProbeReceiver {
 
 impl Drop for ProbeReceiver {
     fn drop(&mut self) {
-        self.probes
-            .remove_if(&self.identifier, |_, (token, _)| *token == self.token);
+        if self
+            .probes
+            .remove_if(&self.identifier, |_, (token, _)| *token == self.token)
+            .is_some()
+        {
+            // The probe owned this Identifier (it was free when chosen); an
+            // unanswered probe must not keep it busy until the TTL.
+            self.in_flight.remove(&self.identifier);
+        }
     }
 }
 
@@ -295,10 +421,14 @@ pub fn spawn_link(
         .to_owned();
 
     let (outbound_tx, outbound_rx) = mpsc::channel(home_server.max_outstanding.max(1));
+    let (reset_tx, reset_rx) = mpsc::channel(1);
     let handle = RadsecLinkHandle {
         outbound: outbound_tx,
+        reset: reset_tx,
         connected: Arc::new(AtomicBool::new(false)),
         probes: Arc::new(DashMap::new()),
+        in_flight: Arc::new(DashMap::new()),
+        identifier_ttl: params.identifier_ttl,
         connections: Arc::new(AtomicU64::new(0)),
     };
 
@@ -314,8 +444,10 @@ pub fn spawn_link(
         responses,
         connected: Arc::clone(&handle.connected),
         probes: Arc::clone(&handle.probes),
+        in_flight: Arc::clone(&handle.in_flight),
         connections: Arc::clone(&handle.connections),
         outbound: outbound_rx,
+        reset: reset_rx,
     };
     tokio::spawn(link.run());
 
@@ -323,11 +455,14 @@ pub fn spawn_link(
 }
 
 type TlsStream = tokio_rustls::client::TlsStream<TcpStream>;
+type TlsWriteHalf = tokio::io::WriteHalf<TlsStream>;
 
 /// How a connection ended.
 enum LinkEnd {
     /// The home server closed the connection (clean EOF).
     Eof,
+    /// [`RadsecLinkHandle::reset`] asked for the connection to be dropped.
+    Reset(String),
     /// Every `RadsecLinkHandle` was dropped: the task is done.
     HandleDropped,
 }
@@ -350,8 +485,10 @@ struct Link {
     responses: mpsc::Sender<LinkResponse>,
     connected: Arc<AtomicBool>,
     probes: Arc<ProbeTable>,
+    in_flight: Arc<InFlight>,
     connections: Arc<AtomicU64>,
     outbound: mpsc::Receiver<Vec<u8>>,
+    reset: mpsc::Receiver<String>,
 }
 
 impl Link {
@@ -366,6 +503,13 @@ impl Link {
 
             match self.connect().await {
                 Ok((tls, negotiated)) => {
+                    // A fresh connection starts clean: nothing queued during
+                    // the backoff rides it (the retry manager owns resends),
+                    // no reset aimed at the old connection, and an empty
+                    // Identifier space (RFC 6613 §2.6: per connection).
+                    self.drain_outbound();
+                    while self.reset.try_recv().is_ok() {}
+                    self.in_flight.clear();
                     self.connections.fetch_add(1, Ordering::Relaxed);
                     self.connected.store(true, Ordering::Release);
                     info!(
@@ -385,26 +529,22 @@ impl Link {
                     self.connected.store(false, Ordering::Release);
                     self.probes.clear();
                     let dropped = self.drain_outbound();
-                    match end {
+                    let reason = match end {
                         Ok(LinkEnd::HandleDropped) => {
                             debug!(server = %self.name, "RadSec link handle dropped; link task ending");
                             return;
                         }
-                        Ok(LinkEnd::Eof) => info!(
-                            server = %self.name,
-                            address = %self.address,
-                            reason = "closed by peer",
-                            dropped_frames = dropped,
-                            "RadSec link lost"
-                        ),
-                        Err(e) => info!(
-                            server = %self.name,
-                            address = %self.address,
-                            reason = %e,
-                            dropped_frames = dropped,
-                            "RadSec link lost"
-                        ),
-                    }
+                        Ok(LinkEnd::Eof) => "closed by peer".to_string(),
+                        Ok(LinkEnd::Reset(reason)) => reason,
+                        Err(e) => e.to_string(),
+                    };
+                    info!(
+                        server = %self.name,
+                        address = %self.address,
+                        reason = %reason,
+                        dropped_frames = dropped,
+                        "RadSec link lost"
+                    );
                     if established.elapsed() >= self.params.stable_after {
                         backoff = self.params.initial_backoff;
                     }
@@ -476,10 +616,12 @@ impl Link {
 
         loop {
             // Drain every complete frame already buffered before awaiting more
-            // I/O. A bad Length (RFC 2865 §3) means the stream is out of sync:
-            // the error closes the connection, as the inbound listener does.
+            // I/O. A bad Length (RFC 2865 §3) or an undecodable packet means
+            // the stream is out of sync or the peer is broken: RFC 6613 §2.6.4
+            // says the connection MUST be closed, so the error ends `serve`
+            // and `run` reconnects.
             while let Some(frame) = take_frame(&mut buf)? {
-                if let Some(end) = self.demux(frame).await {
+                if let Some(end) = self.demux(frame, &mut wr).await? {
                     return Ok(end);
                 }
             }
@@ -492,10 +634,15 @@ impl Link {
                 }
                 frame = self.outbound.recv() => match frame {
                     Some(frame) => {
-                        // RFC 6614 §2.5: the packet as is, no extra framing.
+                        // RFC 6614 §3.4 item 1: the packet as is, delimited by
+                        // its own Length, no extra framing.
                         wr.write_all(&frame).await?;
                         wr.flush().await?;
                     }
+                    None => return Ok(LinkEnd::HandleDropped),
+                },
+                reason = self.reset.recv() => match reason {
+                    Some(reason) => return Ok(LinkEnd::Reset(reason)),
                     None => return Ok(LinkEnd::HandleDropped),
                 },
             }
@@ -503,17 +650,50 @@ impl Link {
     }
 
     /// Route one inbound frame. Nothing is verified here (see the module
-    /// docs); the handler and the probe do that. Returns `Some` when the task
-    /// must end (the `HomeServer` is gone).
-    async fn demux(&self, frame: Vec<u8>) -> Option<LinkEnd> {
+    /// docs); the handler and the probe do that. Returns `Ok(Some)` when the
+    /// task must end (the `HomeServer` is gone) and `Err` when the connection
+    /// must be closed (RFC 6613 §2.6.4: the frame is not a RADIUS packet).
+    async fn demux(
+        &self,
+        frame: Vec<u8>,
+        wr: &mut TlsWriteHalf,
+    ) -> Result<Option<LinkEnd>, RadsecClientError> {
         let packet = match Packet::decode(&frame) {
             Ok(packet) => packet,
             Err(e) => {
-                // Undecodable but correctly framed: drop it, keep the connection.
-                debug!(server = %self.name, error = %e, "RadSec link: dropping undecodable frame");
-                return None;
+                // Correctly framed but not a RADIUS packet (attribute Length
+                // 0 or 1, attributes not filling the packet, ...): RFC 6613
+                // §2.6.4 — the connection MUST be closed.
+                warn!(
+                    server = %self.name,
+                    error = %e,
+                    "RadSec link: malformed packet on the connection; closing it (RFC 6613 §2.6.4)"
+                );
+                return Err(RadsecClientError::Malformed(e.to_string()));
             }
         };
+
+        // A CoA-Request / Disconnect-Request from the home server (RFC 6614
+        // §2.5 permits every code on the one connection). The proxy does not
+        // relay dynamic authorization to the NAS, so it answers as §2.5 says a
+        // peer that does not handle them must: a NAK with Error-Cause 406
+        // (Unsupported Extension, RFC 5176 §3.5), signed under "radsec".
+        if matches!(packet.code, Code::CoaRequest | Code::DisconnectRequest) {
+            debug!(
+                server = %self.name,
+                code = ?packet.code,
+                identifier = packet.identifier,
+                "RadSec link: answering unsupported server-originated request with a NAK (Error-Cause 406)"
+            );
+            let nak = unsupported_extension_nak(&packet)?;
+            wr.write_all(&nak).await?;
+            wr.flush().await?;
+            return Ok(None);
+        }
+
+        // Whatever comes back under an Identifier answers the request written
+        // under it: that Identifier is free again on this connection.
+        self.in_flight.remove(&packet.identifier);
 
         // RFC 2865 §5.33: the last Proxy-State is the one we appended, so any
         // Proxy-State marks a proxied response. Its length and cache hit are
@@ -524,7 +704,7 @@ impl Link {
             .any(|a| a.attr_type == AttributeType::ProxyState as u8);
         if has_proxy_state {
             let Some(home_server) = self.home_server.upgrade() else {
-                return Some(LinkEnd::HandleDropped);
+                return Ok(Some(LinkEnd::HandleDropped));
             };
             if self
                 .responses
@@ -537,19 +717,7 @@ impl Link {
             {
                 debug!(server = %self.name, "RadSec link: response channel closed; dropping frame");
             }
-            return None;
-        }
-
-        // CoA/Disconnect from the home server over this connection is out of
-        // scope (RFC 6614 §2.5 permits it; the proxy does not relay it).
-        if matches!(packet.code, Code::CoaRequest | Code::DisconnectRequest) {
-            debug!(
-                server = %self.name,
-                code = ?packet.code,
-                identifier = packet.identifier,
-                "RadSec link: dropping unsupported server-originated request"
-            );
-            return None;
+            return Ok(None);
         }
 
         // RFC 5997 Status-Server reply: no Proxy-State, matched by Identifier
@@ -572,7 +740,7 @@ impl Link {
                 "RadSec link: dropping unsolicited frame"
             ),
         }
-        None
+        Ok(None)
     }
 
     /// Discard frames queued for a connection that no longer exists. Their
@@ -593,6 +761,40 @@ impl Link {
     }
 }
 
+/// The CoA-NAK / Disconnect-NAK for a CoA-Request / Disconnect-Request the
+/// proxy does not handle: same Identifier, `Error-Cause (101) = 406`
+/// Unsupported Extension (RFC 6614 §2.5, RFC 5176 §3.5), a
+/// Message-Authenticator and the Response Authenticator (RFC 5176 §3 →
+/// RFC 2865 §3 formula) under the fixed hop secret `"radsec"`.
+fn unsupported_extension_nak(request: &Packet) -> Result<Vec<u8>, RadsecClientError> {
+    let code = match request.code {
+        Code::CoaRequest => Code::CoaNak,
+        _ => Code::DisconnectNak,
+    };
+    let mut nak = Packet::new(code, request.identifier, request.authenticator);
+    nak.add_attribute(Attribute::integer(
+        AttributeType::ErrorCause as u8,
+        ErrorCause::UnsupportedExtension.as_u32(),
+    )?);
+    nak.add_attribute(Attribute::new(
+        AttributeType::MessageAuthenticator as u8,
+        vec![0u8; 16],
+    )?);
+    // RFC 3579 §3.2: a response's Message-Authenticator is computed with the
+    // Request Authenticator in the header and the attribute zeroed.
+    let mac = calculate_message_authenticator(&nak.encode()?, RADSEC_SECRET);
+    if let Some(ma) = nak
+        .attributes
+        .iter_mut()
+        .find(|a| a.attr_type == AttributeType::MessageAuthenticator as u8)
+    {
+        ma.value = mac.to_vec();
+    }
+    nak.authenticator =
+        calculate_response_authenticator(&nak, &request.authenticator, RADSEC_SECRET);
+    Ok(nak.encode()?)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -609,11 +811,9 @@ mod tests {
         FakeAction, TestPaths, gen_chain, gen_chain_with, lenient_server_config,
         spawn_fake_tls_home, spawn_fake_tls_home_with_provider, spawn_radsec_home,
     };
-    use radius_proto::attributes::Attribute;
     use radius_proto::auth::{
-        calculate_response_authenticator, encrypt_user_password, generate_request_authenticator,
+        encrypt_user_password, generate_request_authenticator, verify_response_authenticator,
     };
-    use radius_proto::calculate_message_authenticator;
 
     const PROXY_STATE: [u8; 16] = [0x50; 16];
 
@@ -624,6 +824,7 @@ mod tests {
             initial_backoff: Duration::from_millis(40),
             max_backoff: Duration::from_millis(160),
             stable_after: Duration::from_secs(10),
+            identifier_ttl: Duration::from_secs(60),
         }
     }
 
@@ -828,7 +1029,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let link = connected_link(&hs, tx, fast()).await;
 
-        let mut probe = link.register_probe(0x5a);
+        let mut probe = link.register_probe(0x5a).unwrap();
         link.send(status_server(0x5a)).unwrap();
 
         let reply = time::timeout(Duration::from_secs(5), probe.recv())
@@ -848,7 +1049,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_registration_survives_a_later_probe_with_the_same_identifier() {
+    async fn a_second_probe_registration_for_the_same_identifier_is_refused() {
+        // RFC 5997 §3: one outstanding probe per Identifier. The second
+        // registration must not steal the first one's replies, and its
+        // failure must not deregister the first.
         let chain = gen_chain();
         let (addr, _registry, paths) =
             spawn_radsec_home(&chain, false, lenient_server_config(&[])).await;
@@ -856,15 +1060,174 @@ mod tests {
         let (tx, _rx) = mpsc::channel(4);
         let link = connected_link(&hs, tx, fast()).await;
 
-        let first = link.register_probe(7);
-        let second = link.register_probe(7);
-        drop(first);
+        let first = link.register_probe(7).unwrap();
+        assert_eq!(
+            link.register_probe(7).err(),
+            Some(ProbeRegistrationError::Duplicate(7))
+        );
         assert!(
             link.probes.get(&7).is_some(),
-            "dropping the superseded probe must not remove the live one"
+            "the refused registration must not remove the live one"
         );
-        drop(second);
+        assert_eq!(
+            link.free_identifier().map(|id| id == 7),
+            Some(false),
+            "an Identifier held by a waiting probe is not free"
+        );
+        drop(first);
         assert!(link.probes.get(&7).is_none());
+        // Free again, and registrable again.
+        let again = link.register_probe(7).unwrap();
+        drop(again);
+    }
+
+    #[tokio::test]
+    async fn probe_identifier_is_never_one_in_flight_on_the_connection() {
+        // RFC 6613 §2.6 / §2.6.5: one Identifier space per connection, one
+        // Identifier reserved for the watchdog. With 0..=254 written and
+        // unanswered, the only free Identifier is 255 — every time. A reply
+        // under an Identifier releases it; a reconnect releases them all; an
+        // Identifier unanswered for longer than `identifier_ttl` is free again.
+        let chain = gen_chain();
+        let paths = chain.write_to_tempdir();
+        // Answers Status-Server (no Proxy-State) and Access-Request 254 only.
+        let addr = spawn_fake_tls_home(&chain, |_, request| match request.code {
+            Code::StatusServer => {
+                let mut reply = Packet::new(Code::AccessAccept, request.identifier, [0u8; 16]);
+                reply.authenticator =
+                    calculate_response_authenticator(&reply, &request.authenticator, RADSEC_SECRET);
+                FakeAction::Reply(vec![reply.encode().unwrap()])
+            }
+            _ if request.identifier == 254 => FakeAction::Reply(vec![echo_accept(request)]),
+            _ => FakeAction::Reply(vec![]),
+        })
+        .await;
+        let hs = Arc::new(
+            HomeServer::new(HomeServerConfig {
+                name: Some("home-ids".to_string()),
+                timeout: 2,
+                max_outstanding: 255,
+                ..HomeServerConfig::radsec(addr.to_string(), tls_block(&paths, "localhost"))
+            })
+            .unwrap(),
+        );
+        let (tx, mut rx) = mpsc::channel(4);
+        let params = LinkParams {
+            identifier_ttl: Duration::from_millis(400),
+            ..fast()
+        };
+        let link = connected_link(&hs, tx, params).await;
+
+        let pw = password();
+        for id in 0..=253u8 {
+            link.send(forwarded_access_request(id, &pw)).unwrap();
+        }
+        for _ in 0..32 {
+            assert!(
+                matches!(link.free_identifier(), Some(254) | Some(255)),
+                "only 254 and 255 are free"
+            );
+        }
+        link.send(forwarded_access_request(254, &pw)).unwrap();
+        // 254 is answered: its Identifier is released when the reply is demuxed.
+        let response = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("response within 5 s")
+            .expect("channel open");
+        assert_eq!(response.packet.identifier, 254);
+        wait_for(
+            || !link.in_flight.contains_key(&254),
+            Duration::from_secs(2),
+        )
+        .await;
+        for _ in 0..32 {
+            assert!(matches!(link.free_identifier(), Some(254) | Some(255)));
+        }
+
+        // The probe takes a free Identifier and holds it while waiting.
+        let probe_id = 255;
+        let mut probe = link.register_probe(probe_id).unwrap();
+        link.send(status_server(probe_id)).unwrap();
+        assert_eq!(link.free_identifier(), Some(254), "255 is the probe's");
+        let reply = time::timeout(Duration::from_secs(5), probe.recv())
+            .await
+            .expect("probe reply within 5 s")
+            .expect("link up");
+        assert_eq!(reply.identifier, probe_id);
+        drop(probe);
+        assert!(matches!(link.free_identifier(), Some(254) | Some(255)));
+
+        // Unanswered requests expire from the in-flight set after the TTL ...
+        time::sleep(Duration::from_millis(500)).await;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            seen.insert(link.free_identifier().unwrap());
+        }
+        assert!(
+            seen.len() > 2,
+            "after the TTL the whole space is free again: {seen:?}"
+        );
+
+        // ... and a reconnect clears it outright.
+        for id in 0..=253u8 {
+            link.send(forwarded_access_request(id, &pw)).unwrap();
+        }
+        assert!(link.in_flight.len() >= 250);
+        link.reset("test");
+        wait_for(
+            || link.connections() == 2 && link.is_connected(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(link.connections(), 2);
+        assert!(
+            link.in_flight.is_empty(),
+            "a new connection starts with an empty Identifier space"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_drops_the_connection_and_the_link_reconnects() {
+        let chain = gen_chain();
+        let (addr, _registry, paths) =
+            spawn_radsec_home(&chain, false, lenient_server_config(&[])).await;
+        let hs = home_server(addr, tls_block(&paths, "localhost"));
+        let (tx, _rx) = mpsc::channel(4);
+        let link = connected_link(&hs, tx, fast()).await;
+        assert_eq!(link.connections(), 1);
+
+        // A probe waiting on the connection is told the link is gone.
+        let mut probe = link.register_probe(1).unwrap();
+        link.reset("test: peer fault");
+        let got = time::timeout(Duration::from_secs(5), probe.recv())
+            .await
+            .expect("probe receiver resolves on reset");
+        assert!(got.is_none());
+
+        wait_for(
+            || link.connections() == 2 && link.is_connected(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(link.connections(), 2, "reset must reconnect exactly once");
+        assert!(link.is_connected());
+
+        // The new connection works, and a reset while down is a no-op (it
+        // must not kill the connection that comes up next).
+        let mut probe = link.register_probe(2).unwrap();
+        link.send(status_server(2)).unwrap();
+        let reply = time::timeout(Duration::from_secs(5), probe.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.identifier, 2);
+        drop(probe);
+        link.connected.store(false, Ordering::Release);
+        link.reset("ignored while down");
+        link.connected.store(true, Ordering::Release);
+        time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(link.connections(), 2, "a reset while down must be dropped");
+        assert!(link.is_connected());
     }
 
     #[tokio::test]
@@ -894,7 +1257,7 @@ mod tests {
     #[tokio::test]
     async fn server_name_mismatch_never_connects() {
         // Valid chain, but the certificate is for "localhost" and we insist on
-        // another name (RFC 6614 §2.3: the client MUST verify the server).
+        // another name (RFC 6614 §2.3 item 3: expected DNS name).
         let chain = gen_chain();
         let (addr, _registry, paths) =
             spawn_radsec_home(&chain, false, lenient_server_config(&[])).await;
@@ -962,7 +1325,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(4);
         let link = connected_link(&hs, tx, fast()).await;
 
-        let mut probe = link.register_probe(9);
+        let mut probe = link.register_probe(9).unwrap();
         link.send(status_server(9)).unwrap();
         // The fake home hangs up on the probe: the receiver ends instead of
         // waiting out the deadline.
@@ -1013,11 +1376,15 @@ mod tests {
         // Before the genuine echo the home server sends two frames nobody asked
         // for: an Access-Accept without Proxy-State under an Identifier no probe
         // is registered for, and a CoA-Request (RFC 6614 §2.5 permits it; the
-        // proxy does not relay it). Neither reaches the response channel, no
-        // probe table entry appears, and the connection is kept.
+        // proxy answers it with a CoA-NAK, see the NAK test). Neither reaches
+        // the response channel, no probe table entry appears, and the
+        // connection is kept.
         let chain = gen_chain();
         let paths = chain.write_to_tempdir();
         let addr = spawn_fake_tls_home(&chain, |_, request| {
+            if request.code != Code::AccessRequest {
+                return FakeAction::Reply(vec![]); // our CoA-NAK: nothing to say
+            }
             let mut stray = Packet::new(
                 Code::AccessAccept,
                 request.identifier.wrapping_add(100),
@@ -1104,8 +1471,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_bad_length_on_the_stream_closes_the_connection_and_the_link_reconnects() {
-        // RFC 2865 §3 / RFC 6614 §2.5: a Length outside 20..=4096 means the
-        // stream has lost synchronisation. Connection 1 answers with Length 19,
+        // RFC 2865 §3 / RFC 6613 §2.6.4: a Length outside 20..=4096 means the
+        // stream has lost synchronisation and the connection MUST be closed. Connection 1 answers with Length 19,
         // connection 2 with Length 4097; each time the link drops the
         // connection without delivering anything and reconnects. Connection 3
         // behaves and its reply is delivered.
@@ -1164,48 +1531,143 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_undecodable_but_well_framed_frame_is_dropped_and_the_connection_kept() {
+    async fn an_undecodable_but_well_framed_frame_closes_the_connection() {
         // Length is a valid 24, but the trailing attribute header claims 16
-        // octets and carries 2: `Packet::decode` fails, the frame is discarded
-        // (the stream is still in sync), and the genuine reply that follows on
-        // the same connection is delivered.
+        // octets and carries 2: `Packet::decode` fails. RFC 6613 §2.6.4: the
+        // connection MUST be closed — nothing from it is delivered (not even
+        // the well-formed echo the peer sends right after), the link
+        // reconnects, and the next request is answered on connection 2.
         let chain = gen_chain();
         let paths = chain.write_to_tempdir();
-        let addr = spawn_fake_tls_home(&chain, |_, request| {
-            let mut junk = Packet::new(Code::AccessAccept, request.identifier, [0u8; 16])
-                .encode()
-                .unwrap();
-            junk.extend_from_slice(&[AttributeType::ProxyState as u8, 16, 0xaa, 0xbb]);
-            junk[2..4].copy_from_slice(&24u16.to_be_bytes());
-            assert_eq!(junk.len(), 24);
-            FakeAction::Reply(vec![junk, echo_accept(request)])
+        let addr = spawn_fake_tls_home(&chain, |connection, request| {
+            if connection == 1 {
+                let mut junk = Packet::new(Code::AccessAccept, request.identifier, [0u8; 16])
+                    .encode()
+                    .unwrap();
+                junk.extend_from_slice(&[AttributeType::ProxyState as u8, 16, 0xaa, 0xbb]);
+                junk[2..4].copy_from_slice(&24u16.to_be_bytes());
+                assert_eq!(junk.len(), 24);
+                FakeAction::Reply(vec![junk, echo_accept(request)])
+            } else {
+                FakeAction::Reply(vec![echo_accept(request)])
+            }
+        })
+        .await;
+        let hs = home_server(addr, tls_block(&paths, "localhost"));
+        let (tx, mut rx) = mpsc::channel(4);
+        let link = connected_link(&hs, tx, fast()).await;
+        assert_eq!(link.connections(), 1);
+
+        link.send(forwarded_access_request(7, &password())).unwrap();
+        wait_for(
+            || link.connections() == 2 && link.is_connected(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            link.connections(),
+            2,
+            "a malformed packet must close the connection (RFC 6613 §2.6.4)"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing read after the malformed packet may be delivered"
+        );
+
+        link.send(forwarded_access_request(8, &password())).unwrap();
+        let response = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("response within 5 s")
+            .expect("channel open");
+        assert_eq!(response.packet.identifier, 8);
+        assert_eq!(link.connections(), 2);
+    }
+
+    #[tokio::test]
+    async fn coa_and_disconnect_requests_from_the_home_server_get_a_nak_with_error_cause_406() {
+        // RFC 6614 §2.5 / RFC 5176 §3.5: a peer that does not handle CoA /
+        // Disconnect answers with a NAK carrying Error-Cause 406 (Unsupported
+        // Extension). The fake home server records every frame it receives;
+        // the NAKs must be signed under "radsec" against the request's
+        // authenticator, carry its Identifier, and not drop the connection.
+        let chain = gen_chain();
+        let paths = chain.write_to_tempdir();
+        let coa_auth = generate_request_authenticator();
+        let disconnect_auth = generate_request_authenticator();
+        let received: Arc<std::sync::Mutex<Vec<Packet>>> = Arc::default();
+        let seen = Arc::clone(&received);
+        let addr = spawn_fake_tls_home(&chain, move |_, request| {
+            seen.lock().unwrap().push(request.clone());
+            if request.code != Code::AccessRequest {
+                return FakeAction::Reply(vec![]);
+            }
+            let mut coa = Packet::new(Code::CoaRequest, 200, coa_auth);
+            coa.add_attribute(Attribute::string(AttributeType::UserName as u8, "alice").unwrap());
+            let mut disc = Packet::new(Code::DisconnectRequest, 201, disconnect_auth);
+            disc.add_attribute(
+                Attribute::string(AttributeType::AcctSessionId as u8, "s-1").unwrap(),
+            );
+            FakeAction::Reply(vec![
+                coa.encode().unwrap(),
+                disc.encode().unwrap(),
+                echo_accept(request),
+            ])
         })
         .await;
         let hs = home_server(addr, tls_block(&paths, "localhost"));
         let (tx, mut rx) = mpsc::channel(4);
         let link = connected_link(&hs, tx, fast()).await;
 
-        link.send(forwarded_access_request(7, &password())).unwrap();
+        link.send(forwarded_access_request(5, &password())).unwrap();
         let response = time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("response within 5 s")
             .expect("channel open");
-        assert_eq!(response.packet.identifier, 7);
-        assert_eq!(
-            response
-                .packet
-                .find_attribute(AttributeType::ProxyState as u8)
-                .unwrap()
-                .value,
-            PROXY_STATE.to_vec(),
-            "the genuine echo, not the junk, is what arrives"
-        );
-        assert!(rx.try_recv().is_err());
+        assert_eq!(response.packet.identifier, 5);
+
+        wait_for(
+            || received.lock().unwrap().len() >= 3,
+            Duration::from_secs(5),
+        )
+        .await;
+        let frames = received.lock().unwrap().clone();
+        let nak = |code: Code| {
+            frames
+                .iter()
+                .find(|p| p.code == code)
+                .unwrap_or_else(|| panic!("home server must receive a {code:?}"))
+                .clone()
+        };
+        for (nak, request_auth, identifier) in [
+            (nak(Code::CoaNak), coa_auth, 200u8),
+            (nak(Code::DisconnectNak), disconnect_auth, 201u8),
+        ] {
+            assert_eq!(nak.identifier, identifier);
+            let cause = nak
+                .find_attribute(AttributeType::ErrorCause as u8)
+                .expect("Error-Cause present");
+            assert_eq!(
+                cause.value,
+                406u32.to_be_bytes().to_vec(),
+                "Unsupported Extension"
+            );
+            assert!(
+                verify_response_authenticator(&nak, &request_auth, RADSEC_SECRET),
+                "NAK Response Authenticator under \"radsec\""
+            );
+            assert!(
+                matches!(
+                    crate::server::check_message_authenticator(&nak, &request_auth, RADSEC_SECRET),
+                    Ok(crate::server::MessageAuthenticatorCheck::Valid)
+                ),
+                "NAK Message-Authenticator under \"radsec\""
+            );
+        }
         assert!(link.is_connected());
-        assert_eq!(
-            link.connections(),
-            1,
-            "an undecodable frame does not drop the connection"
+        assert_eq!(link.connections(), 1, "a NAK keeps the connection");
+        assert!(
+            link.in_flight.get(&200).is_none() && link.in_flight.get(&201).is_none(),
+            "a NAK is a response, not a request in flight"
         );
     }
 
@@ -1285,7 +1747,7 @@ mod tests {
             let (tx, _rx) = mpsc::channel(4);
             let link = connected_link(&hs, tx, fast()).await;
 
-            let mut probe = link.register_probe(3);
+            let mut probe = link.register_probe(3).unwrap();
             link.send(status_server(3)).unwrap();
             let reply = time::timeout(Duration::from_secs(5), probe.recv())
                 .await

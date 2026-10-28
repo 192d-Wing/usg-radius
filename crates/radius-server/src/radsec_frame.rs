@@ -6,7 +6,7 @@
 //! home-server validation needs [`RADSEC_SECRET`] whether or not the `tls`
 //! feature is on.
 
-/// RFC 6614 §2.3: RadSec uses a fixed shared secret of the ASCII string
+/// RFC 6614 §2.3 item 4: RadSec uses a fixed shared secret of the ASCII string
 /// `"radsec"` for the RADIUS Authenticator / Message-Authenticator computations.
 /// It authenticates nothing — the TLS layer does — which is why it is public.
 pub(crate) const RADSEC_SECRET: &[u8] = b"radsec";
@@ -22,15 +22,17 @@ pub const RADIUS_MAX_LEN: usize = 4096;
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FrameError {
     /// RFC 2865 §3 bounds the `Length` field to 20..=4096; a stream carrying
-    /// anything else has lost synchronisation and must be closed.
+    /// anything else has lost synchronisation and RFC 6613 §2.6.4 says the
+    /// connection MUST be closed.
     #[error("invalid RADIUS Length field: {0} (must be {RADIUS_MIN_LEN}..={RADIUS_MAX_LEN})")]
     BadRadiusLength(usize),
 }
 
-/// Pull one complete RADIUS frame off the front of `buf` (delimited by the
-/// `Length` header field, RFC 6614 §2.5: RADIUS packets are sent as-is on the
-/// stream and delimited by their own Length), or `None` if a full frame isn't
-/// buffered yet.
+/// Pull one complete RADIUS frame off the front of `buf`, or `None` if a full
+/// frame isn't buffered yet. RFC 6614 §3.4 item 1: RADIUS packets are sent
+/// as-is on the stream and their boundaries are found by evaluating the
+/// `Length` header field; the receiver rules for a bad `Length` are RFC 6613
+/// §2.6.4 (close the connection).
 pub fn take_frame(buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>, FrameError> {
     if buf.len() < RADIUS_HEADER_LEN {
         return Ok(None);
@@ -150,7 +152,7 @@ mod tests {
 
     #[test]
     fn radsec_secret_is_the_rfc_6614_fixed_string() {
-        // RFC 6614 §2.3.
+        // RFC 6614 §2.3 item 4.
         assert_eq!(RADSEC_SECRET, b"radsec");
     }
 }

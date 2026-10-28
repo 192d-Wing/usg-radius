@@ -44,13 +44,13 @@ pub struct HomeServerTlsConfig {
     /// CA bundle (PEM) the home server's certificate must chain to.
     pub ca_path: String,
     /// Our client certificate chain (PEM, leaf first), presented to the home
-    /// server (RFC 6614 §2.3: mutual authentication).
+    /// server (RFC 6614 §2.3 item 2: mutual authentication is REQUIRED).
     pub cert_path: String,
     /// Our client private key (PEM).
     pub key_path: String,
     /// Name the home server's certificate must be valid for (DNS name or IP
-    /// literal); also sent as SNI. RFC 6614 §2.3: the client MUST verify the
-    /// server certificate.
+    /// literal); also sent as SNI. RFC 6614 §2.3 item 3: certificate
+    /// validation MUST follow RFC 5280 and check the expected DNS name.
     pub server_name: String,
     /// CRL/OCSP revocation checking of the home server's certificate; the same
     /// block as `eap.tls.revocation` and `radsec.revocation`. Omitted ⇒ chain
@@ -202,6 +202,21 @@ impl HomeServerConfig {
                 }
             }
             HomeServerTransport::Radsec => {
+                // RFC 6613 §2.6.5: no more than 256 requests outstanding on
+                // one TCP connection, and RFC 6613 §2.6 reserves one
+                // Identifier of the connection's 256 for the watchdog
+                // (Status-Server), so at most 255 forwarded requests may be
+                // in flight on the link. `max_outstanding` is also the depth
+                // of the link's outbound queue.
+                if self.max_outstanding > 255 {
+                    return Err(ProxyError::Configuration(format!(
+                        "Home server '{label}': max_outstanding {} exceeds 255; one RadSec \
+                         connection carries at most 256 outstanding requests with one \
+                         Identifier reserved for the Status-Server watchdog \
+                         (RFC 6613 §2.6, §2.6.5)",
+                        self.max_outstanding
+                    )));
+                }
                 // Fail closed: a config that asks for RadSec must not start a
                 // binary that would have to reach the home server some other way.
                 if !cfg!(feature = "tls") {
@@ -447,6 +462,20 @@ impl HomeServer {
     #[cfg(feature = "tls")]
     pub fn link(&self) -> Option<&RadsecLinkHandle> {
         self.link.get()
+    }
+
+    /// The link's connection generation (`RadsecLinkHandle::connections()`)
+    /// a request sent now goes out on, for `ProxyCacheEntry::sent_on_connection`
+    /// (RFC 6613 §2.6.1). `None` for UDP and for a RadSec server with no link.
+    pub fn link_generation(&self) -> Option<u64> {
+        #[cfg(feature = "tls")]
+        {
+            self.link.get().map(RadsecLinkHandle::connections)
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            None
+        }
     }
 
     /// Whether the transport to this server is currently usable: always for
@@ -737,8 +766,34 @@ mod tests {
     }
 
     #[test]
+    fn radsec_rejects_max_outstanding_above_255() {
+        // RFC 6613 §2.6.5: at most 256 outstanding on one connection, one
+        // Identifier of which RFC 6613 §2.6 reserves for the watchdog.
+        let config = HomeServerConfig {
+            max_outstanding: 256,
+            ..radsec_config()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_outstanding 256"), "{err}");
+        assert!(err.contains("RFC 6613"), "{err}");
+
+        let config = HomeServerConfig {
+            max_outstanding: 255,
+            ..radsec_config()
+        };
+        assert_eq!(config.validate().is_ok(), cfg!(feature = "tls"));
+
+        // UDP is not bound by it.
+        let config = HomeServerConfig {
+            max_outstanding: 1000,
+            ..udp_config()
+        };
+        config.validate().unwrap();
+    }
+
+    #[test]
     fn radsec_rejects_a_configured_secret() {
-        // RFC 6614 §2.3: the hop secret is fixed; a configured one is a mistake.
+        // RFC 6614 §2.3 item 4: the hop secret is fixed; a configured one is a mistake.
         let config = HomeServerConfig {
             secret: "not-radsec".to_string(),
             ..radsec_config()
