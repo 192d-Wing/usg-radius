@@ -258,16 +258,19 @@ mod tests {
     use std::collections::HashSet;
     use std::thread;
     use std::time::Duration;
+    use x509_parser::num_bigint::BigUint;
 
     // Helper to create a test CrlInfo
     fn create_test_crl(issuer: &str) -> CrlInfo {
         CrlInfo {
             issuer: issuer.to_string(),
+            issuer_raw: Vec::new(),
             this_update: Utc::now(),
             next_update: Some(Utc::now() + chrono::Duration::days(7)),
             revoked_serials: HashSet::new(),
             signature_algorithm: "1.2.840.113549.1.1.11".to_string(),
-            crl_number: Some(1),
+            crl_number: Some(BigUint::from(1u32)),
+            verified_with: None,
         }
     }
 

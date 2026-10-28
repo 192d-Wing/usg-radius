@@ -65,7 +65,7 @@ A RADIUS (Remote Authentication Dial-In User Service) server implementation in R
 - **RFC 7170**: EAP-TEAP - TLS tunnel and TLV protocol with Crypto-Binding and MSK derivation (inner methods with real keying material pending)
 - **RFC 9190**: EAP-TLS 1.3 - Version-correct exporter labels and EAP-Key-Name
 
-See [RFC Compliance](docs/docs/protocol/RFC-COMPLIANCE.md) for the gap analysis, including what is not yet implemented (DTLS, CoA over UDP, CRL/OCSP integration).
+See [RFC Compliance](docs/docs/protocol/RFC-COMPLIANCE.md) for the gap analysis, including what is not yet implemented (DTLS, CoA over UDP, delta CRLs).
 
 ## Installation
 

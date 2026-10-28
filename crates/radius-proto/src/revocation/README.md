@@ -515,8 +515,11 @@ If migrating from custom CRL checking:
 ### v0.8.0 - Advanced Features (Phase 3)
 
 - Delta CRL support
-- CRL signing chain validation
-- Indirect CRL support
+- Indirect / Issuing Distribution Point CRL support
+
+CRL and OCSP signature verification against the issuing CA, crlNumber
+tracking and checking of intermediates are implemented; see
+`docs/docs/protocol/RFC-COMPLIANCE.md` (Certificate Revocation).
 - Certificate status monitoring API
 
 ## References

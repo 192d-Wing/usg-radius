@@ -30,6 +30,8 @@ dashmap = { workspace = true, optional = true }
 
 [dev-dependencies]
 hex.workspace = true
+# Revocation tests: throwaway CAs, CRLs and OCSP responder certificates.
+rcgen = "0.14"
 
 [features]
 default = []

@@ -7,7 +7,7 @@ This document identifies gaps between the current USG RADIUS implementation and 
 **Overall Status**: Production-ready for modern enterprise authentication with EAP-TLS over RadSec, server-originated CoA/Disconnect, certificate revocation checking, comprehensive rate limiting, accounting, and security features. Reflects the code at **v0.13.0**.
 
 **Implemented**: Core RADIUS authentication (RFC 2865, PAP + CHAP), Accounting (RFC 2866) on a dedicated 1813/udp socket, Message-Authenticator (RFC 2869 / RFC 3579), EAP-TLS (RFC 5216 / RFC 9190), EAP-TEAP (RFC 9930, Basic-Password-Auth inner method, interoperable with wpa_supplicant), EAP-Nak method negotiation (RFC 3748 §5.3.1), MS-MPPE key delivery (RFC 2548), RadSec (RFC 6614), Status-Server (RFC 5997), CoA/Disconnect (RFC 5176), certificate revocation checking (RFC 5280 CRL, RFC 6960 OCSP) for EAP-TLS supplicant and RadSec NAS certificates, RADIUS proxy with secret re-keying on both legs, Rate Limiting, DoS Protection
-**Partial**: EAP-TEAP inner methods that derive keying material (EAP-MSCHAPv2, inner EAP-TLS), OCSP response signature verification
+**Partial**: EAP-TEAP inner methods that derive keying material (EAP-MSCHAPv2, inner EAP-TLS); certificate revocation (no delta or partitioned CRLs, no hot reload of static CRLs)
 **Missing**: legacy tunneled EAP methods (TTLS/PEAP), DTLS transport, UDP-originated CoA
 
 **Major Milestones Completed**:
@@ -852,16 +852,27 @@ Set `"audit_log_path": "stdout"` (or `"-"`) to emit JSON Lines on stdout for the
 - ✅ `revocation` config block under `eap.tls` (supplicant certificates) and under `radsec` (NAS client certificates): `mode` (`crl_only` default, `ocsp_only`, `prefer_ocsp`, `both`), `on_error` (`fail_closed` default, `fail_open`), `crl.static_files`, `crl.fetch` + timeout/TTL/cache/size limits, `ocsp` timeout/TTL/cache/nonce/size limits. Validated at startup; a binary without the feature rejects a config that asks for it.
 - ✅ The rustls `WebPkiClientVerifier` of each listener is wrapped in `RevocationCheckingVerifier` when the block is present (chain validation first, then revocation); without the block the plain verifier is used unchanged
 - ✅ Static CRL files (PEM/DER) loaded at startup and matched to the certificate's issuer; CRL Distribution Points fetched over HTTP(S) with TTL cache when enabled; `thisUpdate`/`nextUpdate` freshness enforced
-- ✅ OCSP request per RFC 6960 §4.1.1 (issuer taken from the handshake intermediates or the configured CA bundle), RFC 8954 nonce, response cache bounded by `nextUpdate`
+- ✅ **Chain**: after WebPKI validation the verifier links the end-entity certificate through the peer's intermediates to a self-issued certificate in `ca_path`, each step by issuer Name *and* signature (an intermediate the peer made up cannot stand in for the real one), and checks **every certificate except the trust anchor** against its own issuer — intermediates as well as the end entity. Peer intermediates count only if they are CA certificates (basicConstraints cA) valid at the time — WebPKI's own criteria — so an expired twin cannot hide a revoked one; certificates in `ca_path` are trusted as configured, like WebPKI's anchors. When more than one path links through intermediates (a renewal under the same Name and key, cross-certificates), every such path is checked and any revoked link rejects, whatever the peer's ordering (a node that links directly to a self-issued anchor is not extended further; see Limitations). Path building is budgeted because the peer controls the intermediates: each certificate is parsed once, each (certificate, issuer) signature verified at most once, and more than 64 signature verifications, 32 path extensions or 8 complete paths rejects the handshake regardless of `on_error`. An issuing CA placed in `ca_path` next to its root is linked to the root and checked like an intermediate; a path that cannot reach a self-issued anchor ends at the furthest configured certificate on it (so a peer appending its root behind a configured issuing CA changes nothing)
+- ✅ **CRL signatures (RFC 5280 §6.3.3)**: a CRL — static file or Distribution Point alike — is used only if its issuer Name equals the issuing CA's subject, the CA's keyUsage (when present) asserts cRLSign (§4.2.1.3), TBSCertList.signature equals signatureAlgorithm (§5.1.1.2), and the signature verifies with the CA's public key. Unsigned, wrongly signed or tampered CRLs are unusable and the fail policy applies (rejected under the default `fail_closed`). Verification uses the rustls `CryptoProvider`'s signature algorithms (aws-lc-rs; the listener's FIPS provider for RadSec), no second crypto implementation
+- ✅ **crlNumber (RFC 5280 §5.2.3)** tracked per issuer (Name and verifying key): a CRL with a lower crlNumber than one already accepted for that issuer (or none, after a numbered one) is refused, so an older still-unexpired CRL cannot be replayed to hide a later revocation; of several static files for one issuer the highest crlNumber is consulted first
+- ✅ CRLs that cannot be processed correctly are rejected rather than misread: delta CRLs, Issuing Distribution Point (partitioned/indirect) CRLs, and unrecognized critical CRL or CRL entry extensions (§5.2, §5.3). A CRL without nextUpdate is refused (conforming issuers MUST include it, §5.1.2.5), so an old CRL cannot be current forever
+- ✅ OCSP request per RFC 6960 §4.1.1 (SHA-256 CertID; issuer taken from the linked chain), byte-identical to `openssl ocsp -sha256` (known-answer test), 32-octet RFC 8954 nonce (§2.1; RFC 9654 keeps the length), response cache keyed by the full CertID and bounded by both `nextUpdate` and `ocsp.cache_ttl_secs`
+- ✅ **OCSP response verification (RFC 6960 §3.2, §4.2.2.2)**: the response must be a BasicOCSPResponse with a SingleResponse for exactly the requested CertID; its signature must verify with the issuing CA's key, or with the key of a delegated responder certificate (from the response's `certs`) that the CA issued directly, that carries id-kp-OCSPSigning, whose keyUsage (if present) permits signing, that carries no unrecognized critical extension, and that is within its validity period; ResponderID byName must name the signer. id-pkix-ocsp-nocheck is honoured for the responder certificate only; without it the responder certificate is checked against the CA's CRL (modes with a CRL source) or the response is unusable (`ocsp_only`). thisUpdate may lead the local clock by at most 5 minutes; nextUpdate must not have passed, and a response without nextUpdate must have a thisUpdate no older than `ocsp.cache_ttl_secs` (§3.2 item 5, "sufficiently recent"), on first use and again on every cache hit, so a recorded response without a nonce cannot be replayed indefinitely. Unrecognized critical response or single extensions are refused (§4.4); an explicitly encoded `critical FALSE` is tolerated. A certificate in `certs` that made the signature but is not authorized only disqualifies itself (`certs` is unsigned), so an expired copy listed first does not mask the current responder certificate. Error responses (unsigned per §2.3) are never treated as an answer
+- ✅ CRL and OCSP HTTP fetches read at most the configured size limit (the body is never buffered whole first) and do not follow redirects
 - ✅ Fail-closed by default: an undeterminable status (no source covers the issuer, fetch/parse/freshness error, responder unreachable) rejects the client; `fail_open` accepts and logs. A positive "revoked" always rejects
 - ✅ Access-Rejects that end an EAP conversation carry EAP-Failure (RFC 3579 §2.6.3), so a revoked supplicant fails promptly rather than by timeout
-- ✅ Tests: config parsing/validation, verifier selection, static-CRL rejection with an rcgen-generated CRL (EAP-TLS verifier and RadSec listener), and the interop harness (revoked `revoked@usg.test` fails with EAP-Failure, valid `eaptls@usg.test` succeeds, both directly and through the proxy; FreeRADIUS/eapol_test)
+- ✅ Tests: config parsing/validation, verifier selection, static-CRL rejection with an rcgen-generated CRL (EAP-TLS verifier and RadSec listener); rcgen fixtures for a signed CRL accepted (ECDSA P-256, P-384, Ed25519), a CRL signed by the wrong key / tampered / from an issuer without cRLSign / with a mismatched signatureAlgorithm rejected, delta, IDP and unrecognized-critical-extension CRLs rejected, stale or missing crlNumber rejected, a revoked intermediate rejected (also behind an expired same-key twin, on either of two same-key paths in either order and under fail-open, and as an issuing CA in the bundle), a peer-appended root behind a configured issuing CA ignored, an expired configured issuing CA still anchoring, a peer intermediate without keyCertSign linked as WebPKI does, chain padding (complete paths, and dead-end certificates exhausting the signature budget) rejected under fail-open, a made-up intermediate refused, OCSP responses signed by the CA and by a delegated responder accepted, a responder without the EKU, an unrelated key and an impostor CA's responder rejected, responders with a non-signing keyUsage, outside their validity or with an unknown critical extension rejected, an expired copy of the responder certificate not masking the current one, CertID, ResponderID, nonce, future-thisUpdate, max-age (overflow-safe) and unknown-critical-extension cases; the bounded HTTP body reader; OpenSSL-generated known-answer fixtures (OCSP request bytes; ECDSA CA-signed, delegated-responder-signed and revoked responses; RSA PKCS#1 v1.5 and PSS responses and CRLs); and the interop harness (revoked `revoked@usg.test` fails with EAP-Failure, valid `eaptls@usg.test` succeeds, both directly and through the proxy; the valid certificate is rejected by a server whose static CRL names the CA but is signed by another key, and that server's log shows the signature failure as the reason; FreeRADIUS/eapol_test, OpenSSL-issued CRLs)
 
 **Limitations**:
 
-- ⚠️ CRL and OCSP response **signatures are not verified** by the module (a CRL fetched from a Distribution Point, or an OCSP response, is trusted as delivered). Static CRL files sit in the same trust position as the CA bundle; for fetched sources use HTTPS Distribution Points / responders on a trusted path, or prefer `crl.static_files`. OCSP mode logs a startup warning for this reason
 - ⚠️ CRL/OCSP fetches block the TLS handshake for up to the configured timeout (default 5 s); size the timeout against the NAS's RADIUS timeout
-- ⚠️ Only the end-entity certificate is checked (not intermediates); no delta CRLs; the CRL `nextUpdate` is enforced but `crlNumber` is not tracked
+- ⚠️ No delta CRLs and no Issuing Distribution Point (partitioned or indirect) CRLs: such CRLs are rejected (fail policy applies), so a CA that publishes only those needs OCSP. CRL signers other than the certificate's issuer (indirect CRLs, §6.3.3 (b)) are not supported
+- ⚠️ Because intermediates are checked too, every CA below the trust anchor needs a CRL (static or Distribution Point) or an OCSP responder in the configured mode; a chain that cannot be linked to `ca_path` is undeterminable (rejected under `fail_closed`)
+- ⚠️ ResponderID byKey (a SHA-1 key hash) is not compared; the signer is identified by signature verification against the CA and the response's `certs`. A locally configured OCSP signing authority (§4.2.2.2 item 1) is not supported
+- ⚠️ CertIDs are SHA-256 only: a responder that answers only SHA-1 CertIDs (the RFC 5019 lightweight profile) yields no usable answer (fail policy applies). The CertID hash uses RustCrypto `sha2`, not aws-lc; signatures use the rustls provider
+- ⚠️ A responder that does not echo the nonce is accepted (bounded by nextUpdate, or by `ocsp.cache_ttl_secs` without one); there is no switch to require the echo
+- ⚠️ Path-building gaps (fix loop capped; open decisions): (1) a certificate that links directly to a self-issued anchor in `ca_path` is not also extended through other issuers, so a revoked cross-certificate the peer sends next to such an anchor — one WebPKI may validate through, e.g. when the anchor's name constraints fail — is not checked; (2) configured certificates count toward the 8-path / 32-extension budget, so a `ca_path` bundle with nine or more same-key versions of a CA, or a bridge-style (FPKI-like) bundle with three or more cross-certificate tiers, exceeds it and every handshake through it is rejected regardless of `on_error`. Keep `ca_path` to the roots (and issuing CAs) actually in use
+- ⚠️ crlNumber state lives in memory: it is reset on restart, and an older CRL accepted first is superseded only once a newer one is seen
 - ⚠️ Static CRL files are read once at startup (no hot reload)
 
 **Files**:
@@ -1099,7 +1110,7 @@ Total:         156+ tests
    ordering tests pending)
 4. ❌ **Hot Configuration Reload** - Deferred (only the mgmt access policy reloads on SIGHUP)
 5. ✅ **Health Monitoring** - Status-Server per RFC 5997 (Message-Authenticator required and verified, reply code by port, Proxy-State echoed, proxy answers locally) and conformant home-server probes (v0.13.0); replies are not tied to backend health
-6. ✅ **Certificate Revocation (CRL/OCSP)** - CRL (static files + Distribution Points) and OCSP checking of EAP-TLS supplicant and RadSec NAS certificates via the `revocation` block, fail-closed by default (v0.12.0); CRL/OCSP signature verification still pending
+6. ✅ **Certificate Revocation (CRL/OCSP)** - CRL (static files + Distribution Points) and OCSP checking of EAP-TLS supplicant and RadSec NAS certificates via the `revocation` block, fail-closed by default (v0.12.0); CRL signatures (RFC 5280 §6.3.3), crlNumber monotonicity, OCSP response signatures and responder authorization (RFC 6960 §3.2, §4.2.2.2) verified, intermediates checked (unreleased)
 7. ✅ **MS-MPPE Keys** - MS-MPPE-Send/Recv-Key (RFC 2548 §2.4) attached to EAP Access-Accepts (v0.11.0)
 
 ### Priority 4 (LOW) - ❌ NOT PLANNED
@@ -1141,7 +1152,7 @@ Total:         156+ tests
 | CoA/Disconnect | 5176 | ✅ RadSec only | v0.10.0 | MEDIUM | Server-originated via mgmt API; no UDP path |
 | NAS Identification | 2865 | ✅ Complete | v0.2.0 | MEDIUM | NAS-IP-Address or NAS-Identifier enforced |
 | Enumerated Values | 2865 | ✅ Strict mode | v0.2.0 | LOW | Lenient mode accepts unknown values |
-| Certificate Revocation | 5280 / 6960 | ✅ Integrated | v0.7.x / v0.12.0 | HIGH | `revocation` block for EAP-TLS + RadSec, fail-closed default; CRL/OCSP signatures not verified |
+| Certificate Revocation | 5280 / 6960 / 8954 | ✅ Integrated | v0.7.x / v0.12.0 / unreleased | HIGH | `revocation` block for EAP-TLS + RadSec, fail-closed default; CRL and OCSP signatures verified against the issuing CA (delegated responders need id-kp-OCSPSigning), crlNumber tracked, whole chain checked; no delta / IDP CRLs |
 | Accounting Port 1813 | 2866 | ✅ Bound | v0.13.0 | - | `accounting_port`: 1813 (default) / `"shared"` / `"disabled"`; replies from 1813; wrong-port codes discarded |
 | Proxy-State | 2865 | ⚠️ Echoed | v0.x | MEDIUM | Ordering test on the Status-Server path; Access-Accept/Reject ordering tests pending |
 | Hot Reload | - | ❌ Deferred | - | MEDIUM | Only mgmt access policy reloads on SIGHUP |
@@ -1219,7 +1230,7 @@ The current implementation is **PRODUCTION-READY** for:
    - Server-originated over RadSec only; no UDP (port 3799) path
 
 4. **Certificate Revocation**
-   - CRL and OCSP signatures are not verified; fetches block the handshake for up to the configured timeout
+   - No delta or Issuing Distribution Point CRLs; fetches block the handshake for up to the configured timeout
 
 ---
 
@@ -1281,7 +1292,8 @@ The current implementation is **PRODUCTION-READY** for:
 
 3. **Certificate Lifecycle**
    - ✅ CRL/OCSP revocation checking of supplicant and NAS certificates at handshake time (`revocation` block, fail-closed default)
-   - ⚠️ CRL/OCSP signatures not verified; static CRL files read once at startup
+   - ✅ CRL and OCSP response signatures verified against the issuing CA (RFC 5280 §6.3.3, RFC 6960 §3.2), delegated OCSP responders must carry id-kp-OCSPSigning, crlNumber rollback refused, intermediates checked as well as the end entity
+   - ⚠️ Static CRL files read once at startup; crlNumber state not persisted across restarts
    - ⚠️ No certificate hot-rotation for RadSec or EAP-TLS
 
 4. **EAP Resource Exhaustion**
@@ -1333,10 +1345,9 @@ The USG RADIUS server is **production-ready** for modern enterprise deployments 
 
 **Next Development Priorities**:
 
-1. Verify CRL and OCSP response signatures against the issuing CA (the module trusts fetched data as delivered)
-2. EAP-TEAP inner methods with real keying material (EAP-MSCHAPv2, inner EAP-TLS) and the EMSK-based S-IMCK chain (RFC 9930 §6.2.2)
-3. Hot configuration reload (including static CRL files)
-4. Administrative enable/disable switch for Status-Server acceptance (RFC 5997 §4.2 SHOULD)
+1. EAP-TEAP inner methods with real keying material (EAP-MSCHAPv2, inner EAP-TLS) and the EMSK-based S-IMCK chain (RFC 9930 §6.2.2)
+2. Hot configuration reload (including static CRL files)
+3. Administrative enable/disable switch for Status-Server acceptance (RFC 5997 §4.2 SHOULD)
 
 ---
 

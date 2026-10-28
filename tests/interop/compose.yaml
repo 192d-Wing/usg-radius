@@ -8,6 +8,7 @@
 #                                   --[proxy-usghome-secret-4]-->    usg-home   10.77.0.30  (realm usg.test)
 #     --[nas-usghome-secret-3]--> usg-home  10.77.0.30   (EAP-TLS with CRL checking, no proxy)
 #     --[nas-usghome-secret-3]--> usg-home  10.77.0.30:1813  (Accounting-Request, Status-Server -> Accounting-Response)
+#     --[nas-usghome-secret-3]--> usg-home-badcrl 10.77.0.31  (EAP-TLS, static CRL signed by the wrong key)
 #
 # Fixed host numbers (.10 .20 .30 .40): the servers' client lists and the
 # proxy's home-server entry are plain IPs, which keeps the configs free of DNS
@@ -70,6 +71,20 @@ services:
     depends_on:
       - usg-proxy
 
+  # Same image and server certificate as usg-home; its only static CRL is
+  # certs/ca-wrongkey.crl (issuer = the test CA, signed by another key).
+  usg-home-badcrl:
+    image: usg-radius-interop/usg-radius:${INTEROP_PROJECT:-latest}
+    command: ["/etc/radius/home-badcrl.json"]
+    networks:
+      radius:
+        ipv4_address: ${INTEROP_NET:-10.77.0}.31
+    volumes:
+      - ${INTEROP_CONF:-.}/usg-radius/home-badcrl.json:/etc/radius/home-badcrl.json:ro
+      - ${INTEROP_CERTS:-./certs}:/certs:ro
+    depends_on:
+      - usg-proxy
+
   nas:
     build: ./eapol_test
     image: usg-radius-interop/eapol_test:${INTEROP_PROJECT:-latest}
@@ -82,8 +97,10 @@ services:
       FREERADIUS: ${INTEROP_NET:-10.77.0}.10
       PROXY: ${INTEROP_NET:-10.77.0}.20
       USG_HOME: ${INTEROP_NET:-10.77.0}.30
+      USG_HOME_BADCRL: ${INTEROP_NET:-10.77.0}.31
     profiles: ["test"]
     depends_on:
       - freeradius
       - usg-proxy
       - usg-home
+      - usg-home-badcrl

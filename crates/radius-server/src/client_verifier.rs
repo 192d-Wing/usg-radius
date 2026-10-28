@@ -90,6 +90,11 @@ pub fn build_client_verifier(
     revocation: Option<&RevocationConfig>,
 ) -> Result<ClientVerifier, ClientVerifierError> {
     let roots = Arc::new(crate::tls_certs::load_root_store(ca_path)?);
+    // CRL/OCSP signatures are verified with the same algorithms as the chain.
+    #[cfg(feature = "revocation")]
+    let signature_algorithms = provider
+        .as_ref()
+        .map(|provider| provider.signature_verification_algorithms);
     let webpki = match provider {
         Some(provider) => WebPkiClientVerifier::builder_with_provider(roots, provider),
         None => WebPkiClientVerifier::builder(roots),
@@ -101,18 +106,22 @@ pub fn build_client_verifier(
         None => Ok(ClientVerifier::WebPki(webpki)),
         #[cfg(feature = "revocation")]
         Some(cfg) => {
-            // The CA certificates double as issuer candidates for OCSP requests
-            // (peers rarely send their issuer as an intermediate).
+            // The CA certificates anchor the chain the revocation checks walk:
+            // CRL and OCSP signatures are trusted only when they chain to one,
+            // and they are the OCSP request issuer (peers rarely send theirs).
             let issuers: Vec<Vec<u8>> = CertificateDer::pem_file_iter(ca_path)?
                 .map(|c| c.map(|c| c.as_ref().to_vec()))
                 .collect::<Result<_, _>>()?;
-            let verifier =
+            let mut verifier =
                 radius_proto::revocation::RevocationCheckingVerifier::with_webpki_verifier(
                     cfg.to_proto(),
                     webpki,
                 )
                 .map_err(|e| ClientVerifierError::Revocation(e.to_string()))?
                 .with_issuer_certificates(issuers);
+            if let Some(algorithms) = signature_algorithms {
+                verifier = verifier.with_signature_verification_algorithms(algorithms);
+            }
             Ok(ClientVerifier::RevocationChecking(Arc::new(verifier)))
         }
         #[cfg(not(feature = "revocation"))]
@@ -182,6 +191,8 @@ mod tests {
         _dir: tempfile::TempDir,
         ca_path: String,
         crl_path: String,
+        /// Empty CRL naming the CA as issuer, signed by another key.
+        forged_crl_path: String,
         revoked_der: CertificateDer<'static>,
         valid_der: CertificateDer<'static>,
     }
@@ -237,6 +248,18 @@ mod tests {
         .signed_by(&issuer)
         .unwrap();
 
+        let forger_key = KeyPair::generate().unwrap();
+        let forged_crl = CertificateRevocationListParams {
+            this_update: date_time_ymd(2026, 1, 1),
+            next_update: date_time_ymd(2099, 1, 1),
+            crl_number: SerialNumber::from(2u64),
+            issuing_distribution_point: None,
+            revoked_certs: Vec::new(),
+            key_identifier_method: KeyIdMethod::Sha256,
+        }
+        .signed_by(&Issuer::from_params(&ca_params, &forger_key))
+        .unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let write = |name: &str, data: &[u8]| {
             let path = dir.path().join(name);
@@ -249,6 +272,7 @@ mod tests {
         TestPki {
             ca_path: write("ca.pem", ca.pem().as_bytes()),
             crl_path: write("ca.crl", crl.der().as_ref()),
+            forged_crl_path: write("forged.crl", forged_crl.der().as_ref()),
             revoked_der: revoked.der().clone(),
             valid_der: valid.der().clone(),
             _dir: dir,
@@ -342,6 +366,27 @@ mod tests {
                     err,
                     rustls::Error::InvalidCertificate(rustls::CertificateError::Revoked),
                     "revoked is revoked even under fail-open ({on_error:?})"
+                );
+            }
+        }
+
+        #[test]
+        fn crl_signed_by_another_key_is_not_trusted() {
+            // Names the real CA, revokes nothing, signed by a different key: a
+            // forged "all clear". Fail-closed rejects even the valid certificate,
+            // and never as "revoked".
+            let pki = gen_pki();
+            let mut cfg = static_crl(&pki, RevocationFailurePolicy::FailClosed);
+            cfg.crl.static_files = vec![pki.forged_crl_path.clone()];
+            let v = build_client_verifier(&pki.ca_path, None, Some(&cfg)).unwrap();
+            for cert in [&pki.valid_der, &pki.revoked_der] {
+                let err = verify(&v, cert).expect_err("forged CRL must not be trusted");
+                assert!(
+                    matches!(
+                        err,
+                        rustls::Error::InvalidCertificate(rustls::CertificateError::Other(_))
+                    ),
+                    "{err:?}"
                 );
             }
         }
