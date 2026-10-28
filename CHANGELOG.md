@@ -96,8 +96,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `examples/configs/proxy-radsec-upstream.json`; `examples/proxy_config.json`
   gains a `radsec_pool`. The Status-Server probe under `"radsec"` is pinned by
   an independent Python known-answer vector
-  (`tests/vectors/radsec_status_server_vector.py`). Interop: a new scenario
-  (nine assertions) proxies EAP-TLS (eapol_test) and PAP (radclient) through
+  (`tests/vectors/radsec_status_server_vector.py`). Interop: scenario 16
+  (nine assertions, 86 in total across sixteen scenarios) proxies EAP-TLS
+  (eapol_test) and PAP (radclient) through
   usg-radius to FreeRADIUS 3.2.7 over RadSec with a different secret on the
   NAS hop (the supplicant's MS-MPPE keys match, the wrong password gets an
   Access-Reject), and twelve host-side checks confirm from the FreeRADIUS and

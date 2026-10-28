@@ -1,6 +1,6 @@
 # Interop test: usg-radius as proxy and as EAP-TLS / EAP-TEAP home server
 # against FreeRADIUS 3.2 and eapol_test (wpa_supplicant 2.12), driven by
-# tests/interop/run.sh. Seventy-six assertions in the nas container plus twelve
+# tests/interop/run.sh. Eighty-six assertions in the nas container plus twelve
 # host-side checks (proxy probes, RadSec hop); the job fails if any one fails.
 # See docs/docs/development/INTEROP_TESTING.md.
 #
@@ -38,6 +38,10 @@ env:
   # CARGO_BUILD_JOBS build arg (default 2, sized for a small Lima VM); the
   # ubuntu-latest runner has 4 vCPUs.
   CARGO_BUILD_JOBS: 4
+  # run.sh otherwise derives a per-run compose project name (so concurrent runs
+  # on one Docker host stay apart); a fixed one lets the log-collection step
+  # below address the containers run.sh left up with KEEP=1.
+  INTEROP_PROJECT: usg-radius-interop-ci
 
 jobs:
   interop:
@@ -140,11 +144,11 @@ jobs:
         working-directory: tests/interop
         run: |
           for service in freeradius usg-proxy usg-home; do
-            docker compose -f compose.yaml logs --no-color --timestamps "$service" \
+            docker compose -p "$INTEROP_PROJECT" -f compose.yaml logs --no-color --timestamps "$service" \
               > "$RUNNER_TEMP/interop-logs/$service.log" 2>&1 || true
           done
-          docker compose -f compose.yaml ps -a > "$RUNNER_TEMP/interop-logs/compose-ps.txt" 2>&1 || true
-          docker compose -f compose.yaml --profile test down --remove-orphans --timeout 2 || true
+          docker compose -p "$INTEROP_PROJECT" -f compose.yaml ps -a > "$RUNNER_TEMP/interop-logs/compose-ps.txt" 2>&1 || true
+          docker compose -p "$INTEROP_PROJECT" -f compose.yaml --profile test down --remove-orphans --timeout 2 || true
 
       # run.log holds run.sh's output: the PASS/FAIL line per assertion, the
       # eapol_test / radclient summaries and the per-check log tails. The

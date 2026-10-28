@@ -808,23 +808,50 @@ async fn test_duplicate_request_detection() {
         42, // Use specific ID
     );
 
-    // First request should succeed
-    let response1 = send_radius_request(&packet, server_addr)
-        .await
-        .expect("First request failed");
-    assert_eq!(response1.code, Code::AccessAccept);
+    // The NAS sends from one socket, so its retransmissions keep the
+    // original source address and port.
+    let nas = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let exchange = |bytes: Vec<u8>| {
+        let nas = &nas;
+        async move {
+            nas.send_to(&bytes, server_addr).await.unwrap();
+            let mut buf = [0u8; 4096];
+            tokio::time::timeout(Duration::from_millis(500), nas.recv_from(&mut buf))
+                .await
+                .ok()
+                .map(|r| buf[..r.unwrap().0].to_vec())
+        }
+    };
+    let bytes = packet.encode().unwrap();
 
-    // Immediate duplicate should be silently dropped (no response)
+    // First request should succeed
+    let reply1 = exchange(bytes.clone()).await.expect("First request failed");
+    assert_eq!(Packet::decode(&reply1).unwrap().code, Code::AccessAccept);
+
+    // RFC 5080 §2.2.2: a byte-identical retransmission (the NAS lost the
+    // reply) is answered with the same reply, without processing it again.
+    let reply2 = exchange(bytes.clone())
+        .await
+        .expect("a retransmission must get the cached reply");
+    assert_eq!(reply2, reply1, "the retransmission got a different reply");
+
+    // The same bytes from another source port are not this NAS's
+    // retransmission: dropped, the cached reply goes only where the original
+    // came from.
     let result = tokio::time::timeout(
-        Duration::from_millis(100),
+        Duration::from_millis(300),
         send_radius_request(&packet, server_addr),
     )
     .await;
+    assert!(result.is_err(), "a copy from another port must be dropped");
 
-    // Should timeout because duplicate requests are silently dropped
+    // Same Identifier and Request Authenticator, different content: not a
+    // retransmission, silently dropped (no response).
+    let mut altered = packet.clone();
+    altered.add_attribute(Attribute::string(AttributeType::NasIdentifier as u8, "other").unwrap());
     assert!(
-        result.is_err(),
-        "Duplicate request should timeout (be silently dropped)"
+        exchange(altered.encode().unwrap()).await.is_none(),
+        "a conflicting duplicate should time out (be silently dropped)"
     );
 }
 

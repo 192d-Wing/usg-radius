@@ -56,11 +56,49 @@ tail of each eapol_test / radclient log and the three servers' logs.
 
 | Variable | Effect |
 |----------|--------|
-| `KEEP=1` | leave the servers running for manual poking (`docker compose -f tests/interop/compose.yaml down` to stop) |
+| `KEEP=1` | leave the servers running for manual poking; `run.sh` prints the `docker compose ... down` command that stops them |
 | `LOGS=1` | print the servers' logs even on success (`LOG_TAIL` lines, default 400) |
 | `INTEROP_VERBOSE=1` | on failure, print the complete eapol_test logs instead of the tails |
 | `DOCKER="limactl shell myvm docker"` | use an explicit docker CLI |
-| `INTEROP_REGEN_CERTS=1` | regenerate `tests/interop/certs/` |
+| `INTEROP_PROJECT=name` | compose project name (default `usg-radius-interop-<path hash>-<pid>`, unique per run) |
+| `INTEROP_NET=10.77.5` | the /24 for the compose network (default: the first free `10.77.N`) |
+| `INTEROP_REGEN_CERTS=1` | regenerate the certificates of a reused `INTEROP_PROJECT` |
+
+### Concurrent runs
+
+Several worktrees can run `run.sh` at the same time against one Docker host
+(the shared Lima VM, say) without seeing each other. Each run gets:
+
+- its own compose project, `usg-radius-interop-<hash of the checkout path>-<pid>`
+  unless `INTEROP_PROJECT` is set, so its containers, network and volumes are
+  its own;
+- its own image tag (`usg-radius-interop/<image>:<project>`), so a run never
+  starts another worktree's usg-radius build;
+- its own /24. Docker refuses overlapping subnets, so a fixed `10.77.0.0/24`
+  would stop a second run. `run.sh` skips the `10.77.N.0/24` networks already
+  on the host, starts from a point derived from the project name, and moves to
+  the next one if a concurrent run claims the same /24 first. The servers'
+  configs and the `nas` container's targets use `.10`/`.20`/`.30`/`.40` in that
+  /24; `run.sh` renders `freeradius/` and `usg-radius/` with the prefix
+  replaced;
+- its own run directory, `tests/interop/.runs/<project>/` (git-ignored):
+  `certs/` (the test PKI), `net-<prefix>-<pid>/` (the rendered configs and
+  `compose.env`, the values compose interpolates; a file because `limactl
+  shell` does not forward the environment) and, at teardown,
+  `logs/<service>.log`. `run.sh` writes a new `net-*` directory per subnet
+  attempt instead of rewriting files: Lima's virtiofs mount can hand the VM the
+  old size of a file rewritten a moment earlier, which truncates it.
+
+No container names and no host ports are fixed: the `nas` container talks to
+the servers over the compose network. A future scenario that needs a host port
+should publish the container port alone (`"1812/udp"`) and read the ephemeral
+host port back with `docker compose -p <project> port <service> 1812/udp`.
+
+Teardown runs on success, failure, `^C` and `SIGTERM`, and removes only this
+run's containers (including the `nas` one-off), network, volumes and images.
+The run directory is deleted after a passing run and kept, with the server
+logs, after a failing or interrupted one; delete `tests/interop/.runs/` at any
+time when no run is in progress.
 
 Files are under `tests/interop/`: `compose.yaml`, `gen-certs.sh`, the
 FreeRADIUS configuration (`freeradius/`), the two usg-radius configurations
@@ -100,9 +138,9 @@ image build (default 2).
 
 ## What is checked
 
-Seventy-six assertions across fifteen scenarios inside the `nas` container,
+Eighty-six assertions across sixteen scenarios inside the `nas` container,
 plus twelve host-side checks in `run.sh` (the proxy's probes to its three home
-servers, §14, and the RadSec hop, §15). All pass on the current tree (run
+servers, §14, and the RadSec hop, §16). All pass on the current tree (run
 `tests/interop/run.sh`).
 
 ### 1 & 2 — EAP-TLS through the proxy to FreeRADIUS
@@ -311,13 +349,41 @@ Message-Authenticator under the home secret; the unit tests in
 a fake home server that verifies the Message-Authenticator and signs its
 reply.
 
-### 15 — EAP-TLS and PAP through the proxy to FreeRADIUS over RadSec (RFC 6614)
+### 15 — Retransmitted Access-Requests get the cached reply (RFC 5080 §2.2.2)
+
+radclient and eapol_test never resend an Access-Request that was answered,
+so the NAS here is `eapol_test/retransmit-tests.sh`, a bash script that
+builds each Access-Request itself (User-Name, NAS-Identifier, EAP-Message,
+and a Message-Authenticator computed with `openssl` HMAC-MD5 under the NAS
+secret, RFC 3579 §3.2) and sends it twice from one `/dev/udp` socket: a true
+retransmission, same source port, RADIUS Identifier, Request Authenticator
+and bytes. Against usg-home:
+
+- EAP-Response/Identity → Access-Challenge whose Response Authenticator
+  (RFC 2865 §3) and Message-Authenticator (RFC 3579 §3.2) verify, carrying a 16-octet State that does not contain the
+  User-Name; the retransmission gets the **identical** Access-Challenge. The
+  State is random per conversation, so an identical second reply can only be
+  the cached one: processing the request again would have started a second
+  conversation with a different State. Before this change the retransmission
+  got no reply at all (the duplicate cache dropped it).
+- An EAP-Nak (RFC 3748 §5.3.1) answering the outstanding Request, offering no
+  method, ends the conversation: Access-Reject with an EAP-Failure carrying
+  the Nak's Identifier (RFC 3579 §2.6.3), both authenticators verified; its
+  retransmission gets the **identical** final Access-Reject, although the
+  conversation no longer exists.
+
+The final Access-Accept of a full EAP-TLS conversation, and the binding of
+the State to the NAS and User-Name, are covered by unit tests in
+`crates/radius-server/src/eap_auth.rs` (`retransmitted_requests_get_the_cached_reply_byte_for_byte`,
+`state_from_another_nas_or_user_is_rejected_without_touching_the_conversation`).
+
+### 16 — EAP-TLS and PAP through the proxy to FreeRADIUS over RadSec (RFC 6614)
 
 `proxy.json` routes realm `radsec.test` to the same FreeRADIUS as scenarios
 1–3, but through a home server entry with `"transport": "radsec"` and a `tls`
 block (`/certs/ca.crt`, `/certs/usg-proxy.crt`, `/certs/usg-proxy.key`,
 `server_name: "freeradius"`) and no `secret`: the proxy keeps one TLS 1.3
-connection to `10.77.0.10:2083` and re-keys User-Password, the MS-MPPE keys
+connection to `<INTEROP_NET>.10:2083` (`10.77.0.10` by default) and re-keys User-Password, the MS-MPPE keys
 and both authenticators between `nas-proxy-secret-1` and the fixed `"radsec"`.
 FreeRADIUS's client entry for the proxy (`clients radsec`) has
 `require_message_authenticator = yes`, so nothing on that hop is accepted
@@ -401,11 +467,13 @@ supplicant) and only appeared against OpenSSL-based peers:
 
 `run.sh` prints, on failure, the tail of each eapol_test / radclient log and
 the three servers' logs. `INTEROP_VERBOSE=1` prints the full eapol_test logs.
-To iterate by hand, `KEEP=1 tests/interop/run.sh` leaves the servers up, then:
+To iterate by hand, `INTEROP_PROJECT=dbg INTEROP_NET=10.77.0 KEEP=1
+tests/interop/run.sh` leaves the servers up under a name and addresses you
+chose, then:
 
 ```bash
 cd tests/interop
-docker compose run --rm --no-deps --entrypoint eapol_test nas \
+docker compose -p dbg --env-file .runs/dbg/net-10.77.0-*/compose.env run --rm --no-deps --entrypoint eapol_test nas \
     -c /etc/eapol_test/eap-tls-usg.conf -a 10.77.0.30 -p 1812 \
     -s nas-usghome-secret-3 -r 0 -t 12 -e
 ```

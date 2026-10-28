@@ -10,34 +10,43 @@
 #     --[nas-usghome-secret-3]--> usg-home  10.77.0.30   (EAP-TLS with CRL checking, no proxy)
 #     --[nas-usghome-secret-3]--> usg-home  10.77.0.30:1813  (Accounting-Request, Status-Server -> Accounting-Response)
 #
-# Fixed addresses: the servers' client lists and the proxy's home-server entry
-# are plain IPs, which keeps the configs free of DNS and of compose internals.
+# Fixed host numbers (.10 .20 .30 .40): the servers' client lists and the
+# proxy's home-server entry are plain IPs, which keeps the configs free of DNS
+# and of compose internals. The 10.77.0 prefix is the default only: run.sh
+# gives every run its own project name, /24 (INTEROP_NET), test PKI
+# (INTEROP_CERTS), configs rendered for that /24 (INTEROP_CONF) and image tag,
+# so runs from different worktrees can share one Docker host. Nothing publishes
+# a host port; the nas container reaches the servers over this network. A
+# scenario that does need one should publish the container port alone
+# ("1812/udp") and read the ephemeral host port back with `compose port`.
 #
 # The RadSec hop (RFC 6614) is the one RADIUS hop carried over TLS: the proxy
-# authenticates with certs/usg-proxy.crt, FreeRADIUS with
-# certs/freeradius-server.crt (server_name "freeradius"), both under certs/ca.crt.
-name: usg-radius-interop
+# authenticates with <certs>/usg-proxy.crt, FreeRADIUS with
+# <certs>/freeradius-server.crt (server_name "freeradius"), both under
+# <certs>/ca.crt; freeradius/sites-radsec is rendered for the run's /24 like
+# every other config under freeradius/ and usg-radius/.
+name: ${INTEROP_PROJECT:-usg-radius-interop}
 
 networks:
   radius:
     driver: bridge
     ipam:
       config:
-        - subnet: 10.77.0.0/24
+        - subnet: ${INTEROP_NET:-10.77.0}.0/24
 
 services:
   freeradius:
     build: ./freeradius
-    image: usg-radius-interop/freeradius
+    image: usg-radius-interop/freeradius:${INTEROP_PROJECT:-latest}
     networks:
       radius:
-        ipv4_address: 10.77.0.10
+        ipv4_address: ${INTEROP_NET:-10.77.0}.10
     volumes:
-      - ./freeradius/clients.conf:/etc/freeradius/3.0/clients.conf:ro
-      - ./freeradius/eap:/etc/freeradius/3.0/mods-available/eap:ro
-      - ./freeradius/authorize:/etc/freeradius/3.0/mods-config/files/authorize:ro
-      - ./freeradius/sites-radsec:/etc/freeradius/3.0/sites-enabled/radsec:ro
-      - ./certs:/etc/freeradius/interop-certs:ro
+      - ${INTEROP_CONF:-.}/freeradius/clients.conf:/etc/freeradius/3.0/clients.conf:ro
+      - ${INTEROP_CONF:-.}/freeradius/eap:/etc/freeradius/3.0/mods-available/eap:ro
+      - ${INTEROP_CONF:-.}/freeradius/authorize:/etc/freeradius/3.0/mods-config/files/authorize:ro
+      - ${INTEROP_CONF:-.}/freeradius/sites-radsec:/etc/freeradius/3.0/sites-enabled/radsec:ro
+      - ${INTEROP_CERTS:-./certs}:/etc/freeradius/interop-certs:ro
 
   usg-proxy:
     build:
@@ -47,38 +56,42 @@ services:
         # Parallel rustc jobs inside the image build. The Dockerfile default (2)
         # suits a small Lima VM; CI exports 4 for the 4-vCPU runner.
         CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-2}
-    image: usg-radius-interop/usg-radius
+    image: usg-radius-interop/usg-radius:${INTEROP_PROJECT:-latest}
     command: ["/etc/radius/proxy.json"]
     networks:
       radius:
-        ipv4_address: 10.77.0.20
+        ipv4_address: ${INTEROP_NET:-10.77.0}.20
     volumes:
-      - ./usg-radius/proxy.json:/etc/radius/proxy.json:ro
+      - ${INTEROP_CONF:-.}/usg-radius/proxy.json:/etc/radius/proxy.json:ro
       # CA bundle, client certificate and key for the RadSec home server.
-      - ./certs:/certs:ro
+      - ${INTEROP_CERTS:-./certs}:/certs:ro
     depends_on:
       - freeradius
 
   usg-home:
-    image: usg-radius-interop/usg-radius
+    image: usg-radius-interop/usg-radius:${INTEROP_PROJECT:-latest}
     command: ["/etc/radius/home.json"]
     networks:
       radius:
-        ipv4_address: 10.77.0.30
+        ipv4_address: ${INTEROP_NET:-10.77.0}.30
     volumes:
-      - ./usg-radius/home.json:/etc/radius/home.json:ro
-      - ./certs:/certs:ro
+      - ${INTEROP_CONF:-.}/usg-radius/home.json:/etc/radius/home.json:ro
+      - ${INTEROP_CERTS:-./certs}:/certs:ro
     depends_on:
       - usg-proxy
 
   nas:
     build: ./eapol_test
-    image: usg-radius-interop/eapol_test
+    image: usg-radius-interop/eapol_test:${INTEROP_PROJECT:-latest}
     networks:
       radius:
-        ipv4_address: 10.77.0.40
+        ipv4_address: ${INTEROP_NET:-10.77.0}.40
     volumes:
-      - ./certs:/certs:ro
+      - ${INTEROP_CERTS:-./certs}:/certs:ro
+    environment:
+      FREERADIUS: ${INTEROP_NET:-10.77.0}.10
+      PROXY: ${INTEROP_NET:-10.77.0}.20
+      USG_HOME: ${INTEROP_NET:-10.77.0}.30
     profiles: ["test"]
     depends_on:
       - freeradius

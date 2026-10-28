@@ -196,7 +196,7 @@ A complete file is [`examples/configs/proxy-radsec-upstream.json`](../../../exam
 
 Keep `health_check.interval` below the home server's TLS idle timeout (FreeRADIUS `idle_timeout`, 30 s in its template): the probe is what keeps the connection warm, and an idle close costs the next request a `retry_interval` of latency.
 
-Interop: `tests/interop/run.sh` scenario 15 drives EAP-TLS and PAP through the proxy to FreeRADIUS 3.2.7 over RadSec (TLS 1.3, ML-KEM-1024, mutual certificates) and checks FreeRADIUS's own log for the connection, the negotiated parameters, the client certificate and the port the requests arrived on; see [INTEROP_TESTING.md](../development/INTEROP_TESTING.md).
+Interop: `tests/interop/run.sh` scenario 16 drives EAP-TLS and PAP through the proxy to FreeRADIUS 3.2.7 over RadSec (TLS 1.3, ML-KEM-1024, mutual certificates) and checks FreeRADIUS's own log for the connection, the negotiated parameters, the client certificate and the port the requests arrived on; see [INTEROP_TESTING.md](../development/INTEROP_TESTING.md).
 
 ## Features
 

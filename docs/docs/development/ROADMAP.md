@@ -2,30 +2,28 @@
 
 This document outlines the development roadmap for the USG RADIUS project, organized by release milestones.
 
-## Current Status: v0.12.0 (Certificate revocation for EAP-TLS and RadSec)
+## Current Status: v0.13.0 (EAP-TEAP interop, hardened EAP sessions, RFC 5997 Status-Server, dedicated accounting port)
 
 **Release Date**: October 2026
-**Status**: ✅ Complete - Production-ready with RadSec (RFC 6614) as the default transport, server-originated CoA/Disconnect (RFC 5176), RFC 2548 MS-MPPE key delivery on EAP Access-Accepts, CRL/OCSP revocation checking of EAP-TLS supplicant and RadSec client certificates (fail-closed), a proxy that re-keys both legs, management API mTLS + ABAC, and Kubernetes-only deployment
+**Status**: ✅ Complete - Production-ready with RadSec (RFC 6614) as the default transport, server-originated CoA/Disconnect (RFC 5176), RFC 2548 MS-MPPE key delivery on EAP Access-Accepts, EAP-TEAP (RFC 9930) interoperable with wpa_supplicant, CRL/OCSP revocation checking of EAP-TLS supplicant and RadSec client certificates (fail-closed), RFC 5997 Status-Server, a dedicated 1813/udp accounting socket, a proxy that re-keys both legs, management API mTLS + ABAC, and Kubernetes-only deployment
 
 ### Known Limitations
 
-See [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md) for detailed gap analysis. Headline gaps at v0.12.0:
+See [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md) for detailed gap analysis. Headline gaps at v0.13.0:
 
 - ❌ No DTLS transport; RadSec is TLS 1.3 only
 - ❌ CoA/Disconnect only over RadSec (no UDP/3799 path)
 - ❌ No certificate hot-rotation for RadSec (listener or proxy client certificate) or EAP-TLS
 - ⚠️ CRL and OCSP response signatures are not verified by the revocation checker
+- ⚠️ EAP-TEAP has only the Basic-Password-Auth inner method (zero IMSK); no EAP-MSCHAPv2 or inner EAP-TLS
 - ⚠️ The proxy forwards NAS Identifiers unchanged on its upstream hop (UDP socket or RadSec connection), so two NASes using the same Identifier at the same time collide at a home server that deduplicates on Identifier (RFC 6613 §2.6); the proxy runs only under the `udp-insecure` NAS listener
 
-Closed since v0.12.0 (unreleased): outbound RadSec (RFC 6614) from the proxy to
+Closed since v0.13.0 (unreleased): outbound RadSec (RFC 6614) from the proxy to
 `transport: "radsec"` home servers with the RFC 6613 connection rules (one
 persistent TLS 1.3 / ML-KEM-1024 connection per home server, fixed `"radsec"`
-hop secret, Status-Server watchdog, home-server certificate revocation);
-Status-Server verifies Message-Authenticator and
-answers by port per RFC 5997, and a dedicated 1813/udp accounting socket is bound
-(`accounting_port`, RFC 2866 §2).
+hop secret, Status-Server watchdog, home-server certificate revocation).
 
-### Completed Features (v0.1.0 through v0.12.0)
+### Completed Features (v0.1.0 through v0.13.0)
 
 
 
@@ -160,6 +158,14 @@ answers by port per RFC 5997, and a dedicated 1813/udp accounting socket is boun
 - ✅ EAP-Failure attached to every EAP Access-Reject (RFC 3579 §2.6.3)
 - ✅ Interop harness (FreeRADIUS 3.2 + eapol_test, 24 assertions including a revoked supplicant) running in CI
 - ✅ RustCrypto / rand major migration with no wire-format or key-derivation change; `ui/bff` under `cargo audit` gating
+
+#### EAP-TEAP Interop, Hardened EAP Sessions, Status-Server & Accounting Port (v0.13.0)
+
+- ✅ EAP-TEAP (RFC 9930) interoperable with wpa_supplicant 2.12: §4.2.13 Crypto-Binding TLV, §6.2–§6.4 key schedule with the negotiated cipher suite's hash (independent known-answer vectors), §3.6.6 protected termination, fragmentation in both phases and directions, `eap.teap_tls`; four TEAP interop scenarios
+- ✅ EAP-Nak method negotiation (RFC 3748 §5.3.1) so EAP-TLS and EAP-TEAP can be enabled together
+- ✅ Bounded EAP session store (`eap.session_idle_timeout_secs`, `eap.max_sessions`, `radius_eap_sessions_evicted_total`), bounded TEAP Phase 2, Basic-Password-Auth fails closed; `eap.enable_teap` defaults to `false`
+- ✅ Status-Server per RFC 5997 (Message-Authenticator required and verified, Access-Accept / Accounting-Response by port, Proxy-State echoed) and conformant home-server health probes
+- ✅ Dedicated 1813/udp accounting socket (`accounting_port`: 1813 default / `"shared"` / `"disabled"`, RFC 2866 §2); interop harness at 67 assertions
 
 ## v0.2.0 - Security & Production Hardening (Q4 2025)
 
@@ -1013,7 +1019,7 @@ let config = RevocationConfig::disabled();
   under the home server's secret, one ephemeral socket per probe; a reply
   counts only if its source, Identifier, Response Authenticator and any
   Message-Authenticator check out and its code is Access-Accept,
-  Accounting-Response or Access-Reject (unreleased; earlier probes were
+  Accounting-Response or Access-Reject (v0.13.0; earlier probes were
   unsigned and discarded by conformant home servers)
 - Servers marked Down after N consecutive failures
 - Servers marked Up after M consecutive successes
@@ -1362,7 +1368,7 @@ let config = RevocationConfig::disabled();
 
 ## Development Priorities
 
-### Remaining Work (post v0.12.0)
+### Remaining Work (post v0.13.0)
 
 1. Verify CRL and OCSP response signatures in the revocation checker
 2. EAP-TEAP inner methods with real keying material (EAP-MSCHAPv2)
@@ -1409,7 +1415,8 @@ We welcome community contributions! Priority areas:
 | v0.10.x | Q2 2026 | RadSec + CoA/Disconnect | ✅ Done |
 | v0.11.0 | Q4 2026 | MS-MPPE keys, RFC 9190 TLS 1.3 keying, proxy re-keying | ✅ Done |
 | v0.11.1 | Q4 2026 | Patch: ships the v0.11.0 binaries the release workflow failed to attach; draft-then-publish release workflow | ✅ Done |
-| v0.12.0 | Q4 2026 | Certificate revocation (CRL/OCSP) for EAP-TLS and RadSec, EAP-Failure on EAP rejects, interop harness in CI | ✅ Done (current) |
+| v0.12.0 | Q4 2026 | Certificate revocation (CRL/OCSP) for EAP-TLS and RadSec, EAP-Failure on EAP rejects, interop harness in CI | ✅ Done |
+| v0.13.0 | Q4 2026 | EAP-TEAP interop with wpa_supplicant (RFC 9930), bounded EAP session store, RFC 5997 Status-Server, dedicated 1813/udp accounting socket | ✅ Done (current) |
 | v1.0.0 | 2027 | Production Release | 10 |
 
 **Remaining Estimated Development Time**: ~10 weeks for v1.0.0 hardening, plus the deferred RadSec/CoA follow-ups above

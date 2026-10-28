@@ -8,6 +8,15 @@
 #   LOGS=1 tests/interop/run.sh     # always print the servers' logs
 #   DOCKER="limactl shell myvm docker" tests/interop/run.sh   # explicit docker CLI
 #
+# Runs are isolated, so several worktrees can run this at once on one Docker
+# host: each run has its own compose project (INTEROP_PROJECT, default
+# usg-radius-interop-<hash of this directory>-<pid>), its own /24 on the
+# Docker host (INTEROP_NET, default the first free 10.77.N), its own image tag
+# and its own run directory (.runs/<project>: certs, rendered configs, logs).
+# Teardown, also on failure or interrupt, removes that project's containers,
+# network, volumes and images and nothing else. The run directory is deleted
+# after a passing run and kept (with the server logs) otherwise.
+#
 # Needs `docker` with the compose plugin. Without a docker CLI on PATH, a running
 # Lima instance (limactl) that has docker is used, which works because Lima
 # mounts the home directory at the same path inside the VM.
@@ -35,31 +44,98 @@ if [[ -z "${DOCKER:-}" ]]; then
         exit 2
     fi
 fi
-compose() { ${DOCKER} compose -f "$PWD/compose.yaml" "$@"; }
 
-./gen-certs.sh
+INTEROP_PROJECT=${INTEROP_PROJECT:-usg-radius-interop-$(printf '%08x' "$(printf %s "$PWD" | cksum | cut -d' ' -f1)")-$$}
+RUN_DIR=$PWD/.runs/$INTEROP_PROJECT
+# Compose reads the per-run values from an env file rather than the
+# environment, which `limactl shell` does not forward into the VM. Files the VM
+# reads are written once and never rewritten: Lima's virtiofs mount can serve
+# the old size of a file rewritten a moment earlier, which truncates it.
+write_env() { # write_env <file>
+    ENV_FILE=$1
+    mkdir -p "$(dirname "$ENV_FILE")"
+    printf 'INTEROP_PROJECT=%s\nINTEROP_CERTS=%s\nINTEROP_CONF=%s\nINTEROP_NET=%s\n' \
+        "$INTEROP_PROJECT" "$RUN_DIR/certs" "${NET_DIR:-.}" "${INTEROP_NET:-10.77.0}" > "$ENV_FILE"
+}
+write_env "$RUN_DIR/build.env"
+compose() { ${DOCKER} compose -p "$INTEROP_PROJECT" --env-file "$ENV_FILE" -f "$PWD/compose.yaml" "$@"; }
+echo "run.sh: compose project $INTEROP_PROJECT, run directory $RUN_DIR"
+
+./gen-certs.sh "$RUN_DIR/certs"
 
 cleanup() {
     status=$?
+    trap '' INT TERM HUP # a second ^C must not cut the teardown short
+    mkdir -p "$RUN_DIR/logs"
+    for service in freeradius usg-proxy usg-home; do
+        compose logs --no-color --timestamps "$service" > "$RUN_DIR/logs/$service.log" 2>&1 || true
+    done
     if [[ $status -ne 0 || -n "${LOGS:-}" ]]; then
         echo; echo "===== server logs (freeradius, usg-proxy, usg-home) ====="
         compose logs --no-color --tail="${LOG_TAIL:-400}" freeradius usg-proxy usg-home || true
     fi
     if [[ -z "${KEEP:-}" ]]; then
-        compose --profile test down --remove-orphans --timeout 2 >/dev/null 2>&1 || true
+        compose --profile test down --remove-orphans --volumes --rmi all --timeout 2 >/dev/null 2>&1 || true
+        if [[ $status -eq 0 ]]; then
+            rm -rf "$RUN_DIR"
+        else
+            echo "run directory kept: $RUN_DIR (certs, configs, logs/)"
+        fi
     else
-        echo "KEEP set: containers left running (compose -f $PWD/compose.yaml down to stop)"
+        echo "KEEP set: containers left running in project $INTEROP_PROJECT (network ${INTEROP_NET:-none}.0/24). Stop with:"
+        echo "  ${DOCKER} compose -p $INTEROP_PROJECT --env-file $ENV_FILE -f $PWD/compose.yaml --profile test down --volumes --rmi all"
     fi
     exit $status
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 
 echo "== building images"
 compose --profile test build
 echo "== starting FreeRADIUS, usg-radius proxy, usg-radius home"
-# --force-recreate: a fresh container per run, so the probe check below reads
-# this run's proxy log and not a kept container's earlier lines.
-compose up -d --force-recreate freeradius usg-proxy usg-home
+# The servers' configs hold the addresses, so they are rendered for the /24
+# this run gets, into a new directory per attempt (net-<prefix>-<pid>/, with
+# its compose.env). Docker refuses a subnet that overlaps an existing network,
+# which is what makes the claim safe against a concurrent run: skip the /24s
+# already in use, start from a point derived from the project name, and move on
+# if another run takes the same one first.
+render_configs() {
+    local f
+    find freeradius usg-radius -type f | while IFS= read -r f; do
+        mkdir -p "$NET_DIR/$(dirname "$f")"
+        sed "s/10\.77\.0\./$INTEROP_NET./g" "$f" > "$NET_DIR/$f"
+    done
+    chmod -R a+rX "$RUN_DIR"
+}
+if [[ -n "${INTEROP_NET:-}" ]]; then
+    candidates=("$INTEROP_NET")
+else
+    # shellcheck disable=SC2046 # one argument per network ID
+    in_use=" $(${DOCKER} network inspect --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' $(${DOCKER} network ls -q) 2>/dev/null | tr '\n' ' ') "
+    start=$(( $(printf %s "$INTEROP_PROJECT" | cksum | cut -d' ' -f1) % 256 ))
+    candidates=()
+    for ((k = 0; k < 256 && ${#candidates[@]} < 16; k++)); do
+        n=$(( (start + k) % 256 ))
+        [[ $in_use == *" 10.77.$n.0/24 "* ]] || candidates+=("10.77.$n")
+    done
+fi
+started=
+for INTEROP_NET in ${candidates[@]+"${candidates[@]}"}; do
+    NET_DIR=$RUN_DIR/net-$INTEROP_NET-$$ # new even when INTEROP_PROJECT is reused
+    render_configs
+    write_env "$NET_DIR/compose.env"
+    # --force-recreate: a fresh container per run even with a reused
+    # INTEROP_PROJECT, so the probe check below reads this run's proxy log.
+    if out=$(compose up -d --force-recreate freeradius usg-proxy usg-home 2>&1); then
+        echo "$out"; started=1; break
+    fi
+    if ! grep -qi 'overlaps' <<<"$out"; then echo "$out" >&2; exit 1; fi
+    echo "run.sh: $INTEROP_NET.0/24 is taken, trying the next one"
+    compose down --remove-orphans --timeout 2 >/dev/null 2>&1 || true
+done
+[[ -n "$started" ]] || { echo "run.sh: no free 10.77.N.0/24 for the compose network (set INTEROP_NET)" >&2; exit 1; }
+echo "run.sh: network $INTEROP_NET.0/24"
 echo "== running checks in the nas container"
 compose run --rm --no-deps nas
 
@@ -92,7 +168,7 @@ for home in freeradius freeradius-radsec usg-home; do
     echo "PASS  proxy Status-Server probe answered by $home"
 done
 
-# RadSec hop proof (scenario 15 ran through it, but the nas container only sees
+# RadSec hop proof (scenario 16 ran through it, but the nas container only sees
 # UDP). Both logs are captured first, then grepped, for the pipefail reason above.
 echo "== checking the RadSec hop from the FreeRADIUS and proxy logs"
 strip_ansi() { perl -pe 's/\e\[[0-9;]*m//g'; }

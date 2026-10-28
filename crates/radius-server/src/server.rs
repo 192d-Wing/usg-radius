@@ -1,7 +1,9 @@
 use crate::accounting::AccountingHandler;
 use crate::audit::{AuditEntry, AuditEventType, AuditLogger};
 use crate::buffer_pool::BufferPool;
-use crate::cache::{RequestCache, RequestFingerprint};
+use crate::cache::{
+    Admission, RETRANSMISSIONS_REPLAYED, RequestCache, RequestFingerprint, request_digest,
+};
 use crate::config::{AccountingPort, AccountingPortMode, Config};
 use crate::proxy::ProxyConfig;
 use crate::proxy::handler::ProxyHandler;
@@ -260,6 +262,10 @@ pub enum ServerError {
     InvalidClient,
     #[error("Duplicate request")]
     DuplicateRequest,
+    /// The handler silently discarded the request ([`AuthResult::Discard`]):
+    /// no reply is sent.
+    #[error("Request silently discarded")]
+    Discarded,
     #[error("Rate limit exceeded")]
     RateLimited,
     #[error("Accounting error: {0}")]
@@ -267,7 +273,7 @@ pub enum ServerError {
 }
 
 /// Authentication result for multi-round authentication
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum AuthResult {
     /// Authentication succeeded.
     ///
@@ -298,6 +304,36 @@ pub enum AuthResult {
         /// Additional attributes to include in challenge
         attributes: Vec<Attribute>,
     },
+    /// Silently discard the request: no reply of any kind is sent (e.g. an
+    /// EAP-Response whose Identifier does not match the outstanding
+    /// EAP-Request, RFC 3748 §4.1). The NAS's retransmissions of the
+    /// same packet are dropped too.
+    Discard,
+}
+
+/// Prints the MSK's length, never its octets (keys stay out of `Debug`).
+impl std::fmt::Debug for AuthResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthResult::Accept { attributes, msk } => f
+                .debug_struct("Accept")
+                .field("attributes", attributes)
+                .field("msk_len", &msk.as_ref().map(|k| k.len()))
+                .finish(),
+            AuthResult::Reject => f.write_str("Reject"),
+            AuthResult::Challenge {
+                message,
+                state,
+                attributes,
+            } => f
+                .debug_struct("Challenge")
+                .field("message", message)
+                .field("state", state)
+                .field("attributes", attributes)
+                .finish(),
+            AuthResult::Discard => f.write_str("Discard"),
+        }
+    }
 }
 
 impl AuthResult {
@@ -413,6 +449,22 @@ pub trait AuthHandler: Send + Sync {
 
         // Delegate to authenticate_with_challenge for backward compatibility
         self.authenticate_with_challenge(&username, password.as_deref(), state)
+    }
+
+    /// [`Self::authenticate_request`] with the identity of the RADIUS client
+    /// the request came from: `client` is the UDP source address or the
+    /// RadSec peer address, as seen by the transport (never a value taken
+    /// from the packet). Handlers that bind state to the NAS (the EAP
+    /// handler binds each conversation to the client that started it)
+    /// override this; the default ignores `client`.
+    fn authenticate_request_from(
+        &self,
+        request: &Packet,
+        secret: &[u8],
+        client: std::net::IpAddr,
+    ) -> AuthResult {
+        let _ = client;
+        self.authenticate_request(request, secret)
     }
 
     /// Get additional attributes to include in Access-Accept response
@@ -1267,13 +1319,74 @@ impl RadiusServer {
             return Ok(None);
         }
 
-        // Check for duplicate request (replay attack prevention)
+        // Authenticate before anything else uses or remembers the packet: an
+        // Access-Request or Status-Server failing its Message-Authenticator
+        // check must not affect the duplicate cache (RFC 5080 §2.2.2) and is
+        // never routed, and neither is an Accounting-Request failing its
+        // Request Authenticator (RFC 2866 §3). Status-Server is answered here
+        // (RFC 5997 §4.1 silent discard on failure); its reply is sent below
+        // unless it is a duplicate.
+        let mut status_server_reply = None;
+        match request.code {
+            Code::AccessRequest => {
+                Self::verify_access_request_message_authenticator(&request, source_ip, secret)?
+            }
+            Code::StatusServer => {
+                match Self::handle_status_server(&request, source_ip, secret, role)? {
+                    Some(reply) => status_server_reply = Some(reply),
+                    // RFC 5997 §4.1: silent discard, nothing on the wire.
+                    None => return Ok(None),
+                }
+            }
+            // RFC 2866 §3: MD5(Code + ID + Length + 16 zero octets +
+            // Attributes + Secret), compared in constant time before any
+            // attribute is used.
+            Code::AccountingRequest
+                if !verify_accounting_request_authenticator(&request, secret) =>
+            {
+                warn!(
+                    client_ip = %source_ip,
+                    request_id = request.identifier,
+                    "Invalid Request Authenticator in Accounting-Request"
+                );
+                return Err(ServerError::Validation(
+                    "Invalid Request Authenticator".to_string(),
+                ));
+            }
+            _ => {}
+        }
+
+        // Duplicate detection (RFC 2865 §3, RFC 5080 §2.2.2). A byte-identical
+        // retransmission of an Access-Request that was already answered gets
+        // the same reply again, unchanged: the NAS retransmits because it
+        // lost our reply, and processing the request a second time would
+        // fail (an EAP conversation has moved on) or answer differently.
+        // Identical bytes under the same secret mean identical Identifier,
+        // Request Authenticator, State and EAP-Message: the replay re-sends
+        // bytes already computed for exactly this request and acts on
+        // nothing new. It goes only to the address the original came from,
+        // a bounded number of times. Any other duplicate (still in progress,
+        // answered without a cached reply, e.g. proxied requests whose reply
+        // comes back asynchronously, or different content under the same
+        // fingerprint) is dropped.
         let fingerprint =
             RequestFingerprint::new(source_ip, request.identifier, &request.authenticator);
-        if config
+        let digest = request_digest(secret, data);
+        let admission = config
             .request_cache
-            .is_duplicate(fingerprint, request.authenticator)
+            .admit(fingerprint.clone(), source, digest);
+        if let Admission::Replay(reply) = &admission
+            && request.code == Code::AccessRequest
         {
+            debug!(
+                client_ip = %source_ip,
+                request_id = request.identifier,
+                "Retransmitted Access-Request: resending the cached reply (RFC 5080 §2.2.2)"
+            );
+            RETRANSMISSIONS_REPLAYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(Some(reply.to_vec()));
+        }
+        if admission != Admission::New {
             warn!(
                 client_ip = %source_ip,
                 request_id = request.identifier,
@@ -1303,18 +1416,21 @@ impl RadiusServer {
         // Handle based on packet type
         let response = match request.code {
             Code::AccessRequest => {
-                Self::handle_access_request(&request, config, source, secret).await?
+                match Self::handle_access_request(&request, config, source, secret).await {
+                    Ok(response) => response,
+                    // AuthResult::Discard: nothing on the wire, and nothing
+                    // cached, so retransmissions are dropped as well.
+                    Err(ServerError::Discarded) => return Ok(None),
+                    Err(e) => return Err(e),
+                }
             }
             Code::AccountingRequest => {
                 Self::handle_accounting_request(&request, config, source_ip, secret).await?
             }
-            Code::StatusServer => {
-                match Self::handle_status_server(&request, source_ip, secret, role)? {
-                    Some(response) => response,
-                    // RFC 5997 §4.1: silent discard, nothing on the wire.
-                    None => return Ok(None),
-                }
-            }
+            Code::StatusServer => match status_server_reply {
+                Some(response) => response,
+                None => return Ok(None),
+            },
             _ => {
                 warn!(packet_type = ?request.code, "Unsupported packet type");
                 return Ok(None);
@@ -1324,6 +1440,14 @@ impl RadiusServer {
         // Encode the response
         let response_data = response.encode()?;
 
+        // Keep the Access-Request's reply for its retransmissions (RFC 5080
+        // §2.2.2), for the cache TTL; see the duplicate check above.
+        if request.code == Code::AccessRequest {
+            config
+                .request_cache
+                .store_reply(&fingerprint, &digest, &response_data);
+        }
+
         debug!(
             response_type = ?response.code,
             client_ip = %source_ip,
@@ -1332,6 +1456,54 @@ impl RadiusServer {
         );
 
         Ok(Some(response_data))
+    }
+
+    /// RFC 3579 §3.2 / RFC 5080 / "Blast-RADIUS" (CVE-2024-3596): verify an
+    /// Access-Request's Message-Authenticator whenever present, and refuse an
+    /// EAP-bearing request without one (otherwise an attacker could strip
+    /// the attribute to defeat the integrity check). Runs first in
+    /// `process_request`: a packet failing it must not affect the duplicate
+    /// cache (RFC 5080 §2.2.2) nor be forwarded, re-signed, to a home server.
+    fn verify_access_request_message_authenticator(
+        request: &Packet,
+        source_ip: std::net::IpAddr,
+        secret: &[u8],
+    ) -> Result<(), ServerError> {
+        match check_message_authenticator(request, &request.authenticator, secret)? {
+            MessageAuthenticatorCheck::Valid => {
+                debug!(
+                    client_ip = %source_ip,
+                    request_id = request.identifier,
+                    "Message-Authenticator validated successfully"
+                );
+            }
+            MessageAuthenticatorCheck::Invalid => {
+                warn!(
+                    client_ip = %source_ip,
+                    request_id = request.identifier,
+                    "Invalid Message-Authenticator"
+                );
+                return Err(ServerError::Validation(
+                    "Invalid Message-Authenticator".to_string(),
+                ));
+            }
+            MessageAuthenticatorCheck::Absent => {
+                if request
+                    .find_attribute(AttributeType::EapMessage as u8)
+                    .is_some()
+                {
+                    warn!(
+                        client_ip = %source_ip,
+                        request_id = request.identifier,
+                        "Rejected EAP Access-Request without required Message-Authenticator (RFC 3579 / Blast-RADIUS)"
+                    );
+                    return Err(ServerError::Validation(
+                        "EAP Access-Request missing required Message-Authenticator".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Handle Access-Request packet
@@ -1483,45 +1655,8 @@ impl RadiusServer {
             }
         }
 
-        // RFC 3579 §3.2 / RFC 5080 / "Blast-RADIUS" (CVE-2024-3596): an
-        // Access-Request that carries EAP-Message MUST also carry a valid
-        // Message-Authenticator. Verify it whenever present, and reject an
-        // EAP-bearing request that omits it — otherwise an attacker could strip
-        // the attribute to defeat the integrity check.
-        match check_message_authenticator(request, &request.authenticator, secret)? {
-            MessageAuthenticatorCheck::Valid => {
-                debug!(
-                    client_ip = %source_ip,
-                    request_id = request.identifier,
-                    "Message-Authenticator validated successfully"
-                );
-            }
-            MessageAuthenticatorCheck::Invalid => {
-                warn!(
-                    client_ip = %source_ip,
-                    request_id = request.identifier,
-                    "Invalid Message-Authenticator"
-                );
-                return Err(ServerError::Validation(
-                    "Invalid Message-Authenticator".to_string(),
-                ));
-            }
-            MessageAuthenticatorCheck::Absent => {
-                if request
-                    .find_attribute(AttributeType::EapMessage as u8)
-                    .is_some()
-                {
-                    warn!(
-                        client_ip = %source_ip,
-                        request_id = request.identifier,
-                        "Rejected EAP Access-Request without required Message-Authenticator (RFC 3579 / Blast-RADIUS)"
-                    );
-                    return Err(ServerError::Validation(
-                        "EAP Access-Request missing required Message-Authenticator".to_string(),
-                    ));
-                }
-            }
-        }
+        // The Message-Authenticator was verified in `process_request`, before
+        // the duplicate cache and proxy routing.
 
         // Audit log authentication attempt
         let client_name = config
@@ -1584,7 +1719,9 @@ impl RadiusServer {
                 "Using authenticate_request for flexible authentication"
             );
 
-            config.auth_handler.authenticate_request(request, secret)
+            config
+                .auth_handler
+                .authenticate_request_from(request, secret, source_ip)
         };
 
         // Handle authentication result
@@ -1829,6 +1966,15 @@ impl RadiusServer {
 
                 Ok(response)
             }
+            AuthResult::Discard => {
+                debug!(
+                    username = %username,
+                    client_ip = %source_ip,
+                    request_id = request.identifier,
+                    "Request silently discarded by the authentication handler"
+                );
+                Err(ServerError::Discarded)
+            }
             AuthResult::Reject => {
                 warn!(
                     username = %username,
@@ -1865,16 +2011,27 @@ impl RadiusServer {
                 // instead of retrying or waiting for a timeout. The method may
                 // fail deep inside the TLS handshake (bad chain, revoked
                 // certificate), where the handler only returns `Reject`, so the
-                // EAP-Failure is attached here for every EAP reject.
-                if let Some(eap_id) = request
+                // EAP-Failure is attached here for every EAP reject. RFC 3579
+                // §2.6.2: an Access-Request encapsulating an EAP-Request (role
+                // reversal) is rejected with an EAP-Response/Nak offering no
+                // method instead.
+                if let Some((code, eap_id)) = request
                     .find_attribute(AttributeType::EapMessage as u8)
-                    .and_then(|a| a.value.get(1).copied())
-                    && let Ok(a) = Attribute::new(
-                        AttributeType::EapMessage as u8,
-                        radius_proto::eap::EapPacket::failure(eap_id).to_bytes(),
-                    )
+                    .and_then(|a| Some((*a.value.first()?, *a.value.get(1)?)))
                 {
-                    response.add_attribute(a);
+                    let eap = if code == radius_proto::eap::EapCode::Request as u8 {
+                        radius_proto::eap::EapPacket::new(
+                            radius_proto::eap::EapCode::Response,
+                            eap_id,
+                            Some(radius_proto::eap::EapType::Nak),
+                            vec![0],
+                        )
+                    } else {
+                        radius_proto::eap::EapPacket::failure(eap_id)
+                    };
+                    if let Ok(a) = Attribute::new(AttributeType::EapMessage as u8, eap.to_bytes()) {
+                        response.add_attribute(a);
+                    }
                 }
 
                 // Add attributes from auth handler
@@ -1915,19 +2072,8 @@ impl RadiusServer {
 
         // `secret` is provided by the caller (per-client for UDP, "radsec" for RadSec).
 
-        // Validate the Request Authenticator (RFC 2866 §3):
-        // MD5(Code + ID + Length + 16 zero octets + Attributes + Secret),
-        // compared in constant time before any attribute is used.
-        if !verify_accounting_request_authenticator(request, secret) {
-            warn!(
-                client_ip = %source_ip,
-                request_id = request.identifier,
-                "Invalid Request Authenticator in Accounting-Request"
-            );
-            return Err(ServerError::Validation(
-                "Invalid Request Authenticator".to_string(),
-            ));
-        }
+        // The Request Authenticator (RFC 2866 §3) was verified in
+        // `process_request`, before the duplicate cache.
 
         // Extract Acct-Status-Type (required)
         let status_type_attr = request
@@ -2270,6 +2416,80 @@ mod tests {
     /// the request leg is re-keyed for the home secret, and the relayed Accept
     /// reaches the NAS's own port from the proxy's listening address, signed
     /// with the NAS secret.
+    /// RFC 3579 §3.2 / Blast-RADIUS: the proxy verifies the NAS's
+    /// Message-Authenticator before routing, so an EAP Access-Request with an
+    /// invalid or missing one is never forwarded (re-signed under the home
+    /// secret, it would look authentic to the home server). A correctly
+    /// signed one is.
+    #[tokio::test]
+    async fn proxy_does_not_forward_a_request_failing_its_message_authenticator() {
+        let home = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let nas_secret = random_secret_hex();
+        let home_secret = random_secret_hex();
+        let server = proxy_server(proxy_config(
+            home.local_addr().unwrap(),
+            0,
+            &nas_secret,
+            &home_secret,
+        ))
+        .await
+        .unwrap();
+        let proxy_addr = server.local_addr().unwrap();
+        tokio::spawn(async move { server.run().await });
+        let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let eap_request = |id: u8, mac: Option<Vec<u8>>| {
+            let mut p = Packet::new(
+                Code::AccessRequest,
+                id,
+                radius_proto::auth::generate_request_authenticator(),
+            );
+            p.add_attribute(
+                Attribute::string(AttributeType::UserName as u8, "alice@home.test").unwrap(),
+            );
+            p.add_attribute(Attribute::string(AttributeType::NasIdentifier as u8, "nas").unwrap());
+            radius_proto::eap::add_eap_to_radius_packet(
+                &mut p,
+                &radius_proto::eap::EapPacket::identity_response(1, "alice@home.test"),
+            )
+            .unwrap();
+            if let Some(mac) = mac {
+                p.add_attribute(
+                    Attribute::new(AttributeType::MessageAuthenticator as u8, mac).unwrap(),
+                );
+            }
+            p
+        };
+        let mut buf = vec![0u8; 4096];
+        for (id, request) in [
+            (1u8, eap_request(1, Some(vec![0x5A; 16]))),
+            (2, eap_request(2, None)),
+        ] {
+            nas.send_to(&request.encode().unwrap(), proxy_addr)
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(500), home.recv_from(&mut buf))
+                    .await
+                    .is_err(),
+                "request {id} with a bad or missing Message-Authenticator was forwarded"
+            );
+        }
+
+        // Control: the same request, correctly signed, is forwarded.
+        let mut signed = eap_request(3, Some(vec![0u8; 16]));
+        let mac = calculate_message_authenticator(&signed.encode().unwrap(), nas_secret.as_bytes());
+        signed.attributes.last_mut().unwrap().value = mac.to_vec();
+        nas.send_to(&signed.encode().unwrap(), proxy_addr)
+            .await
+            .unwrap();
+        let (len, _) = tokio::time::timeout(Duration::from_secs(5), home.recv_from(&mut buf))
+            .await
+            .expect("a correctly signed request is forwarded")
+            .unwrap();
+        assert_eq!(Packet::decode(&buf[..len]).unwrap().identifier, 3);
+    }
+
     #[tokio::test]
     async fn proxy_relays_home_server_response_to_the_nas() {
         use radius_proto::auth::{
@@ -2533,6 +2753,19 @@ mod tests {
             assert!(err.to_string().contains("RadSec link"), "{err}");
             assert!(err.to_string().contains("home-radsec"), "{err}");
         }
+    }
+
+    /// `Debug` of an Accept shows the MSK's length, never its octets.
+    #[test]
+    fn auth_result_debug_redacts_the_msk() {
+        let accept = AuthResult::Accept {
+            attributes: Vec::new(),
+            msk: Some(vec![0xAB; 64]),
+        };
+        let shown = format!("{accept:?}");
+        assert!(shown.contains("msk_len: Some(64)"), "{shown}");
+        assert!(!shown.contains("171"), "{shown}");
+        assert_eq!(format!("{:?}", AuthResult::Discard), "Discard");
     }
 
     #[test]
