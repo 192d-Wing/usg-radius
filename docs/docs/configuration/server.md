@@ -144,9 +144,6 @@ authentication socket.
 - A value equal to `listen_port` is rejected: `accounting_port 1812 must differ from listen_port`
 - Any string other than `"shared"` or `"disabled"` fails to parse
 
-`usg-radius --validate` prints the effective mode as `Accounting: 1813`,
-`Accounting: shared` or `Accounting: disabled`.
-
 !!! note
     Ignored under `transport = "radsec"`: authentication, accounting and
     Status-Server share the single TLS connection on 2083/tcp (RFC 6614 §2.5).

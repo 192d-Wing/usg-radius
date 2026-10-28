@@ -317,11 +317,6 @@ async fn main() {
         println!();
         println!("Configuration summary:");
         println!("  Listen: {}:{}", config.listen_address, config.listen_port);
-        // UDP only: under RadSec accounting shares the TLS connection (RFC 6614
-        // §2.5) and no accounting socket is bound.
-        if config.transport == radius_server::config::Transport::UdpInsecure {
-            println!("  Accounting: {}", config.accounting_port);
-        }
         println!("  Clients: {}", config.clients.len());
         println!("  Users: {}", config.users.len());
         println!(

@@ -37,7 +37,7 @@ use crate::server::{PortRole, RadiusServer, ServerConfig};
 
 /// RFC 6614 §2.3: RadSec uses a fixed shared secret of the ASCII string
 /// `"radsec"` for the RADIUS Authenticator / Message-Authenticator computations.
-const RADSEC_SECRET: &[u8] = b"radsec";
+pub(crate) const RADSEC_SECRET: &[u8] = b"radsec";
 
 /// A RADIUS packet header is 20 octets; the `Length` field is octets 2..4.
 const RADIUS_HEADER_LEN: usize = 20;

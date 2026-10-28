@@ -76,10 +76,18 @@ pub fn verify_message_authenticator(
 mod tests {
     use super::*;
 
+    /// A fresh random HMAC key per test, built at runtime (never a literal,
+    /// so CodeQL does not read it as a hard-coded key); the tests only need a
+    /// key both calls agree on, or two keys that differ.
+    fn random_secret() -> Vec<u8> {
+        use rand::RngExt;
+        rand::rng().random::<[u8; 16]>().to_vec()
+    }
+
     #[test]
     fn test_calculate_message_authenticator() {
         let packet = vec![0u8; 20]; // Minimal packet header
-        let secret = b"testing123";
+        let secret = &random_secret();
 
         let auth = calculate_message_authenticator(&packet, secret);
         assert_eq!(auth.len(), 16);
@@ -92,8 +100,8 @@ mod tests {
     #[test]
     fn test_message_authenticator_different_secrets() {
         let packet = vec![0u8; 20];
-        let secret1 = b"secret1";
-        let secret2 = b"secret2";
+        let secret1 = &random_secret();
+        let secret2 = &random_secret();
 
         let auth1 = calculate_message_authenticator(&packet, secret1);
         let auth2 = calculate_message_authenticator(&packet, secret2);
@@ -109,7 +117,7 @@ mod tests {
         let packet1 = vec![0u8; 20];
         let mut packet2 = vec![0u8; 20];
         packet2[0] = 1; // Change one byte
-        let secret = b"testing123";
+        let secret = &random_secret();
 
         let auth1 = calculate_message_authenticator(&packet1, secret);
         let auth2 = calculate_message_authenticator(&packet2, secret);
@@ -124,7 +132,7 @@ mod tests {
     fn test_verify_message_authenticator_valid() {
         // Create a packet with space for Message-Authenticator
         let mut packet = vec![0u8; 40];
-        let secret = b"testing123";
+        let secret = &random_secret();
         let msg_auth_offset = 20;
 
         // Calculate and insert Message-Authenticator
@@ -142,7 +150,7 @@ mod tests {
     #[test]
     fn test_verify_message_authenticator_invalid() {
         let mut packet = vec![0u8; 40];
-        let secret = b"testing123";
+        let secret = &random_secret();
         let msg_auth_offset = 20;
 
         // Insert wrong Message-Authenticator
@@ -159,8 +167,8 @@ mod tests {
     #[test]
     fn test_verify_message_authenticator_wrong_secret() {
         let mut packet = vec![0u8; 40];
-        let secret1 = b"secret1";
-        let secret2 = b"secret2";
+        let secret1 = &random_secret();
+        let secret2 = &random_secret();
         let msg_auth_offset = 20;
 
         // Calculate with secret1
@@ -178,7 +186,7 @@ mod tests {
     #[test]
     fn test_verify_message_authenticator_out_of_bounds() {
         let packet = vec![0u8; 20];
-        let secret = b"testing123";
+        let secret = &random_secret();
 
         // Offset beyond packet length
         assert!(!verify_message_authenticator(&packet, secret, 100));

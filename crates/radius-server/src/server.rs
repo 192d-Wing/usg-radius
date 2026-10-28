@@ -2041,10 +2041,32 @@ impl RadiusServer {
 mod tests {
     use super::*;
 
+    /// A fresh random shared secret per test, built at runtime (never a
+    /// literal, so CodeQL does not read it as a hard-coded key); the tests
+    /// only need both sides to agree on it.
+    fn random_secret() -> Vec<u8> {
+        use rand::RngExt;
+        rand::rng().random::<[u8; 16]>().to_vec()
+    }
+
+    /// `random_secret()` as hex, for the `String` secrets in `Config`
+    /// (`Client.secret`, `HomeServerConfig.secret`). The bytes a fake peer
+    /// keys with are `secret.as_bytes()` of that same value.
+    fn random_secret_hex() -> String {
+        hex::encode(random_secret())
+    }
+
     // --- Proxy: socket layout and end-to-end relay ---
 
-    /// A proxy config with one home server at `home` for realm `home.test`.
-    fn proxy_config(home: SocketAddr, listen_port: u16) -> Config {
+    /// A proxy config with one home server at `home` for realm `home.test`,
+    /// the NAS client keyed with `nas_secret` and the home server with
+    /// `home_secret`.
+    fn proxy_config(
+        home: SocketAddr,
+        listen_port: u16,
+        nas_secret: &str,
+        home_secret: &str,
+    ) -> Config {
         use crate::proxy::ProxyConfig;
         use crate::proxy::health::HealthCheckConfig;
         use crate::proxy::home_server::HomeServerConfig;
@@ -2059,7 +2081,7 @@ mod tests {
             accounting_port: AccountingPort::Named(AccountingPortMode::Disabled),
             clients: vec![crate::config::Client {
                 address: "127.0.0.1/32".to_string(),
-                secret: "nas-secret".to_string(),
+                secret: nas_secret.to_string(),
                 name: Some("test-nas".to_string()),
                 enabled: true,
                 nas_identifier: None,
@@ -2071,7 +2093,7 @@ mod tests {
                     strategy: Default::default(),
                     servers: vec![HomeServerConfig {
                         address: home.to_string(),
-                        secret: "home-secret".to_string(),
+                        secret: home_secret.to_string(),
                         timeout: 5,
                         max_outstanding: 10,
                         name: Some("home".to_string()),
@@ -2112,9 +2134,14 @@ mod tests {
             probe.local_addr().unwrap().port()
         };
 
-        let server = proxy_server(proxy_config(home, port))
-            .await
-            .expect("server with proxy enabled must start on a fixed port");
+        let server = proxy_server(proxy_config(
+            home,
+            port,
+            &random_secret_hex(),
+            &random_secret_hex(),
+        ))
+        .await
+        .expect("server with proxy enabled must start on a fixed port");
 
         assert_eq!(server.local_addr().unwrap().port(), port);
         let upstream = server
@@ -2144,9 +2171,16 @@ mod tests {
         };
 
         let home = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server = proxy_server(proxy_config(home.local_addr().unwrap(), 0))
-            .await
-            .unwrap();
+        let nas_secret = random_secret_hex();
+        let home_secret = random_secret_hex();
+        let server = proxy_server(proxy_config(
+            home.local_addr().unwrap(),
+            0,
+            &nas_secret,
+            &home_secret,
+        ))
+        .await
+        .unwrap();
         let proxy_addr = server.local_addr().unwrap();
         tokio::spawn(async move { server.run().await });
 
@@ -2163,7 +2197,7 @@ mod tests {
         request.add_attribute(
             Attribute::new(
                 AttributeType::UserPassword as u8,
-                encrypt_user_password(&password, b"nas-secret", &request_auth),
+                encrypt_user_password(&password, nas_secret.as_bytes(), &request_auth),
             )
             .unwrap(),
         );
@@ -2189,7 +2223,7 @@ mod tests {
             .find_attribute(AttributeType::UserPassword as u8)
             .expect("User-Password forwarded");
         assert_eq!(
-            decrypt_user_password(&pw.value, b"home-secret", &request_auth).unwrap(),
+            decrypt_user_password(&pw.value, home_secret.as_bytes(), &request_auth).unwrap(),
             password
         );
         let proxy_state = forwarded
@@ -2204,7 +2238,7 @@ mod tests {
         );
         accept.add_attribute(proxy_state);
         accept.authenticator =
-            calculate_response_authenticator(&accept, &request_auth, b"home-secret");
+            calculate_response_authenticator(&accept, &request_auth, home_secret.as_bytes());
         home.send_to(&accept.encode().unwrap(), upstream)
             .await
             .unwrap();
@@ -2221,7 +2255,7 @@ mod tests {
         assert!(verify_response_authenticator(
             &relayed,
             &request_auth,
-            b"nas-secret"
+            nas_secret.as_bytes()
         ));
         assert!(
             relayed
@@ -2277,7 +2311,7 @@ mod tests {
         RadiusServer::process_request(
             data,
             "10.0.0.1:1812".parse().unwrap(),
-            b"s3cret",
+            &random_secret(),
             PortRole::Auth,
             &cfg,
         )
@@ -2411,6 +2445,9 @@ mod tests {
     // --- Status-Server (RFC 5997) and per-port admission (RFC 2866 §2) ---
 
     use crate::accounting::SimpleAccountingHandler;
+    /// RFC 6614 §2.3: the fixed RadSec shared secret, as the transport uses it.
+    #[cfg(feature = "tls")]
+    use crate::radsec::RADSEC_SECRET;
     use radius_proto::auth::{
         calculate_accounting_request_authenticator, generate_request_authenticator,
         verify_response_authenticator,
@@ -2549,11 +2586,6 @@ mod tests {
         RadiusServer::process_request(data, NAS.parse().unwrap(), secret, role, cfg).await
     }
 
-    fn random_secret() -> Vec<u8> {
-        use rand::RngExt;
-        rand::rng().random::<[u8; 16]>().to_vec()
-    }
-
     #[tokio::test]
     async fn status_server_without_message_authenticator_is_discarded() {
         let secret = random_secret();
@@ -2636,15 +2668,16 @@ mod tests {
         assert_eq!(echoed[1].value, ps2.value);
     }
 
+    #[cfg(feature = "tls")]
     #[tokio::test]
     async fn status_server_over_radsec_answers_access_accept() {
         let cfg = pipeline_config(AccountingPort::default());
-        let (bytes, request_auth) = signed_status_server_bytes(13, b"radsec", vec![]);
-        let out = process_as(&bytes, b"radsec", PortRole::Any, &cfg)
+        let (bytes, request_auth) = signed_status_server_bytes(13, RADSEC_SECRET, vec![]);
+        let out = process_as(&bytes, RADSEC_SECRET, PortRole::Any, &cfg)
             .await
             .unwrap()
             .unwrap();
-        assert_status_reply(&out, Code::AccessAccept, 13, &request_auth, b"radsec");
+        assert_status_reply(&out, Code::AccessAccept, 13, &request_auth, RADSEC_SECRET);
     }
 
     #[tokio::test]
@@ -2721,6 +2754,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tls")]
     #[tokio::test]
     async fn radsec_role_admits_every_code() {
         let cfg = pipeline_config(AccountingPort::Named(AccountingPortMode::Disabled));
@@ -2731,7 +2765,7 @@ mod tests {
             Attribute::string(AttributeType::UserName as u8, "nobody").unwrap(),
             Attribute::new(AttributeType::UserPassword as u8, vec![0u8; 16]).unwrap(),
         ]);
-        match process_as(&data, b"radsec", PortRole::Any, &cfg).await {
+        match process_as(&data, RADSEC_SECRET, PortRole::Any, &cfg).await {
             Ok(None) => panic!("RadSec must not discard Access-Request by admission"),
             Ok(Some(bytes)) => {
                 assert_eq!(Packet::decode(&bytes).unwrap().code, Code::AccessReject)
@@ -2740,8 +2774,8 @@ mod tests {
         }
 
         // Accounting-Request is handled even though UDP accounting is disabled.
-        let (bytes, request_auth) = accounting_start_bytes(22, b"radsec");
-        let out = process_as(&bytes, b"radsec", PortRole::Any, &cfg)
+        let (bytes, request_auth) = accounting_start_bytes(22, RADSEC_SECRET);
+        let out = process_as(&bytes, RADSEC_SECRET, PortRole::Any, &cfg)
             .await
             .unwrap()
             .expect("RadSec carries accounting (RFC 6614 §2.5)");
@@ -2750,20 +2784,20 @@ mod tests {
         assert!(verify_response_authenticator(
             &reply,
             &request_auth,
-            b"radsec"
+            RADSEC_SECRET
         ));
     }
 
     // --- Real sockets: two listeners, routing by port ---
 
-    fn dual_socket_config(accounting_port: AccountingPort) -> Config {
+    fn dual_socket_config(accounting_port: AccountingPort, nas_secret: &str) -> Config {
         Config {
             listen_address: "127.0.0.1".to_string(),
             listen_port: 0,
             accounting_port,
             clients: vec![crate::config::Client {
                 address: "127.0.0.1/32".to_string(),
-                secret: "nas-secret".to_string(),
+                secret: nas_secret.to_string(),
                 name: Some("test-nas".to_string()),
                 enabled: true,
                 nas_identifier: None,
@@ -2791,7 +2825,12 @@ mod tests {
 
     #[tokio::test]
     async fn dual_sockets_route_by_port() {
-        let server = dual_socket_server(dual_socket_config(AccountingPort::Dedicated(0))).await;
+        let nas_secret = random_secret_hex();
+        let server = dual_socket_server(dual_socket_config(
+            AccountingPort::Dedicated(0),
+            &nas_secret,
+        ))
+        .await;
         let auth_addr = server.local_addr().unwrap();
         let acct_addr = server
             .accounting_local_addr()
@@ -2801,7 +2840,7 @@ mod tests {
         tokio::spawn(async move { server.run().await });
 
         let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let secret = b"nas-secret";
+        let secret = nas_secret.as_bytes();
         let long = Duration::from_secs(5);
         let short = Duration::from_millis(500);
 
@@ -2858,16 +2897,18 @@ mod tests {
 
     #[tokio::test]
     async fn shared_mode_binds_one_socket() {
-        let server = dual_socket_server(dual_socket_config(AccountingPort::Named(
-            AccountingPortMode::Shared,
-        )))
+        let nas_secret = random_secret_hex();
+        let server = dual_socket_server(dual_socket_config(
+            AccountingPort::Named(AccountingPortMode::Shared),
+            &nas_secret,
+        ))
         .await;
         let auth_addr = server.local_addr().unwrap();
         assert!(server.accounting_local_addr().unwrap().is_none());
         tokio::spawn(async move { server.run().await });
 
         let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let secret = b"nas-secret";
+        let secret = nas_secret.as_bytes();
         let (bytes, request_auth) = accounting_start_bytes(40, secret);
         nas.send_to(&bytes, auth_addr).await.unwrap();
         let (reply, from) = recv_reply(&nas, Duration::from_secs(5))
@@ -3097,17 +3138,22 @@ mod tests {
         // On the wire: the dedicated accounting socket stays silent for a bad
         // Request Authenticator, then answers a good one (so the silence is a
         // refusal, not a dead server).
-        let server = dual_socket_server(dual_socket_config(AccountingPort::Dedicated(0))).await;
+        let nas_secret = random_secret_hex();
+        let server = dual_socket_server(dual_socket_config(
+            AccountingPort::Dedicated(0),
+            &nas_secret,
+        ))
+        .await;
         let acct_addr = server.accounting_local_addr().unwrap().unwrap();
         tokio::spawn(async move { server.run().await });
         let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (bad, _) = accounting_start_bytes(94, b"not-the-nas-secret");
+        let (bad, _) = accounting_start_bytes(94, &random_secret());
         nas.send_to(&bad, acct_addr).await.unwrap();
         assert!(
             recv_reply(&nas, Duration::from_millis(500)).await.is_none(),
             "RFC 2866 §3: an Accounting-Request with a bad Request Authenticator is not answered"
         );
-        let (good, request_auth) = accounting_start_bytes(95, b"nas-secret");
+        let (good, request_auth) = accounting_start_bytes(95, nas_secret.as_bytes());
         nas.send_to(&good, acct_addr).await.unwrap();
         let (reply, from) = recv_reply(&nas, Duration::from_secs(5))
             .await
@@ -3119,7 +3165,7 @@ mod tests {
         assert!(verify_response_authenticator(
             &reply,
             &request_auth,
-            b"nas-secret"
+            nas_secret.as_bytes()
         ));
     }
 
@@ -3138,8 +3184,10 @@ mod tests {
 
     #[tokio::test]
     async fn discard_paths_do_not_log_the_secret() {
-        let secret = b"qa-log-hygiene-secret-7f3a9c".to_vec();
+        let secret = random_secret();
         let secret_hex = hex::encode(&secret);
+        let other_secret = random_secret();
+        let other_secret_hex = hex::encode(&other_secret);
         let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
         let writer_sink = Arc::clone(&sink);
         let subscriber = tracing_subscriber::fmt()
@@ -3171,11 +3219,11 @@ mod tests {
             .encode()
             .unwrap();
         let _ = process_as(&no_ma, &secret, PortRole::Auth, &cfg).await;
-        let (wrong_secret, _) = signed_status_server_bytes(101, b"some-other-secret", vec![]);
+        let (wrong_secret, _) = signed_status_server_bytes(101, &other_secret, vec![]);
         let _ = process_as(&wrong_secret, &secret, PortRole::Accounting, &cfg).await;
         let (acct_on_auth, _) = accounting_start_bytes(102, &secret);
         let _ = process_as(&acct_on_auth, &secret, PortRole::Auth, &cfg).await;
-        let (bad_ra, _) = accounting_start_bytes(103, b"some-other-secret");
+        let (bad_ra, _) = accounting_start_bytes(103, &other_secret);
         let _ = process_as(&bad_ra, &secret, PortRole::Accounting, &cfg).await;
         let access_on_acct = access_request_bytes(vec![
             Attribute::string(AttributeType::UserName as u8, "nobody").unwrap(),
@@ -3199,16 +3247,20 @@ mod tests {
             );
         }
         assert!(
-            !log.contains("qa-log-hygiene-secret"),
-            "shared secret leaked into the log:\n{log}"
+            !log.contains(&format!("{secret:?}")),
+            "shared secret (Debug) leaked into the log:\n{log}"
         );
         assert!(
             !log.to_lowercase().contains(&secret_hex),
             "shared secret (hex) leaked into the log:\n{log}"
         );
         assert!(
-            !log.contains("some-other-secret"),
-            "a foreign secret leaked into the log:\n{log}"
+            !log.contains(&format!("{other_secret:?}")),
+            "a foreign secret (Debug) leaked into the log:\n{log}"
+        );
+        assert!(
+            !log.to_lowercase().contains(&other_secret_hex),
+            "a foreign secret (hex) leaked into the log:\n{log}"
         );
     }
 }

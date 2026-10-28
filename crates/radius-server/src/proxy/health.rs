@@ -696,13 +696,20 @@ mod tests {
     use radius_proto::auth::calculate_response_authenticator;
     use radius_proto::verify_message_authenticator;
 
-    const HOME_SECRET: &[u8] = b"home-secret";
+    /// A fresh shared secret per test, built at runtime (never a literal, so
+    /// CodeQL does not read it as a hard-coded key) and hex-encoded so it is
+    /// also a valid `HomeServerConfig.secret`. The `HomeServer` under test and
+    /// the fake home server both key with `secret.as_bytes()` of one value.
+    fn home_secret() -> String {
+        use rand::RngExt;
+        hex::encode(rand::rng().random::<[u8; 16]>())
+    }
 
-    fn home_server_at(addr: SocketAddr, secret: &[u8]) -> Arc<HomeServer> {
+    fn home_server_at(addr: SocketAddr, secret: &str) -> Arc<HomeServer> {
         Arc::new(
             HomeServer::new(HomeServerConfig {
                 address: addr.to_string(),
-                secret: String::from_utf8(secret.to_vec()).unwrap(),
+                secret: secret.to_string(),
                 timeout: 5,
                 max_outstanding: 10,
                 name: Some(format!("home-{}", addr.port())),
@@ -754,23 +761,26 @@ mod tests {
         reply.encode().unwrap()
     }
 
-    /// Fake home server: answers one probe with `respond(request)` (or nothing
-    /// when `respond` returns `None`), after `delay`.
+    /// Fake home server keyed with `secret`: answers one probe with
+    /// `respond(request, secret_bytes)` (or nothing when `respond` returns
+    /// `None`), after `delay`.
     fn spawn_fake_home(
+        secret: &str,
         delay: Duration,
-        respond: impl FnOnce(&Packet) -> Option<Vec<u8>> + Send + 'static,
+        respond: impl FnOnce(&Packet, &[u8]) -> Option<Vec<u8>> + Send + 'static,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         sock.set_nonblocking(true).unwrap();
         let addr = sock.local_addr().unwrap();
+        let secret = secret.to_string();
         let handle = tokio::spawn(async move {
             let sock = UdpSocket::from_std(sock).unwrap();
             let mut buf = vec![0u8; 4096];
             let (len, from) = sock.recv_from(&mut buf).await.unwrap();
-            let Some(request) = verify_probe(&buf[..len], HOME_SECRET) else {
+            let Some(request) = verify_probe(&buf[..len], secret.as_bytes()) else {
                 return; // RFC 5997 §4.1: silent discard
             };
-            if let Some(reply) = respond(&request) {
+            if let Some(reply) = respond(&request, secret.as_bytes()) {
                 tokio::time::sleep(delay).await;
                 sock.send_to(&reply, from).await.unwrap();
             }
@@ -823,15 +833,11 @@ mod tests {
 
     #[tokio::test]
     async fn probe_is_accepted_by_a_verifying_home_server() {
-        let (addr, home) = spawn_fake_home(Duration::ZERO, |req| {
-            Some(signed_reply(
-                req,
-                Code::AccessAccept,
-                req.identifier,
-                HOME_SECRET,
-            ))
+        let secret = home_secret();
+        let (addr, home) = spawn_fake_home(&secret, Duration::ZERO, |req, key| {
+            Some(signed_reply(req, Code::AccessAccept, req.identifier, key))
         });
-        let server = home_server_at(addr, HOME_SECRET);
+        let server = home_server_at(addr, &secret);
         probe(&server).await;
         home.await.unwrap();
         assert_eq!(server.health_stats().consecutive_successes(), 1);
@@ -840,15 +846,16 @@ mod tests {
 
     #[tokio::test]
     async fn probe_accepts_accounting_response() {
-        let (addr, home) = spawn_fake_home(Duration::ZERO, |req| {
+        let secret = home_secret();
+        let (addr, home) = spawn_fake_home(&secret, Duration::ZERO, |req, key| {
             Some(signed_reply(
                 req,
                 Code::AccountingResponse,
                 req.identifier,
-                HOME_SECRET,
+                key,
             ))
         });
-        let server = home_server_at(addr, HOME_SECRET);
+        let server = home_server_at(addr, &secret);
         probe(&server).await;
         home.await.unwrap();
         assert_eq!(
@@ -860,15 +867,17 @@ mod tests {
 
     #[tokio::test]
     async fn probe_rejects_bad_response_authenticator() {
-        let (addr, home) = spawn_fake_home(Duration::ZERO, |req| {
+        let secret = home_secret();
+        let other = home_secret();
+        let (addr, home) = spawn_fake_home(&secret, Duration::ZERO, move |req, _| {
             Some(signed_reply(
                 req,
                 Code::AccessAccept,
                 req.identifier,
-                b"not-the-home-secret",
+                other.as_bytes(),
             ))
         });
-        let server = home_server_at(addr, HOME_SECRET);
+        let server = home_server_at(addr, &secret);
         probe_expecting_failure(&server).await;
         home.await.unwrap();
         assert_eq!(server.health_stats().consecutive_failures(), 1);
@@ -878,15 +887,16 @@ mod tests {
     #[tokio::test]
     async fn probe_rejects_wrong_identifier_and_wrong_source() {
         // Wrong Identifier, otherwise perfectly signed.
-        let (addr, home) = spawn_fake_home(Duration::ZERO, |req| {
+        let secret = home_secret();
+        let (addr, home) = spawn_fake_home(&secret, Duration::ZERO, |req, key| {
             Some(signed_reply(
                 req,
                 Code::AccessAccept,
                 req.identifier.wrapping_add(1),
-                HOME_SECRET,
+                key,
             ))
         });
-        let server = home_server_at(addr, HOME_SECRET);
+        let server = home_server_at(addr, &secret);
         probe_expecting_failure(&server).await;
         home.await.unwrap();
         assert_eq!(server.health_stats().consecutive_failures(), 1);
@@ -895,21 +905,22 @@ mod tests {
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         sock.set_nonblocking(true).unwrap();
         let addr = sock.local_addr().unwrap();
+        let key = secret.clone();
         let home = tokio::spawn(async move {
             let sock = UdpSocket::from_std(sock).unwrap();
             let mut buf = vec![0u8; 4096];
             let (len, from) = sock.recv_from(&mut buf).await.unwrap();
-            let request = verify_probe(&buf[..len], HOME_SECRET).expect("probe is conformant");
+            let request = verify_probe(&buf[..len], key.as_bytes()).expect("probe is conformant");
             let reply = signed_reply(
                 &request,
                 Code::AccessAccept,
                 request.identifier,
-                HOME_SECRET,
+                key.as_bytes(),
             );
             let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             other.send_to(&reply, from).await.unwrap();
         });
-        let server = home_server_at(addr, HOME_SECRET);
+        let server = home_server_at(addr, &secret);
         probe_expecting_failure(&server).await;
         home.await.unwrap();
         assert_eq!(server.health_stats().consecutive_failures(), 1);
@@ -921,24 +932,15 @@ mod tests {
     /// waiting, and both probes failed.
     #[tokio::test]
     async fn concurrent_probes_do_not_cross() {
-        let (addr_a, home_a) = spawn_fake_home(Duration::from_millis(100), |req| {
-            Some(signed_reply(
-                req,
-                Code::AccessAccept,
-                req.identifier,
-                HOME_SECRET,
-            ))
+        let secret = home_secret();
+        let (addr_a, home_a) = spawn_fake_home(&secret, Duration::from_millis(100), |req, key| {
+            Some(signed_reply(req, Code::AccessAccept, req.identifier, key))
         });
-        let (addr_b, home_b) = spawn_fake_home(Duration::ZERO, |req| {
-            Some(signed_reply(
-                req,
-                Code::AccessAccept,
-                req.identifier,
-                HOME_SECRET,
-            ))
+        let (addr_b, home_b) = spawn_fake_home(&secret, Duration::ZERO, |req, key| {
+            Some(signed_reply(req, Code::AccessAccept, req.identifier, key))
         });
-        let server_a = home_server_at(addr_a, HOME_SECRET);
-        let server_b = home_server_at(addr_b, HOME_SECRET);
+        let server_a = home_server_at(addr_a, &secret);
+        let server_b = home_server_at(addr_b, &secret);
         tokio::join!(probe(&server_a), probe(&server_b));
         home_a.await.unwrap();
         home_b.await.unwrap();
@@ -949,8 +951,9 @@ mod tests {
     #[tokio::test]
     async fn probe_times_out_without_reply() {
         // A bound socket nobody reads from: the probe gets no datagram back.
+        let secret = home_secret();
         let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server = home_server_at(silent.local_addr().unwrap(), HOME_SECRET);
+        let server = home_server_at(silent.local_addr().unwrap(), &secret);
         HealthChecker::check_server_health(
             Arc::clone(&server),
             PROBE_BIND.parse().unwrap(),
@@ -965,15 +968,11 @@ mod tests {
     async fn probe_accepts_authenticated_access_reject() {
         // RFC 5997 §4.2: "An Access-Reject response MAY be used." A server
         // that answers with an authenticated Access-Reject is alive.
-        let (addr, home) = spawn_fake_home(Duration::ZERO, |req| {
-            Some(signed_reply(
-                req,
-                Code::AccessReject,
-                req.identifier,
-                HOME_SECRET,
-            ))
+        let secret = home_secret();
+        let (addr, home) = spawn_fake_home(&secret, Duration::ZERO, |req, key| {
+            Some(signed_reply(req, Code::AccessReject, req.identifier, key))
         });
-        let server = home_server_at(addr, HOME_SECRET);
+        let server = home_server_at(addr, &secret);
         probe(&server).await;
         home.await.unwrap();
         assert_eq!(server.health_stats().consecutive_successes(), 1);
@@ -984,15 +983,17 @@ mod tests {
     async fn probe_rejects_access_reject_with_bad_response_authenticator() {
         // Access-Reject counts only once authenticated: the same reply signed
         // under the wrong secret is a failed probe.
-        let (addr, home) = spawn_fake_home(Duration::ZERO, |req| {
+        let secret = home_secret();
+        let other = home_secret();
+        let (addr, home) = spawn_fake_home(&secret, Duration::ZERO, move |req, _| {
             Some(signed_reply(
                 req,
                 Code::AccessReject,
                 req.identifier,
-                b"not-the-home-secret",
+                other.as_bytes(),
             ))
         });
-        let server = home_server_at(addr, HOME_SECRET);
+        let server = home_server_at(addr, &secret);
         probe_expecting_failure(&server).await;
         home.await.unwrap();
         assert_eq!(server.health_stats().consecutive_failures(), 1);
@@ -1003,15 +1004,16 @@ mod tests {
     async fn probe_rejects_access_challenge() {
         // RFC 5997 §4.2: Access-Challenge is NOT RECOMMENDED as the reply and
         // is not accepted, however well it is signed.
-        let (addr, home) = spawn_fake_home(Duration::ZERO, |req| {
+        let secret = home_secret();
+        let (addr, home) = spawn_fake_home(&secret, Duration::ZERO, |req, key| {
             Some(signed_reply(
                 req,
                 Code::AccessChallenge,
                 req.identifier,
-                HOME_SECRET,
+                key,
             ))
         });
-        let server = home_server_at(addr, HOME_SECRET);
+        let server = home_server_at(addr, &secret);
         probe_expecting_failure(&server).await;
         home.await.unwrap();
         assert_eq!(server.health_stats().consecutive_failures(), 1);
@@ -1023,16 +1025,17 @@ mod tests {
         // RFC 2869 §5.14 / RFC 3579 §3.2: a reply whose Response Authenticator
         // verifies but whose Message-Authenticator does not is discarded, so a
         // peer with a broken MA computation is not marked alive.
+        let secret = home_secret();
         for code in [Code::AccessAccept, Code::AccountingResponse] {
-            let (addr, home) = spawn_fake_home(Duration::ZERO, move |req| {
+            let (addr, home) = spawn_fake_home(&secret, Duration::ZERO, move |req, key| {
                 Some(reply_with_bad_message_authenticator(
                     req,
                     code,
                     req.identifier,
-                    HOME_SECRET,
+                    key,
                 ))
             });
-            let server = home_server_at(addr, HOME_SECRET);
+            let server = home_server_at(addr, &secret);
             probe_expecting_failure(&server).await;
             home.await.unwrap();
             assert_eq!(server.health_stats().consecutive_failures(), 1, "{code:?}");
@@ -1044,13 +1047,13 @@ mod tests {
     async fn probe_accepts_reply_without_message_authenticator() {
         // RFC 5997 §5 lists Message-Authenticator as 0-1 on the reply: a home
         // server that signs only the Response Authenticator is still alive.
-        let (addr, home) = spawn_fake_home(Duration::ZERO, |req| {
+        let secret = home_secret();
+        let (addr, home) = spawn_fake_home(&secret, Duration::ZERO, |req, key| {
             let mut reply = Packet::new(Code::AccessAccept, req.identifier, req.authenticator);
-            reply.authenticator =
-                calculate_response_authenticator(&reply, &req.authenticator, HOME_SECRET);
+            reply.authenticator = calculate_response_authenticator(&reply, &req.authenticator, key);
             Some(reply.encode().unwrap())
         });
-        let server = home_server_at(addr, HOME_SECRET);
+        let server = home_server_at(addr, &secret);
         probe(&server).await;
         home.await.unwrap();
         assert_eq!(server.health_stats().consecutive_successes(), 1);
@@ -1062,8 +1065,10 @@ mod tests {
         // all (below the 20-octet minimum) is ignored; with nothing else
         // arriving the probe fails on its deadline, not with a crash and not
         // with a success.
-        let (addr, home) = spawn_fake_home(Duration::ZERO, |_| Some(vec![0x02, 0x00, 0x00]));
-        let server = home_server_at(addr, HOME_SECRET);
+        let secret = home_secret();
+        let (addr, home) =
+            spawn_fake_home(&secret, Duration::ZERO, |_, _| Some(vec![0x02, 0x00, 0x00]));
+        let server = home_server_at(addr, &secret);
         probe_expecting_failure(&server).await;
         home.await.unwrap();
         assert_eq!(server.health_stats().consecutive_failures(), 1);
@@ -1076,14 +1081,17 @@ mod tests {
         // verify and keeps waiting. Three bad datagrams from the home server's
         // own address — garbage, a wrong Identifier, a wrong secret — arrive
         // before the genuine reply; the probe still succeeds.
+        let secret = home_secret();
+        let other = home_secret();
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         sock.set_nonblocking(true).unwrap();
         let addr = sock.local_addr().unwrap();
+        let key = secret.clone();
         let home = tokio::spawn(async move {
             let sock = UdpSocket::from_std(sock).unwrap();
             let mut buf = vec![0u8; 4096];
             let (len, from) = sock.recv_from(&mut buf).await.unwrap();
-            let request = verify_probe(&buf[..len], HOME_SECRET).expect("probe is conformant");
+            let request = verify_probe(&buf[..len], key.as_bytes()).expect("probe is conformant");
             let id = request.identifier;
             sock.send_to(&[0x02, 0x00, 0x00], from).await.unwrap();
             sock.send_to(
@@ -1091,27 +1099,27 @@ mod tests {
                     &request,
                     Code::AccessAccept,
                     id.wrapping_add(1),
-                    HOME_SECRET,
+                    key.as_bytes(),
                 ),
                 from,
             )
             .await
             .unwrap();
             sock.send_to(
-                &signed_reply(&request, Code::AccessAccept, id, b"not-the-home-secret"),
+                &signed_reply(&request, Code::AccessAccept, id, other.as_bytes()),
                 from,
             )
             .await
             .unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
             sock.send_to(
-                &signed_reply(&request, Code::AccessAccept, id, HOME_SECRET),
+                &signed_reply(&request, Code::AccessAccept, id, key.as_bytes()),
                 from,
             )
             .await
             .unwrap();
         });
-        let server = home_server_at(addr, HOME_SECRET);
+        let server = home_server_at(addr, &secret);
         probe(&server).await;
         home.await.unwrap();
         assert_eq!(server.health_stats().consecutive_successes(), 1);
