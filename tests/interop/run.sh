@@ -57,7 +57,9 @@ trap cleanup EXIT
 echo "== building images"
 compose --profile test build
 echo "== starting FreeRADIUS, usg-radius proxy, usg-radius home"
-compose up -d freeradius usg-proxy usg-home
+# --force-recreate: a fresh container per run, so the probe check below reads
+# this run's proxy log and not a kept container's earlier lines.
+compose up -d --force-recreate freeradius usg-proxy usg-home
 echo "== running checks in the nas container"
 compose run --rm --no-deps nas
 

@@ -275,7 +275,6 @@ Per RFC 2865 Section 3:
 **Monitoring (RFC 5997):**
 
 - **Status-Server (12)**: Liveness probe; must carry a Message-Authenticator, answered with Access-Accept on the authentication port or Accounting-Response on the accounting port (RFC 5997)
-- **Status-Client (13)**: Client health check response
 
 **Dynamic Authorization (RFC 5176, server-originated over RadSec):**
 

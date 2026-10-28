@@ -101,8 +101,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Authenticator, a Message-Authenticator of its own and any Proxy-State
   echoed in order (§4.1, RFC 2865 §5.33), and no State or EAP-Message. The
   proxy keeps answering Status-Server itself and never forwards it (§4.3).
-- **Interop scenario 14: Status-Server and the accounting port** (64
-  assertions, up from 57). radclient, which signs each Status-Server and
+  The proxy's home-server probes are RFC 5997 clients: a random Request
+  Authenticator and Identifier, a Message-Authenticator under the home
+  server's secret, one ephemeral socket per probe, and a reply counts only
+  if it comes from the probed address with the same Identifier and its
+  Response Authenticator (and Message-Authenticator, when present) verify;
+  Access-Accept, Accounting-Response and an authenticated Access-Reject
+  mean alive, and a datagram that fails any check is skipped while the probe
+  keeps waiting for its deadline.
+- **Interop scenario 14: Status-Server and the accounting port** (67
+  assertions, up from 57, plus a host-side check that the proxy's own
+  Status-Server probes are answered by FreeRADIUS and usg-home). radclient, which signs each Status-Server and
   verifies the reply's Response Authenticator and Message-Authenticator
   before it prints `Received`, gets Access-Accept from the proxy and from
   usg-home on 1812, Accounting-Response from usg-home on 1813 for a
@@ -136,7 +145,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Accounting-Request on the authentication port is discarded by default.**
   With the new default `"accounting_port": 1813` (and with `"disabled"`) a
   Code 4 packet arriving on `listen_port` gets no reply and one warn line
-  (`Discarded packet: code not accepted on this port (RFC 2866 §2)` with the
+  (`Discarded packet: code not accepted on this port (accounting has its own
+  port, RFC 2866 §2)` with the
   client IP and Identifier); previously it was answered there. A NAS that
   sends accounting to 1812 stops getting Accounting-Response and will
   retransmit. Migration: point the NAS's accounting server at 1813, or set
