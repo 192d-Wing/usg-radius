@@ -13,8 +13,14 @@
 //! server alive; Access-Challenge is NOT RECOMMENDED there and is not accepted.
 //! A datagram that fails any check is discarded and the probe keeps waiting
 //! until its deadline, so a stray datagram cannot fail a healthy server.
+//!
+//! A `transport = "radsec"` home server is probed over its RadSec link
+//! (RFC 6614 §3.4: Status-Server as the application-layer watchdog of the
+//! long-lived connection), with the same packet and the same reply checks;
+//! the TLS peer authentication stands in for the source-address check.
 
-use crate::proxy::home_server::{HomeServer, HomeServerState};
+use crate::proxy::error::ProxyResult;
+use crate::proxy::home_server::{HomeServer, HomeServerState, HomeServerTransport};
 use crate::server::{MessageAuthenticatorCheck, check_message_authenticator};
 use radius_proto::attributes::{Attribute, AttributeType};
 use radius_proto::auth::{generate_request_authenticator, verify_response_authenticator};
@@ -243,22 +249,63 @@ impl HealthChecker {
 
     /// Check health of a single server using Status-Server request (RFC 5997).
     ///
-    /// The probe binds its own ephemeral socket at `probe_bind_addr`, sends a
-    /// Status-Server with a random Request Authenticator and Identifier and a
-    /// Message-Authenticator under the server's secret, and counts the probe as
-    /// a success only when a datagram from the server's address carries the
-    /// same Identifier, Code 2, 3 or 5, a Response Authenticator that verifies
-    /// under that secret and, if present, a Message-Authenticator that does
-    /// too. Anything else — including a reply from the right address that
-    /// fails verification — is discarded and the probe keeps waiting; only the
-    /// deadline (or a socket error) fails it. A stray or forged datagram can
-    /// therefore neither make a server look up nor make a healthy one look down.
+    /// Over UDP the probe binds its own ephemeral socket at `probe_bind_addr`,
+    /// sends a Status-Server with a random Request Authenticator and
+    /// Identifier and a Message-Authenticator under the server's secret, and
+    /// counts the probe as a success only when a datagram from the server's
+    /// address carries the same Identifier, Code 2, 3 or 5, a Response
+    /// Authenticator that verifies under that secret and, if present, a
+    /// Message-Authenticator that does too. Anything else — including a reply
+    /// from the right address that fails verification — is discarded and the
+    /// probe keeps waiting; only the deadline (or a socket error) fails it. A
+    /// stray or forged datagram can therefore neither make a server look up
+    /// nor make a healthy one look down.
+    ///
+    /// Over RadSec the same packet goes down the server's link and the same
+    /// checks apply to what comes back on it (see [`Self::probe_over_link`]).
     async fn check_server_health(
         server: Arc<HomeServer>,
         probe_bind_addr: SocketAddr,
         timeout: Duration,
     ) {
-        // Get or create health stats for this server
+        match server.transport() {
+            HomeServerTransport::Udp => {
+                Self::probe_over_udp(server, probe_bind_addr, timeout).await
+            }
+            HomeServerTransport::Radsec => {
+                #[cfg(feature = "tls")]
+                match server.link() {
+                    Some(link) => {
+                        let link = link.clone();
+                        Self::probe_over_link(server, &link, timeout).await;
+                    }
+                    None => {
+                        warn!(
+                            server = %server.name,
+                            "Status-Server probe: RadSec home server has no link attached"
+                        );
+                        server.health_stats().record_failure();
+                    }
+                }
+                #[cfg(not(feature = "tls"))]
+                {
+                    // Unreachable after config validation.
+                    warn!(
+                        server = %server.name,
+                        "Status-Server probe: RadSec home server in a binary without `tls`"
+                    );
+                    server.health_stats().record_failure();
+                }
+            }
+        }
+    }
+
+    /// The UDP probe described on [`Self::check_server_health`].
+    async fn probe_over_udp(
+        server: Arc<HomeServer>,
+        probe_bind_addr: SocketAddr,
+        timeout: Duration,
+    ) {
         let stats = server.health_stats();
 
         let socket = match UdpSocket::bind(probe_bind_addr).await {
@@ -274,50 +321,13 @@ impl HealthChecker {
             }
         };
 
-        // RFC 5997 §3: random Request Authenticator; the Identifier is random
-        // too so a stale reply from an earlier probe cannot match.
-        let request_auth = generate_request_authenticator();
-        let identifier: u8 = rand::rng().random();
-        let mut request = Packet::new(Code::StatusServer, identifier, request_auth);
-
-        // RFC 5997 §4.1: the request MUST carry a Message-Authenticator,
-        // HMAC-MD5 under the home server's secret over the packet with the
-        // attribute value zeroed (RFC 2869 §5.14).
-        let zeroed_ma =
-            match Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]) {
-                Ok(attr) => attr,
-                Err(e) => {
-                    warn!(
-                        server = %server.name,
-                        error = %e,
-                        "Failed to build the Status-Server Message-Authenticator"
-                    );
-                    stats.record_failure();
-                    return;
-                }
-            };
-        request.add_attribute(zeroed_ma);
-        let request_data = match request.encode() {
-            Ok(bytes) => {
-                let mac = calculate_message_authenticator(&bytes, server.secret());
-                if let Some(ma) = request
-                    .attributes
-                    .iter_mut()
-                    .find(|a| a.attr_type == AttributeType::MessageAuthenticator as u8)
-                {
-                    ma.value = mac.to_vec();
-                }
-                request.encode()
-            }
-            Err(e) => Err(e),
-        };
-        let request_data = match request_data {
-            Ok(data) => data,
+        let (request_data, identifier, request_auth) = match build_probe(server.secret()) {
+            Ok(probe) => probe,
             Err(e) => {
                 warn!(
                     server = %server.name,
                     error = %e,
-                    "Failed to encode Status-Server request"
+                    "Failed to build Status-Server request"
                 );
                 stats.record_failure();
                 return;
@@ -381,7 +391,87 @@ impl HealthChecker {
         }
     }
 
-    /// Every check a probe reply must pass before `server` counts as alive.
+    /// The probe over a RadSec link (RFC 6614 §3.4). The probe registers for
+    /// its Identifier **before** sending so a fast reply cannot be missed;
+    /// a link that is down fails the probe at once (nothing to wait for);
+    /// a link lost while waiting fails it as soon as the link task says so.
+    /// Frames that fail [`verify_probe_packet`] are discarded and the probe
+    /// keeps waiting, as over UDP. There is no source-address check: the TLS
+    /// peer is the authenticated home server.
+    #[cfg(feature = "tls")]
+    async fn probe_over_link(
+        server: Arc<HomeServer>,
+        link: &crate::proxy::radsec_client::RadsecLinkHandle,
+        timeout: Duration,
+    ) {
+        let stats = server.health_stats();
+
+        let (request_data, identifier, request_auth) = match build_probe(server.secret()) {
+            Ok(probe) => probe,
+            Err(e) => {
+                warn!(
+                    server = %server.name,
+                    error = %e,
+                    "Failed to build Status-Server request"
+                );
+                stats.record_failure();
+                return;
+            }
+        };
+
+        let mut replies = link.register_probe(identifier);
+        if let Err(e) = link.send(request_data) {
+            warn!(
+                server = %server.name,
+                error = %e.into_proxy_error(&server.name),
+                "Failed to send Status-Server request over the RadSec link"
+            );
+            stats.record_failure();
+            return;
+        }
+
+        let wait = time::timeout(timeout, async {
+            loop {
+                let Some(reply) = replies.recv().await else {
+                    return None; // link lost
+                };
+                if let Some(code) = verify_probe_packet(&server, &reply, identifier, &request_auth)
+                {
+                    return Some(code);
+                }
+            }
+        })
+        .await;
+
+        match wait {
+            Ok(Some(code)) => {
+                debug!(
+                    server = %server.name,
+                    code = ?code,
+                    "Status-Server check successful"
+                );
+                stats.record_success();
+            }
+            Ok(None) => {
+                warn!(
+                    server = %server.name,
+                    "RadSec link lost while waiting for the Status-Server response"
+                );
+                stats.record_failure();
+            }
+            Err(_) => {
+                warn!(
+                    server = %server.name,
+                    timeout_secs = timeout.as_secs(),
+                    "Status-Server request timed out"
+                );
+                stats.record_failure();
+            }
+        }
+    }
+
+    /// Every check a UDP probe reply must pass before `server` counts as
+    /// alive: the source address, then everything in [`verify_probe_packet`].
     /// Returns the reply code on success; on any failure logs at `debug!`
     /// (naming the check — never the secret or the MAC bytes) and returns
     /// `None` so the caller keeps waiting for the real reply.
@@ -417,69 +507,7 @@ impl HealthChecker {
             }
         };
 
-        if response.identifier != identifier {
-            debug!(
-                server = %server.name,
-                expected = identifier,
-                actual = response.identifier,
-                "Ignoring Status-Server reply with the wrong Identifier"
-            );
-            return None;
-        }
-
-        // RFC 5997 §4.2: Access-Accept from an authentication port,
-        // Accounting-Response from an accounting port; an Access-Reject "MAY be
-        // used" and, once authenticated, still proves the server is up.
-        // Access-Challenge is NOT RECOMMENDED there and is not accepted.
-        if !matches!(
-            response.code,
-            Code::AccessAccept | Code::AccessReject | Code::AccountingResponse
-        ) {
-            debug!(
-                server = %server.name,
-                code = ?response.code,
-                "Ignoring Status-Server reply with an unexpected code"
-            );
-            return None;
-        }
-
-        // RFC 5997 §4.4 / RFC 2865 §3: a reply whose Response Authenticator
-        // does not verify under the secret is discarded.
-        if !verify_response_authenticator(&response, request_auth, server.secret()) {
-            debug!(
-                server = %server.name,
-                code = ?response.code,
-                "Ignoring Status-Server reply that failed the Response Authenticator check"
-            );
-            return None;
-        }
-
-        // RFC 2869 §5.14 / RFC 3579 §3.2: a client receiving a reply that
-        // carries a Message-Authenticator MUST verify it (HMAC-MD5 with the
-        // Request Authenticator in the header) and silently discard the packet
-        // on mismatch. A reply without one is accepted: RFC 5997 §5 lists the
-        // attribute as 0-1 on Access-Accept / Accounting-Response.
-        match check_message_authenticator(&response, request_auth, server.secret()) {
-            Ok(MessageAuthenticatorCheck::Valid) | Ok(MessageAuthenticatorCheck::Absent) => {
-                Some(response.code)
-            }
-            Ok(MessageAuthenticatorCheck::Invalid) => {
-                debug!(
-                    server = %server.name,
-                    code = ?response.code,
-                    "Ignoring Status-Server reply that failed the Message-Authenticator check"
-                );
-                None
-            }
-            Err(e) => {
-                debug!(
-                    server = %server.name,
-                    error = %e,
-                    "Ignoring Status-Server reply that could not be re-encoded"
-                );
-                None
-            }
-        }
+        verify_probe_packet(server, &response, identifier, request_auth)
     }
 
     /// Update server state based on consecutive failures/successes
@@ -534,6 +562,117 @@ impl HealthChecker {
 impl Drop for HealthChecker {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Build one RFC 5997 Status-Server probe keyed with `secret`: random Request
+/// Authenticator (§3) and random Identifier (so a stale reply from an earlier
+/// probe cannot match), and the Message-Authenticator §4.1 requires. Returns
+/// the encoded packet, its Identifier and its Request Authenticator.
+fn build_probe(secret: &[u8]) -> ProxyResult<(Vec<u8>, u8, [u8; 16])> {
+    let request_auth = generate_request_authenticator();
+    let identifier: u8 = rand::rng().random();
+    let bytes = build_probe_with(secret, identifier, request_auth)?;
+    Ok((bytes, identifier, request_auth))
+}
+
+/// [`build_probe`] with the Identifier and Request Authenticator given, so
+/// the packet can be pinned against an independently computed vector.
+///
+/// RFC 5997 §4.1: the request MUST carry a Message-Authenticator, HMAC-MD5
+/// under the home server's secret over the packet with the attribute value
+/// zeroed (RFC 2869 §5.14). Over RadSec `secret` is the fixed `"radsec"`
+/// (RFC 6614 §2.3).
+fn build_probe_with(secret: &[u8], identifier: u8, request_auth: [u8; 16]) -> ProxyResult<Vec<u8>> {
+    let mut request = Packet::new(Code::StatusServer, identifier, request_auth);
+    request.add_attribute(Attribute::new(
+        AttributeType::MessageAuthenticator as u8,
+        vec![0u8; 16],
+    )?);
+    let mac = calculate_message_authenticator(&request.encode()?, secret);
+    if let Some(ma) = request
+        .attributes
+        .iter_mut()
+        .find(|a| a.attr_type == AttributeType::MessageAuthenticator as u8)
+    {
+        ma.value = mac.to_vec();
+    }
+    Ok(request.encode()?)
+}
+
+/// Every check a decoded probe reply must pass before `server` counts as
+/// alive, whatever transport it arrived on: Identifier, Code, Response
+/// Authenticator (RFC 5997 §4.4) and, when present, Message-Authenticator.
+/// Returns the reply code on success; on any failure logs at `debug!` (naming
+/// the check — never the secret or the MAC bytes) and returns `None`.
+fn verify_probe_packet(
+    server: &HomeServer,
+    response: &Packet,
+    identifier: u8,
+    request_auth: &[u8; 16],
+) -> Option<Code> {
+    if response.identifier != identifier {
+        debug!(
+            server = %server.name,
+            expected = identifier,
+            actual = response.identifier,
+            "Ignoring Status-Server reply with the wrong Identifier"
+        );
+        return None;
+    }
+
+    // RFC 5997 §4.2: Access-Accept from an authentication port,
+    // Accounting-Response from an accounting port; an Access-Reject "MAY be
+    // used" and, once authenticated, still proves the server is up.
+    // Access-Challenge is NOT RECOMMENDED there and is not accepted.
+    if !matches!(
+        response.code,
+        Code::AccessAccept | Code::AccessReject | Code::AccountingResponse
+    ) {
+        debug!(
+            server = %server.name,
+            code = ?response.code,
+            "Ignoring Status-Server reply with an unexpected code"
+        );
+        return None;
+    }
+
+    // RFC 5997 §4.4 / RFC 2865 §3: a reply whose Response Authenticator
+    // does not verify under the secret is discarded.
+    if !verify_response_authenticator(response, request_auth, server.secret()) {
+        debug!(
+            server = %server.name,
+            code = ?response.code,
+            "Ignoring Status-Server reply that failed the Response Authenticator check"
+        );
+        return None;
+    }
+
+    // RFC 2869 §5.14 / RFC 3579 §3.2: a client receiving a reply that
+    // carries a Message-Authenticator MUST verify it (HMAC-MD5 with the
+    // Request Authenticator in the header) and silently discard the packet
+    // on mismatch. A reply without one is accepted: RFC 5997 §5 lists the
+    // attribute as 0-1 on Access-Accept / Accounting-Response.
+    match check_message_authenticator(response, request_auth, server.secret()) {
+        Ok(MessageAuthenticatorCheck::Valid) | Ok(MessageAuthenticatorCheck::Absent) => {
+            Some(response.code)
+        }
+        Ok(MessageAuthenticatorCheck::Invalid) => {
+            debug!(
+                server = %server.name,
+                code = ?response.code,
+                "Ignoring Status-Server reply that failed the Message-Authenticator check"
+            );
+            None
+        }
+        Err(e) => {
+            debug!(
+                server = %server.name,
+                error = %e,
+                "Ignoring Status-Server reply that could not be re-encoded"
+            );
+            None
+        }
     }
 }
 
@@ -613,11 +752,8 @@ mod tests {
     #[test]
     fn test_update_server_state_mark_down() {
         let config = HomeServerConfig {
-            address: "127.0.0.1:1812".to_string(),
-            secret: "test_secret".to_string(),
-            timeout: 30,
-            max_outstanding: 100,
             name: Some("test_server".to_string()),
+            ..HomeServerConfig::udp("127.0.0.1:1812", "test_secret")
         };
 
         let server = Arc::new(HomeServer::new(config).unwrap());
@@ -638,11 +774,8 @@ mod tests {
     #[test]
     fn test_update_server_state_recover() {
         let config = HomeServerConfig {
-            address: "127.0.0.1:1812".to_string(),
-            secret: "test_secret".to_string(),
-            timeout: 30,
-            max_outstanding: 100,
             name: Some("test_server".to_string()),
+            ..HomeServerConfig::udp("127.0.0.1:1812", "test_secret")
         };
 
         let server = Arc::new(HomeServer::new(config).unwrap());
@@ -668,11 +801,8 @@ mod tests {
 
         // Create a test server
         let server_config = HomeServerConfig {
-            address: "127.0.0.1:1812".to_string(),
-            secret: "test_secret".to_string(),
-            timeout: 30,
-            max_outstanding: 100,
             name: Some("test_server".to_string()),
+            ..HomeServerConfig::udp("127.0.0.1:1812", "test_secret")
         };
         let server = Arc::new(HomeServer::new(server_config).unwrap());
 
@@ -708,11 +838,10 @@ mod tests {
     fn home_server_at(addr: SocketAddr, secret: &str) -> Arc<HomeServer> {
         Arc::new(
             HomeServer::new(HomeServerConfig {
-                address: addr.to_string(),
-                secret: secret.to_string(),
                 timeout: 5,
                 max_outstanding: 10,
                 name: Some(format!("home-{}", addr.port())),
+                ..HomeServerConfig::udp(addr.to_string(), secret)
             })
             .unwrap(),
         )
@@ -1141,5 +1270,314 @@ mod tests {
         ));
         assert!(!same_peer("10.77.0.10:1813".parse().unwrap(), home));
         assert!(!same_peer("[::1]:1812".parse().unwrap(), home));
+    }
+
+    // --- Known-answer vector: the probe as sent over a RadSec link -----------
+
+    // Generated by tests/vectors/radsec_status_server_vector.py, an independent
+    // implementation written from RFC 5997 §3/§4.1, RFC 2869 §5.14 and
+    // RFC 6614 §2.3 (Python standard library only, self-checked against the
+    // RFC 2202 HMAC-MD5 test case 2). Inputs: secret "radsec", Identifier
+    // 0x5a, Request Authenticator a0 a1 .. af.
+    const KAT_IDENTIFIER: u8 = 0x5a;
+    const KAT_REQUEST_AUTHENTICATOR: &str = "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf";
+    const KAT_MESSAGE_AUTHENTICATOR: &str = "87a91107160f1ca1f12ec3304cbe2752";
+    const KAT_PACKET: &str =
+        "0c5a0026a0a1a2a3a4a5a6a7a8a9aaabacadaeaf501287a91107160f1ca1f12ec3304cbe2752";
+
+    #[test]
+    fn status_server_probe_matches_the_radsec_known_answer_vector() {
+        // RFC 6614 §2.3 fixed hop secret; a public constant, not a credential.
+        let secret = crate::radsec_frame::RADSEC_SECRET;
+        let mut request_auth = [0u8; 16];
+        request_auth.copy_from_slice(&hex::decode(KAT_REQUEST_AUTHENTICATOR).unwrap());
+
+        let packet = build_probe_with(secret, KAT_IDENTIFIER, request_auth).unwrap();
+        assert_eq!(hex::encode(&packet), KAT_PACKET);
+        assert_eq!(packet.len(), 38);
+        assert_eq!(packet[0], Code::StatusServer as u8);
+        assert_eq!(packet[1], KAT_IDENTIFIER);
+        assert_eq!(&packet[4..20], &request_auth);
+        assert_eq!(packet[20], AttributeType::MessageAuthenticator as u8);
+        assert_eq!(packet[21], 18);
+        assert_eq!(hex::encode(&packet[22..]), KAT_MESSAGE_AUTHENTICATOR);
+
+        // And the home server's view: the MAC verifies under "radsec" only.
+        assert!(verify_message_authenticator(&packet, secret, 22));
+        assert!(!verify_message_authenticator(&packet, b"radsec2", 22));
+    }
+
+    #[test]
+    fn build_probe_randomises_identifier_and_request_authenticator() {
+        let secret = home_secret();
+        let (a, id_a, auth_a) = build_probe(secret.as_bytes()).unwrap();
+        let (b, id_b, auth_b) = build_probe(secret.as_bytes()).unwrap();
+        assert_ne!(auth_a, auth_b, "RFC 5997 §3: random Request Authenticator");
+        assert_ne!((id_a, auth_a), (id_b, auth_b));
+        assert_eq!(a[1], id_a);
+        assert_eq!(b[1], id_b);
+        // Both are conformant probes a home server accepts.
+        assert!(verify_probe(&a, secret.as_bytes()).is_some());
+        assert!(verify_probe(&b, secret.as_bytes()).is_some());
+    }
+
+    // --- verify_probe_packet: the transport-independent reply checks ---------
+
+    fn kat_server(secret: &str) -> Arc<HomeServer> {
+        home_server_at("127.0.0.1:1812".parse().unwrap(), secret)
+    }
+
+    fn probe_request(secret: &str) -> (Packet, u8, [u8; 16]) {
+        let (bytes, id, auth) = build_probe(secret.as_bytes()).unwrap();
+        (Packet::decode(&bytes).unwrap(), id, auth)
+    }
+
+    #[test]
+    fn verify_probe_packet_accepts_each_permitted_code() {
+        let secret = home_secret();
+        let server = kat_server(&secret);
+        let (req, id, auth) = probe_request(&secret);
+        for code in [
+            Code::AccessAccept,
+            Code::AccessReject,
+            Code::AccountingResponse,
+        ] {
+            let reply = Packet::decode(&signed_reply(&req, code, id, secret.as_bytes())).unwrap();
+            assert_eq!(verify_probe_packet(&server, &reply, id, &auth), Some(code));
+        }
+    }
+
+    #[test]
+    fn verify_probe_packet_rejects_identifier_code_authenticator_and_mac_failures() {
+        let secret = home_secret();
+        let other = home_secret();
+        let server = kat_server(&secret);
+        let (req, id, auth) = probe_request(&secret);
+
+        // Wrong Identifier.
+        let reply = Packet::decode(&signed_reply(
+            &req,
+            Code::AccessAccept,
+            id.wrapping_add(1),
+            secret.as_bytes(),
+        ))
+        .unwrap();
+        assert_eq!(verify_probe_packet(&server, &reply, id, &auth), None);
+
+        // Access-Challenge is not accepted (RFC 5997 §4.2).
+        let reply = Packet::decode(&signed_reply(
+            &req,
+            Code::AccessChallenge,
+            id,
+            secret.as_bytes(),
+        ))
+        .unwrap();
+        assert_eq!(verify_probe_packet(&server, &reply, id, &auth), None);
+
+        // Wrong secret ⇒ Response Authenticator fails.
+        let reply = Packet::decode(&signed_reply(
+            &req,
+            Code::AccessAccept,
+            id,
+            other.as_bytes(),
+        ))
+        .unwrap();
+        assert_eq!(verify_probe_packet(&server, &reply, id, &auth), None);
+
+        // Good Response Authenticator, bad Message-Authenticator.
+        let reply = Packet::decode(&reply_with_bad_message_authenticator(
+            &req,
+            Code::AccessAccept,
+            id,
+            secret.as_bytes(),
+        ))
+        .unwrap();
+        assert_eq!(verify_probe_packet(&server, &reply, id, &auth), None);
+
+        // Wrong Request Authenticator on our side ⇒ nothing verifies.
+        let reply = Packet::decode(&signed_reply(
+            &req,
+            Code::AccessAccept,
+            id,
+            secret.as_bytes(),
+        ))
+        .unwrap();
+        assert_eq!(verify_probe_packet(&server, &reply, id, &[0u8; 16]), None);
+    }
+
+    // --- The probe over a RadSec link (RFC 6614 §3.4) -------------------------
+
+    #[cfg(feature = "tls")]
+    mod over_link {
+        use super::*;
+        use crate::proxy::home_server::HomeServerTlsConfig;
+        use crate::proxy::radsec_client::{LinkParams, spawn_link};
+        use crate::radsec_frame::RADSEC_SECRET;
+        use crate::test_pki::{
+            FakeAction, TestPaths, gen_chain, lenient_server_config, spawn_fake_tls_home,
+            spawn_radsec_home,
+        };
+        use std::time::Instant;
+
+        fn radsec_home_server(addr: SocketAddr, paths: &TestPaths) -> Arc<HomeServer> {
+            Arc::new(
+                HomeServer::new(HomeServerConfig {
+                    name: Some(format!("home-radsec-{}", addr.port())),
+                    timeout: 2,
+                    max_outstanding: 8,
+                    ..HomeServerConfig::radsec(
+                        addr.to_string(),
+                        HomeServerTlsConfig {
+                            ca_path: paths.ca.clone(),
+                            cert_path: paths.client_cert.clone(),
+                            key_path: paths.client_key.clone(),
+                            server_name: "localhost".to_string(),
+                            revocation: None,
+                        },
+                    )
+                })
+                .unwrap(),
+            )
+        }
+
+        fn fast() -> LinkParams {
+            LinkParams {
+                connect_timeout: Duration::from_secs(2),
+                initial_backoff: Duration::from_millis(40),
+                max_backoff: Duration::from_millis(160),
+                stable_after: Duration::from_secs(10),
+            }
+        }
+
+        /// Spawn and attach the link, waiting for it to come up.
+        async fn attach_connected_link(hs: &Arc<HomeServer>) {
+            let (tx, _rx) = tokio::sync::mpsc::channel(4);
+            let link = spawn_link(Arc::clone(hs), tx, fast()).unwrap();
+            hs.attach_link(link.clone());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !link.is_connected() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(hs.is_connected(), "link did not come up");
+        }
+
+        #[tokio::test]
+        async fn probe_over_the_link_against_the_real_listener_succeeds() {
+            let chain = gen_chain();
+            let (addr, _registry, paths) =
+                spawn_radsec_home(&chain, false, lenient_server_config(&[])).await;
+            let server = radsec_home_server(addr, &paths);
+            attach_connected_link(&server).await;
+
+            probe(&server).await;
+            assert_eq!(server.health_stats().consecutive_successes(), 1);
+            assert_eq!(server.health_stats().consecutive_failures(), 0);
+            assert_eq!(server.secret(), RADSEC_SECRET);
+        }
+
+        #[tokio::test]
+        async fn probe_on_a_down_link_fails_immediately() {
+            // Nothing listens: the link never comes up and the probe does not
+            // wait out its deadline.
+            let chain = gen_chain();
+            let paths = chain.write_to_tempdir();
+            let addr = {
+                let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                probe.local_addr().unwrap()
+            };
+            let server = radsec_home_server(addr, &paths);
+            let (tx, _rx) = tokio::sync::mpsc::channel(4);
+            let link = spawn_link(Arc::clone(&server), tx, fast()).unwrap();
+            server.attach_link(link);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let started = Instant::now();
+            probe_with(&server, Duration::from_secs(5)).await;
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                started.elapsed()
+            );
+            assert_eq!(server.health_stats().consecutive_failures(), 1);
+            assert_eq!(server.health_stats().consecutive_successes(), 0);
+        }
+
+        #[tokio::test]
+        async fn probe_without_an_attached_link_is_a_failure() {
+            let chain = gen_chain();
+            let paths = chain.write_to_tempdir();
+            let server = radsec_home_server("127.0.0.1:12083".parse().unwrap(), &paths);
+            probe_with(&server, Duration::from_secs(5)).await;
+            assert_eq!(server.health_stats().consecutive_failures(), 1);
+        }
+
+        #[tokio::test]
+        async fn stray_frames_do_not_fail_a_probe_the_real_reply_answers() {
+            // RFC 5997 §4.4: the fake home answers each probe first with a
+            // reply under the wrong secret (bad Response Authenticator), then
+            // one with the wrong Identifier, then the genuine reply.
+            let chain = gen_chain();
+            let paths = chain.write_to_tempdir();
+            let other = home_secret();
+            let addr = spawn_fake_tls_home(&chain, move |_, request| {
+                let id = request.identifier;
+                FakeAction::Reply(vec![
+                    signed_reply(request, Code::AccessAccept, id, other.as_bytes()),
+                    signed_reply(
+                        request,
+                        Code::AccessAccept,
+                        id.wrapping_add(1),
+                        RADSEC_SECRET,
+                    ),
+                    signed_reply(request, Code::AccessAccept, id, RADSEC_SECRET),
+                ])
+            })
+            .await;
+            let server = radsec_home_server(addr, &paths);
+            attach_connected_link(&server).await;
+
+            probe(&server).await;
+            assert_eq!(server.health_stats().consecutive_successes(), 1);
+            assert_eq!(server.health_stats().consecutive_failures(), 0);
+        }
+
+        #[tokio::test]
+        async fn probe_over_the_link_rejects_a_reply_under_the_wrong_secret() {
+            let chain = gen_chain();
+            let paths = chain.write_to_tempdir();
+            let other = home_secret();
+            let addr = spawn_fake_tls_home(&chain, move |_, request| {
+                FakeAction::Reply(vec![signed_reply(
+                    request,
+                    Code::AccessAccept,
+                    request.identifier,
+                    other.as_bytes(),
+                )])
+            })
+            .await;
+            let server = radsec_home_server(addr, &paths);
+            attach_connected_link(&server).await;
+
+            probe_expecting_failure(&server).await;
+            assert_eq!(server.health_stats().consecutive_failures(), 1);
+            assert_eq!(server.health_stats().consecutive_successes(), 0);
+        }
+
+        #[tokio::test]
+        async fn probe_fails_when_the_link_drops_while_waiting() {
+            let chain = gen_chain();
+            let paths = chain.write_to_tempdir();
+            let addr = spawn_fake_tls_home(&chain, |_, _| FakeAction::Close).await;
+            let server = radsec_home_server(addr, &paths);
+            attach_connected_link(&server).await;
+
+            let started = Instant::now();
+            probe_with(&server, Duration::from_secs(5)).await;
+            assert!(
+                started.elapsed() < Duration::from_secs(4),
+                "a lost link must fail the probe before its deadline"
+            );
+            assert_eq!(server.health_stats().consecutive_failures(), 1);
+        }
     }
 }

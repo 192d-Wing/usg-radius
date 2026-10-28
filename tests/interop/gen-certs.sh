@@ -1,8 +1,10 @@
 #!/usr/bin/env sh
 # Generate the throw-away test PKI for the interop run: one CA, two RADIUS
-# server certificates (FreeRADIUS home server, usg-radius home server), three
-# EAP-TLS client certificates whose CN is the EAP identity each run uses, and a
-# CRL from the CA that revokes one of them (client-usg-revoked).
+# server certificates (FreeRADIUS home server, usg-radius home server; the
+# FreeRADIUS one also serves its RadSec listener), one RadSec client certificate
+# for the usg-radius proxy (usg-proxy, EKU clientAuth), three EAP-TLS client
+# certificates whose CN is the EAP identity each run uses, and a CRL from the CA
+# that revokes one of them (client-usg-revoked).
 #
 # Everything lands in tests/interop/certs/ (git-ignored) with mode 0644: the
 # files are bind-mounted read-only into containers that run as unprivileged
@@ -13,7 +15,9 @@ here=$(cd "$(dirname "$0")" && pwd)
 out="$here/certs"
 days=${INTEROP_CERT_DAYS:-30}
 
-if [ -s "$out/ca.crt" ] && [ -z "${INTEROP_REGEN_CERTS:-}" ]; then
+# usg-proxy.crt is the newest file in the set: a certs/ dir from before it was
+# added is regenerated instead of reused.
+if [ -s "$out/ca.crt" ] && [ -s "$out/usg-proxy.crt" ] && [ -z "${INTEROP_REGEN_CERTS:-}" ]; then
     echo "gen-certs: reusing $out (set INTEROP_REGEN_CERTS=1 to regenerate)"
     exit 0
 fi
@@ -65,6 +69,10 @@ issue() { # issue <name> <subject CN> <section>
 # Server certificates (SAN = the compose service name).
 issue freeradius-server freeradius server
 issue usg-home-server   usg-home   server
+
+# RadSec client certificate for the proxy -> FreeRADIUS hop (RFC 6614 section
+# 2.3: mutual TLS). FreeRADIUS checks the chain against ca.crt, not the CN.
+issue usg-proxy usg-proxy client
 
 # Client certificates: CN must equal the EAP identity. usg-radius checks that
 # (EapTlsServer::verify_peer_identity); FreeRADIUS does not by default.

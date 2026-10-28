@@ -2,7 +2,7 @@
 
 use crate::proxy::cache::{ProxyCache, ProxyCacheEntry, ProxyStateKey, generate_proxy_state_key};
 use crate::proxy::error::{ProxyError, ProxyResult};
-use crate::proxy::home_server::HomeServer;
+use crate::proxy::home_server::{HomeServer, HomeServerTransport};
 use radius_proto::attributes::{Attribute, AttributeType, VendorSpecific};
 use radius_proto::auth::{
     calculate_response_authenticator, decrypt_user_password, encrypt_user_password,
@@ -69,9 +69,16 @@ impl ProxyHandler {
     /// 5. Recompute Message-Authenticator (RFC 3579 §3.2) under the home
     ///    server secret
     /// 6. Store the forwarded request in cache for correlation and retries
-    /// 7. Send modified request to home server
+    /// 7. Send modified request to home server (UDP socket or RadSec link,
+    ///    see [`ProxyHandler::send_to_home_server`])
     ///
     /// Steps 3–5 are [`rewrite_request_for_home_server`].
+    ///
+    /// A send failure (a RadSec link that is down, a socket error) is returned
+    /// to the caller **with the cache entry left in place and counted as
+    /// outstanding**: the retry manager resends it on its next tick and, after
+    /// `max_retries`, answers the NAS with a signed Access-Reject. There is no
+    /// second queue.
     ///
     /// # Returns
     /// The Proxy-State key used for correlation
@@ -134,14 +141,15 @@ impl ProxyHandler {
         // Store in cache (before sending to avoid race condition)
         self.cache.insert(entry)?;
 
+        // In the cache ⇒ in flight, whether or not the send below succeeds:
+        // the retry manager's `record_timeout` for this entry must have a
+        // `record_request` to balance, or `outstanding` would underflow.
+        home_server.stats().record_request();
+
         // Encode and send request to home server
         let request_data = request.encode()?;
-        self.socket
-            .send_to(&request_data, home_server.address)
+        self.send_to_home_server(&request_data, &home_server)
             .await?;
-
-        // Record statistics
-        home_server.stats().record_request();
 
         debug!(
             source = %source,
@@ -154,7 +162,45 @@ impl ProxyHandler {
         Ok(proxy_state)
     }
 
-    /// Handle a response from a home server
+    /// Write one encoded packet to `home_server` over its transport: the
+    /// shared UDP socket, or the server's RadSec link (RFC 6614). Every path
+    /// that talks to a home server — forwarding, retries, health probes —
+    /// goes through here. A RadSec server whose link is down fails
+    /// immediately with [`ProxyError::LinkDown`]; nothing is queued.
+    pub(crate) async fn send_to_home_server(
+        &self,
+        bytes: &[u8],
+        home_server: &HomeServer,
+    ) -> ProxyResult<()> {
+        match home_server.transport() {
+            HomeServerTransport::Udp => {
+                self.socket.send_to(bytes, home_server.address).await?;
+                Ok(())
+            }
+            HomeServerTransport::Radsec => {
+                #[cfg(feature = "tls")]
+                {
+                    let link = home_server
+                        .link()
+                        .ok_or_else(|| ProxyError::LinkDown(home_server.name.clone()))?;
+                    link.send(bytes.to_vec())
+                        .map_err(|e| e.into_proxy_error(&home_server.name))
+                }
+                #[cfg(not(feature = "tls"))]
+                {
+                    // Unreachable after config validation, which refuses a
+                    // RadSec home server in a binary without `tls`.
+                    Err(ProxyError::Configuration(format!(
+                        "home server {} uses transport = \"radsec\" but this binary was built \
+                         without the `tls` feature",
+                        home_server.name
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Handle a response from a home server received on the UDP socket.
     ///
     /// # Process
     /// 1. Extract our Proxy-State attribute (last one added)
@@ -177,6 +223,29 @@ impl ProxyHandler {
         response: Packet,
         home_server_addr: SocketAddr,
     ) -> ProxyResult<()> {
+        self.handle_response_from(response, ResponseOrigin::Udp(home_server_addr))
+            .await
+    }
+
+    /// Handle a response read off a RadSec link (RFC 6614). Same processing as
+    /// [`ProxyHandler::handle_response`]; the response is attributed to the
+    /// link's home server by `Arc` identity instead of by source address,
+    /// because the TLS peer — not an IP:port — is what authenticated it.
+    pub async fn handle_link_response(
+        &self,
+        response: Packet,
+        home_server: Arc<HomeServer>,
+    ) -> ProxyResult<()> {
+        self.handle_response_from(response, ResponseOrigin::Link(home_server))
+            .await
+    }
+
+    /// Shared body of the two `handle_*_response` entry points.
+    async fn handle_response_from(
+        &self,
+        response: Packet,
+        origin: ResponseOrigin,
+    ) -> ProxyResult<()> {
         // Extract the last Proxy-State attribute (the one we added)
         let proxy_state_attr = response
             .attributes
@@ -191,21 +260,36 @@ impl ProxyHandler {
         let mut proxy_state = [0u8; 16];
         proxy_state.copy_from_slice(&proxy_state_attr.value);
 
-        // Look up original request
+        // Look up original request. The entry is consumed only once the
+        // response is attributed to its home server, so a datagram with a
+        // guessed Proxy-State from elsewhere cannot evict a live entry.
         let entry = self
             .cache
-            .remove(&proxy_state)
+            .get(&proxy_state)
             .ok_or(ProxyError::CorrelationFailed)?;
 
-        // Verify this response is from the expected home server
-        if home_server_addr != entry.home_server.address {
+        // Verify this response is from the expected home server: for UDP the
+        // configured address of a UDP server; for a link, that very server.
+        let from_expected = match &origin {
+            ResponseOrigin::Udp(addr) => {
+                entry.home_server.transport() == HomeServerTransport::Udp
+                    && *addr == entry.home_server.address
+            }
+            ResponseOrigin::Link(home_server) => Arc::ptr_eq(home_server, &entry.home_server),
+        };
+        if !from_expected {
             warn!(
-                expected = %entry.home_server.address,
-                actual = %home_server_addr,
+                expected = %entry.home_server.name,
+                expected_transport = %entry.home_server.transport(),
+                origin = %origin,
                 "Response from unexpected home server"
             );
             return Err(ProxyError::CorrelationFailed);
         }
+        let entry = self
+            .cache
+            .remove(&proxy_state)
+            .ok_or(ProxyError::CorrelationFailed)?;
 
         // Record statistics
         entry.home_server.stats().record_response();
@@ -246,6 +330,23 @@ impl ProxyHandler {
     /// Get cache reference for statistics
     pub fn cache(&self) -> Arc<ProxyCache> {
         Arc::clone(&self.cache)
+    }
+}
+
+/// Where a home server response arrived from.
+enum ResponseOrigin {
+    /// A datagram on the shared UDP socket, from this address.
+    Udp(SocketAddr),
+    /// A frame on this home server's RadSec link.
+    Link(Arc<HomeServer>),
+}
+
+impl std::fmt::Display for ResponseOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Udp(addr) => write!(f, "udp {addr}"),
+            Self::Link(hs) => write!(f, "radsec link {}", hs.name),
+        }
     }
 }
 
@@ -1359,11 +1460,11 @@ mod tests {
 
     fn home_server_at(address: SocketAddr) -> Arc<HomeServer> {
         let config = HomeServerConfig {
-            address: address.to_string(),
-            secret: String::from_utf8(HOME_SECRET.to_vec()).unwrap(),
-            timeout: 30,
-            max_outstanding: 100,
             name: Some("Test Server".to_string()),
+            ..HomeServerConfig::udp(
+                address.to_string(),
+                String::from_utf8(HOME_SECRET.to_vec()).unwrap(),
+            )
         };
         Arc::new(HomeServer::new(config).unwrap())
     }
@@ -1412,11 +1513,8 @@ mod tests {
 
     fn create_test_home_server() -> Arc<HomeServer> {
         let config = HomeServerConfig {
-            address: "127.0.0.1:11812".to_string(),
-            secret: "home_secret".to_string(),
-            timeout: 30,
-            max_outstanding: 100,
             name: Some("Test Server".to_string()),
+            ..HomeServerConfig::udp("127.0.0.1:11812", "home_secret")
         };
         Arc::new(HomeServer::new(config).unwrap())
     }
@@ -1533,6 +1631,320 @@ mod tests {
         match result {
             Err(ProxyError::CacheFull(_)) => {}
             _ => panic!("Expected CacheFull error"),
+        }
+    }
+
+    // ---- Response origin: UDP address vs. RadSec link identity -------------
+
+    #[tokio::test]
+    async fn udp_response_for_another_server_at_a_different_address_is_rejected() {
+        let cache = Arc::new(ProxyCache::new(Duration::from_secs(60), 1000));
+        let handler = ProxyHandler::new(cache.clone(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let entry = create_test_entry("192.168.1.100:12345".parse().unwrap());
+        cache.insert(entry).unwrap();
+
+        let other: SocketAddr = "127.0.0.1:11813".parse().unwrap();
+        let err = handler
+            .handle_response(home_access_accept_with_keys(), other)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProxyError::CorrelationFailed), "{err}");
+        assert!(
+            cache.get(&PROXY_STATE).is_some(),
+            "a response from the wrong peer must not consume the entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_response_for_a_udp_entry_is_rejected() {
+        // A RadSec link cannot answer for a UDP home server, even one at the
+        // same address: identity is the Arc, not the socket address.
+        let cache = Arc::new(ProxyCache::new(Duration::from_secs(60), 1000));
+        let handler = ProxyHandler::new(cache.clone(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let entry = create_test_entry("192.168.1.100:12345".parse().unwrap());
+        let same_address_other_server = create_test_home_server();
+        assert_eq!(same_address_other_server.address, entry.home_server.address);
+        assert!(!Arc::ptr_eq(&same_address_other_server, &entry.home_server));
+        cache.insert(entry).unwrap();
+
+        let err = handler
+            .handle_link_response(home_access_accept_with_keys(), same_address_other_server)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProxyError::CorrelationFailed), "{err}");
+        assert!(cache.get(&PROXY_STATE).is_some());
+    }
+
+    #[tokio::test]
+    async fn link_response_from_the_entry_home_server_is_relayed() {
+        // The same `Arc<HomeServer>` the entry was forwarded to: accepted,
+        // re-keyed and relayed to the NAS.
+        let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cache = Arc::new(ProxyCache::new(Duration::from_secs(60), 1000));
+        let handler = ProxyHandler::new(cache.clone(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let entry = create_test_entry(nas.local_addr().unwrap());
+        let home_server = Arc::clone(&entry.home_server);
+        cache.insert(entry).unwrap();
+
+        handler
+            .handle_link_response(home_access_accept_with_keys(), home_server)
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 4096];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(5), nas.recv_from(&mut buf))
+            .await
+            .expect("relayed response within 5s")
+            .unwrap();
+        let relayed = Packet::decode(&buf[..len]).unwrap();
+        assert_eq!(relayed.code, Code::AccessAccept);
+        assert!(verify_response_authenticator(
+            &relayed,
+            &REQUEST_AUTH,
+            CLIENT_SECRET
+        ));
+        assert_eq!(
+            MppeKeys::from_packet(&relayed, CLIENT_SECRET, &REQUEST_AUTH).unwrap(),
+            Some(test_keys())
+        );
+        assert!(cache.get(&PROXY_STATE).is_none(), "entry consumed");
+    }
+
+    // ---- RadSec home servers (fixed "radsec" hop secret) --------------------
+
+    #[cfg(feature = "tls")]
+    mod radsec {
+        use super::*;
+        use crate::proxy::home_server::HomeServerTlsConfig;
+        use crate::radsec_frame::RADSEC_SECRET;
+
+        /// A RadSec home server with no link attached (the link is down).
+        fn radsec_home_server(address: &str) -> Arc<HomeServer> {
+            let tls = HomeServerTlsConfig {
+                ca_path: "/nonexistent/ca.pem".to_string(),
+                cert_path: "/nonexistent/proxy.pem".to_string(),
+                key_path: "/nonexistent/proxy.key".to_string(),
+                server_name: "home.test".to_string(),
+                revocation: None,
+            };
+            Arc::new(
+                HomeServer::new(HomeServerConfig {
+                    name: Some("home-radsec".to_string()),
+                    ..HomeServerConfig::radsec(address, tls)
+                })
+                .unwrap(),
+            )
+        }
+
+        /// `create_test_entry` re-pointed at a RadSec home server, whose
+        /// response is signed with the fixed "radsec" secret.
+        fn radsec_entry(source: SocketAddr) -> ProxyCacheEntry {
+            let mut entry = create_test_entry(source);
+            entry.home_server = radsec_home_server("127.0.0.1:12083");
+            entry
+        }
+
+        fn home_response_under_radsec(mut response: Packet) -> Packet {
+            response.add_attribute(
+                Attribute::new(AttributeType::ProxyState as u8, PROXY_STATE.to_vec()).unwrap(),
+            );
+            response.authenticator =
+                calculate_response_authenticator(&response, &REQUEST_AUTH, RADSEC_SECRET);
+            response
+        }
+
+        #[test]
+        fn request_leg_is_rekeyed_to_the_radsec_secret() {
+            let hs = radsec_home_server("127.0.0.1:12083");
+            assert_eq!(hs.secret(), RADSEC_SECRET);
+            let forwarded = rewrite_request_for_home_server(
+                nas_pap_request(),
+                PROXY_STATE,
+                CLIENT_SECRET,
+                hs.secret(),
+            )
+            .unwrap();
+            assert!(message_authenticator_valid(
+                &forwarded,
+                &REQUEST_AUTH,
+                RADSEC_SECRET
+            ));
+            let pw = &forwarded
+                .find_attribute(AttributeType::UserPassword as u8)
+                .unwrap()
+                .value;
+            assert_eq!(
+                decrypt_user_password(pw, RADSEC_SECRET, &REQUEST_AUTH).unwrap(),
+                pap_password()
+            );
+        }
+
+        #[test]
+        fn response_leg_rekeys_mppe_and_tunnel_password_from_radsec_to_client_secret() {
+            let entry = radsec_entry("192.168.1.100:12345".parse().unwrap());
+            let mut response = Packet::new(Code::AccessAccept, 7, [0u8; 16]);
+            response.add_attribute(
+                Attribute::new(
+                    AttributeType::EapMessage as u8,
+                    vec![0x03, 0x01, 0x00, 0x04],
+                )
+                .unwrap(),
+            );
+            response.add_attribute(
+                Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]).unwrap(),
+            );
+            for attr in test_keys()
+                .to_attributes_with_salts(RADSEC_SECRET, &REQUEST_AUTH, [0x80, 0x01], [0x80, 0x02])
+                .unwrap()
+            {
+                response.add_attribute(attr);
+            }
+            let tp = test_tunnel_passwords().remove(0);
+            response.add_attribute(
+                tp.to_attribute_with_salt(RADSEC_SECRET, &REQUEST_AUTH, [0x80, 0x10])
+                    .unwrap(),
+            );
+            let home_response = home_response_under_radsec(response);
+
+            let relayed = rewrite_response_for_nas(home_response, &entry).unwrap();
+
+            assert!(verify_response_authenticator(
+                &relayed,
+                &REQUEST_AUTH,
+                CLIENT_SECRET
+            ));
+            assert!(message_authenticator_valid(
+                &relayed,
+                &REQUEST_AUTH,
+                CLIENT_SECRET
+            ));
+            assert_eq!(
+                MppeKeys::from_packet(&relayed, CLIENT_SECRET, &REQUEST_AUTH).unwrap(),
+                Some(test_keys())
+            );
+            let forwarded_tp = relayed
+                .find_attribute(AttributeType::TunnelPassword as u8)
+                .unwrap();
+            assert_eq!(
+                TunnelPassword::from_attribute(forwarded_tp, CLIENT_SECRET, &REQUEST_AUTH).unwrap(),
+                tp
+            );
+            assert!(
+                relayed
+                    .find_attribute(AttributeType::ProxyState as u8)
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn response_leg_rejects_a_reply_not_signed_under_radsec() {
+            // Signed with some other secret: the TLS peer is authenticated,
+            // but the RADIUS layer still has to agree on "radsec".
+            let entry = radsec_entry("192.168.1.100:12345".parse().unwrap());
+            let home_response =
+                finalize_home_response(Packet::new(Code::AccessAccept, 7, [0u8; 16]));
+            assert!(matches!(
+                rewrite_response_for_nas(home_response, &entry),
+                Err(ProxyError::InvalidResponseAuthenticator)
+            ));
+        }
+
+        #[tokio::test]
+        async fn udp_datagram_cannot_answer_a_radsec_entry() {
+            let cache = Arc::new(ProxyCache::new(Duration::from_secs(60), 1000));
+            let handler = ProxyHandler::new(cache.clone(), "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let entry = radsec_entry("192.168.1.100:12345".parse().unwrap());
+            let home_addr = entry.home_server.address;
+            cache.insert(entry).unwrap();
+
+            // Even from the RadSec server's own address.
+            let response =
+                home_response_under_radsec(Packet::new(Code::AccessAccept, 7, [0u8; 16]));
+            let err = handler
+                .handle_response(response, home_addr)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ProxyError::CorrelationFailed), "{err}");
+            assert!(cache.get(&PROXY_STATE).is_some(), "entry kept for the link");
+        }
+
+        #[tokio::test]
+        async fn link_response_for_a_radsec_entry_from_another_server_is_rejected() {
+            let cache = Arc::new(ProxyCache::new(Duration::from_secs(60), 1000));
+            let handler = ProxyHandler::new(cache.clone(), "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let entry = radsec_entry("192.168.1.100:12345".parse().unwrap());
+            cache.insert(entry).unwrap();
+
+            let impostor = radsec_home_server("127.0.0.1:12083");
+            let response =
+                home_response_under_radsec(Packet::new(Code::AccessAccept, 7, [0u8; 16]));
+            let err = handler
+                .handle_link_response(response, impostor)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ProxyError::CorrelationFailed), "{err}");
+            assert!(cache.get(&PROXY_STATE).is_some());
+        }
+
+        #[tokio::test]
+        async fn forward_request_to_a_down_link_keeps_the_entry_and_counts_it() {
+            let cache = Arc::new(ProxyCache::new(Duration::from_secs(60), 1000));
+            let handler = ProxyHandler::new(cache.clone(), "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let hs = radsec_home_server("127.0.0.1:12083");
+            let source: SocketAddr = "192.168.1.100:12345".parse().unwrap();
+
+            let err = handler
+                .forward_request(
+                    nas_pap_request(),
+                    source,
+                    Arc::clone(&hs),
+                    CLIENT_SECRET.to_vec(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ProxyError::LinkDown(_)), "{err}");
+
+            // The request waits in the cache for the retry manager, already
+            // re-keyed for "radsec", and counts as outstanding.
+            assert_eq!(cache.len(), 1);
+            assert_eq!(hs.stats().outstanding(), 1);
+            assert_eq!(hs.stats().requests_sent(), 1);
+            let entry = cache.get_timed_out(Duration::ZERO).remove(0);
+            assert!(Arc::ptr_eq(&entry.home_server, &hs));
+            assert!(message_authenticator_valid(
+                &entry.original_request,
+                &REQUEST_AUTH,
+                RADSEC_SECRET
+            ));
+        }
+
+        #[tokio::test]
+        async fn send_to_home_server_without_a_link_is_link_down() {
+            let cache = Arc::new(ProxyCache::new(Duration::from_secs(60), 1000));
+            let handler = ProxyHandler::new(cache, "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let hs = radsec_home_server("127.0.0.1:12083");
+            let err = handler
+                .send_to_home_server(&[0u8; 20], &hs)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ProxyError::LinkDown(ref n) if n == "home-radsec"),
+                "{err}"
+            );
         }
     }
 }

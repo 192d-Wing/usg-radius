@@ -1,0 +1,109 @@
+{
+  "_comment": "USG RADIUS - Proxy with an upstream RadSec (RFC 6614) home server",
+  "_description": "NASes reach this proxy over plain UDP RADIUS with per-client secrets; requests for the realm are forwarded to a home server over one persistent, mutually authenticated TLS 1.3 connection (ML-KEM-1024-only key exchange, AES-256-GCM-SHA384). Health probes (RFC 5997 Status-Server) run over the same connection.",
+  "_transport_notes": [
+    "The proxy is active only when the NAS hop is `transport: udp-insecure`: under the inbound `radsec` listener the server runs the RadSec accept loop and does not start the proxy components.",
+    "Per home server, `transport` is `udp` (default; `secret` required) or `radsec` (`tls` block required; `secret` must be absent — RFC 6614 §2.3 fixes the hop secret to the string \"radsec\", and the TLS certificates are what authenticate the hop).",
+    "`tls.server_name` is the DNS name or IP literal the home server's certificate must be valid for; it is also sent as SNI. The link verifies the certificate chain against `tls.ca_path` and never falls back to UDP.",
+    "`tls.revocation` is the same block as `eap.tls.revocation` / `radsec.revocation` and checks the home server's certificate for revocation (needs a binary built with the `revocation` feature); see examples/proxy_config.json for a static-CRL example.",
+    "While the link is down, forwarded requests wait in the proxy cache and the retry manager resends them; after `retry.max_retries` the NAS receives a signed Access-Reject."
+  ],
+
+  "listen_address": "::",
+  "listen_port": 1812,
+  "accounting_port": 1813,
+  "transport": "udp-insecure",
+  "secret": "${RADIUS_DEFAULT_SECRET}",
+
+  "clients": [
+    {
+      "address": "10.20.0.0/16",
+      "secret": "${RADIUS_NAS_SECRET}",
+      "name": "Access switches",
+      "enabled": true
+    }
+  ],
+
+  "users": [],
+
+  "verbose": false,
+  "log_level": "info",
+  "audit_log_path": "/var/log/radius/audit.log",
+  "strict_rfc_compliance": true,
+
+  "proxy": {
+    "enabled": true,
+    "cache_ttl": 30,
+    "max_outstanding": 1000,
+    "proxy_timeout": 10,
+    "default_realm": "local",
+
+    "pools": [
+      {
+        "name": "home_radsec",
+        "strategy": "failover",
+        "servers": [
+          {
+            "name": "home-radius-1",
+            "address": "10.0.1.10:2083",
+            "transport": "radsec",
+            "tls": {
+              "ca_path": "/etc/radius/proxy/home-ca.pem",
+              "cert_path": "/etc/radius/proxy/proxy.pem",
+              "key_path": "/etc/radius/proxy/proxy.key",
+              "server_name": "radius1.home.example.com"
+            },
+            "timeout": 5,
+            "max_outstanding": 200
+          },
+          {
+            "name": "home-radius-2",
+            "address": "10.0.1.11:2083",
+            "transport": "radsec",
+            "tls": {
+              "ca_path": "/etc/radius/proxy/home-ca.pem",
+              "cert_path": "/etc/radius/proxy/proxy.pem",
+              "key_path": "/etc/radius/proxy/proxy.key",
+              "server_name": "radius2.home.example.com"
+            },
+            "timeout": 5,
+            "max_outstanding": 200
+          }
+        ]
+      }
+    ],
+
+    "realms": [
+      {
+        "name": "home",
+        "match": {
+          "type": "suffix",
+          "pattern": "home.example.com"
+        },
+        "pool": "home_radsec",
+        "strip_realm": false
+      }
+    ],
+
+    "health_check": {
+      "enabled": true,
+      "interval": 30,
+      "timeout": 5,
+      "failures_before_down": 3,
+      "successes_before_up": 2
+    },
+
+    "retry": {
+      "max_retries": 3,
+      "retry_interval": 5,
+      "failover_on_timeout": true
+    }
+  },
+
+  "request_cache_ttl": 60,
+  "request_cache_max_entries": 10000,
+  "rate_limit_per_client_rps": 200,
+  "rate_limit_per_client_burst": 400,
+  "rate_limit_global_rps": 2000,
+  "rate_limit_global_burst": 4000
+}

@@ -33,18 +33,11 @@ use tracing::{debug, info, warn};
 
 use crate::coa::{CoaJob, NasRegistry};
 use crate::config::RadSecConfig;
+use crate::radsec_frame::{FrameError, RADIUS_MAX_LEN, take_frame};
 use crate::server::{PortRole, RadiusServer, ServerConfig};
 
-/// RFC 6614 §2.3: RadSec uses a fixed shared secret of the ASCII string
-/// `"radsec"` for the RADIUS Authenticator / Message-Authenticator computations.
-pub(crate) const RADSEC_SECRET: &[u8] = b"radsec";
-
-/// A RADIUS packet header is 20 octets; the `Length` field is octets 2..4.
-const RADIUS_HEADER_LEN: usize = 20;
-
-/// RFC 2865 §3: the RADIUS `Length` field ranges 20..=4096.
-const RADIUS_MIN_LEN: usize = RADIUS_HEADER_LEN;
-const RADIUS_MAX_LEN: usize = 4096;
+/// RFC 6614 §2.3 fixed secret, shared with the outbound proxy link.
+pub(crate) use crate::radsec_frame::RADSEC_SECRET;
 
 /// Errors from the RadSec listener.
 #[derive(Debug, thiserror::Error)]
@@ -68,8 +61,8 @@ pub enum RadSecError {
     DisallowedParameters(usg_fips_tls::error::FipsError),
     #[error("peer presented no client certificate (mTLS required)")]
     NoClientCert,
-    #[error("invalid RADIUS Length field: {0} (must be {RADIUS_MIN_LEN}..={RADIUS_MAX_LEN})")]
-    BadRadiusLength(usize),
+    #[error("{0}")]
+    Frame(#[from] FrameError),
 }
 
 /// Build the rustls `ServerConfig` for the RadSec listener: the ML-KEM-1024-only
@@ -125,8 +118,9 @@ pub async fn run(
 }
 
 /// Accept loop over an already-bound listener. Split out from [`run`] so tests
-/// can drive it on an ephemeral port with an injected acceptor.
-async fn serve(
+/// can drive it on an ephemeral port with an injected acceptor (it also stands
+/// in as the RadSec home server in the outbound-link tests).
+pub(crate) async fn serve(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     server_config: Arc<ServerConfig>,
@@ -217,22 +211,6 @@ async fn handle_connection(
     }
 
     Ok(())
-}
-
-/// Pull one complete RADIUS frame off the front of `buf` (delimited by the
-/// `Length` header field), or `None` if a full frame isn't buffered yet.
-fn take_frame(buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>, RadSecError> {
-    if buf.len() < RADIUS_HEADER_LEN {
-        return Ok(None);
-    }
-    let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
-    if !(RADIUS_MIN_LEN..=RADIUS_MAX_LEN).contains(&length) {
-        return Err(RadSecError::BadRadiusLength(length));
-    }
-    if buf.len() < length {
-        return Ok(None);
-    }
-    Ok(Some(buf.drain(..length).collect()))
 }
 
 /// A server-originated request awaiting its ACK/NAK: where to deliver the reply,
@@ -380,100 +358,16 @@ mod tests {
     )]
 
     use super::*;
-    use std::io::Write as _;
 
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+    use rustls::pki_types::{PrivateKeyDer, ServerName};
     use rustls::{ClientConfig, RootCertStore};
 
-    use crate::config::Config;
-    use crate::server::{ServerConfig, SimpleAuthHandler};
+    use crate::radsec_frame::RADIUS_HEADER_LEN;
+    use crate::test_pki::{TestChain, TestPaths, gen_chain, lenient_server_config};
 
-    /// A throwaway CA plus a CA-signed server cert and NAS client cert.
-    struct TestChain {
-        ca_pem: String,
-        ca_der: CertificateDer<'static>,
-        server_cert_pem: String,
-        server_key_pem: String,
-        client_cert_der: CertificateDer<'static>,
-        client_key_der: PrivateKeyDer<'static>,
-        /// DER CRL from the test CA revoking `client_cert_der`.
-        crl_der: Vec<u8>,
-    }
-
-    fn gen_chain() -> TestChain {
-        use rcgen::{
-            BasicConstraints, CertificateParams, CertificateRevocationListParams, DnType, IsCa,
-            Issuer, KeyIdMethod, KeyPair, RevocationReason, RevokedCertParams, SerialNumber,
-            date_time_ymd,
-        };
-
-        let ca_key = KeyPair::generate().unwrap();
-        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        ca_params
-            .distinguished_name
-            .push(DnType::CommonName, "USG Test NAS CA");
-        let ca = ca_params.self_signed(&ca_key).unwrap();
-        let issuer = Issuer::from_params(&ca_params, &ca_key);
-
-        let server_key = KeyPair::generate().unwrap();
-        let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        let server = server_params.signed_by(&server_key, &issuer).unwrap();
-
-        let client_key = KeyPair::generate().unwrap();
-        let mut client_params = CertificateParams::new(vec!["nas-1.usg.test".to_string()]).unwrap();
-        client_params
-            .distinguished_name
-            .push(DnType::CommonName, "switch-eth0");
-        let client_serial = SerialNumber::from(vec![0x4e, 0x41, 0x53, 0x01]);
-        client_params.serial_number = Some(client_serial.clone());
-        let client = client_params.signed_by(&client_key, &issuer).unwrap();
-
-        // A CRL from the same CA that revokes the NAS certificate above.
-        let crl = CertificateRevocationListParams {
-            this_update: date_time_ymd(2026, 1, 1),
-            next_update: date_time_ymd(2099, 1, 1),
-            crl_number: SerialNumber::from(1u64),
-            issuing_distribution_point: None,
-            revoked_certs: vec![RevokedCertParams {
-                serial_number: client_serial,
-                revocation_time: date_time_ymd(2026, 1, 2),
-                reason_code: Some(RevocationReason::KeyCompromise),
-                invalidity_date: None,
-            }],
-            key_identifier_method: KeyIdMethod::Sha256,
-        }
-        .signed_by(&issuer)
-        .unwrap();
-
-        TestChain {
-            ca_pem: ca.pem(),
-            ca_der: ca.der().clone(),
-            server_cert_pem: server.pem(),
-            server_key_pem: server_key.serialize_pem(),
-            client_cert_der: client.der().clone(),
-            client_key_der: PrivateKeyDer::Pkcs8(client_key.serialize_der().into()),
-            crl_der: crl.der().as_ref().to_vec(),
-        }
-    }
-
-    /// Build a minimal radius `ServerConfig` (lenient validation so a bare
-    /// Status-Server is accepted without a Message-Authenticator).
-    fn test_server_config() -> Arc<ServerConfig> {
-        let config = Config {
-            strict_rfc_compliance: false,
-            ..Config::default()
-        };
-        let handler = Arc::new(SimpleAuthHandler::new());
-        Arc::new(ServerConfig::from_config(config, handler).unwrap())
-    }
-
-    /// Write the server cert/key + CA to temp files and start `serve` on an
-    /// ephemeral loopback port. Returns the bound address (and keeps the temp
-    /// dir alive for the test's duration).
-    async fn start_listener(
-        chain: &TestChain,
-    ) -> (SocketAddr, Arc<NasRegistry>, tempfile::TempDir) {
+    /// Start `serve` on an ephemeral loopback port with `chain`. Returns the
+    /// bound address (and keeps the temp files alive for the test's duration).
+    async fn start_listener(chain: &TestChain) -> (SocketAddr, Arc<NasRegistry>, TestPaths) {
         start_listener_with(chain, false).await
     }
 
@@ -482,42 +376,8 @@ mod tests {
     async fn start_listener_with(
         chain: &TestChain,
         check_crl: bool,
-    ) -> (SocketAddr, Arc<NasRegistry>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let write = |name: &str, data: &[u8]| {
-            let path = dir.path().join(name);
-            let mut f = std::fs::File::create(&path).unwrap();
-            f.write_all(data).unwrap();
-            path.to_str().unwrap().to_string()
-        };
-        let revocation = check_crl.then(|| crate::config::RevocationConfig {
-            crl: crate::config::CrlSettings {
-                static_files: vec![write("ca.crl", &chain.crl_der)],
-                fetch: false,
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-        let cfg = RadSecConfig {
-            listen_address: "127.0.0.1".to_string(),
-            listen_port: 0,
-            cert_path: write("server.pem", chain.server_cert_pem.as_bytes()),
-            key_path: write("server.key", chain.server_key_pem.as_bytes()),
-            client_ca_path: write("ca.pem", chain.ca_pem.as_bytes()),
-            revocation,
-        };
-
-        let tls_config = build_server_config(&cfg).unwrap();
-        let acceptor = TlsAcceptor::from(tls_config);
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_config = test_server_config();
-        let registry = NasRegistry::new();
-        let reg = Arc::clone(&registry);
-        tokio::spawn(async move {
-            let _ = serve(listener, acceptor, server_config, reg).await;
-        });
-        (addr, registry, dir)
+    ) -> (SocketAddr, Arc<NasRegistry>, TestPaths) {
+        crate::test_pki::spawn_radsec_home(chain, check_crl, lenient_server_config(&[])).await
     }
 
     /// Client config pinned to the given kx-group provider, with the NAS client
@@ -693,6 +553,8 @@ mod tests {
         chain.ca_der = ca.der().clone();
         chain.server_cert_pem = server.pem();
         chain.server_key_pem = server_key.serialize_pem();
+        chain.client_cert_pem = client.pem();
+        chain.client_key_pem = client_key.serialize_pem();
         chain.client_cert_der = client.der().clone();
         chain.client_key_der = PrivateKeyDer::Pkcs8(client_key.serialize_der().into());
         chain.crl_der = crl.der().as_ref().to_vec();

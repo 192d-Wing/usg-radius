@@ -6,6 +6,8 @@ use crate::config::{AccountingPort, AccountingPortMode, Config};
 use crate::proxy::ProxyConfig;
 use crate::proxy::handler::ProxyHandler;
 use crate::proxy::pool::HomeServerPool;
+#[cfg(feature = "tls")]
+use crate::proxy::radsec_client::{LinkParams, LinkResponse, spawn_link};
 use crate::proxy::realm::Realm;
 use crate::proxy::retry::RetryManager;
 use crate::proxy::router::{Router, RoutingDecision};
@@ -661,6 +663,23 @@ pub struct RadiusServer {
     home_servers: Vec<Arc<crate::proxy::home_server::HomeServer>>,
     /// Home server pools (if proxy is enabled)
     pools: Vec<Arc<crate::proxy::pool::HomeServerPool>>,
+    /// Responses read off the RadSec links to `transport = "radsec"` home
+    /// servers (RFC 6614), drained by `run` into the proxy handler. `None`
+    /// when no home server uses RadSec; taken once by `run`.
+    #[cfg(feature = "tls")]
+    link_responses: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<LinkResponse>>>,
+}
+
+/// What `initialize_proxy` builds.
+struct ProxyComponents {
+    router: Router,
+    handler: Arc<ProxyHandler>,
+    retry_manager: RetryManager,
+    health_checker: Option<crate::proxy::health::HealthChecker>,
+    home_servers: Vec<Arc<crate::proxy::home_server::HomeServer>>,
+    pools: Vec<Arc<crate::proxy::pool::HomeServerPool>>,
+    #[cfg(feature = "tls")]
+    link_responses: Option<tokio::sync::mpsc::Receiver<LinkResponse>>,
 }
 
 impl RadiusServer {
@@ -687,6 +706,8 @@ impl RadiusServer {
 
         let mut home_servers = Vec::new();
         let mut pools = Vec::new();
+        #[cfg(feature = "tls")]
+        let mut link_responses = None;
 
         // Initialize proxy components if enabled
         if let Some(ref full_config) = config.config
@@ -696,15 +717,18 @@ impl RadiusServer {
             info!("Initializing RADIUS proxy");
 
             // Create proxy components
-            let (router, proxy_handler, retry_manager, health_checker, servers, server_pools) =
-                Self::initialize_proxy(proxy_config, Arc::clone(&socket)).await?;
+            let components = Self::initialize_proxy(proxy_config, Arc::clone(&socket)).await?;
 
-            config.router = Some(Arc::new(router));
-            config.proxy_handler = Some(proxy_handler);
-            config.retry_manager = Some(Arc::new(retry_manager));
-            config.health_checker = health_checker.map(Arc::new);
-            home_servers = servers;
-            pools = server_pools;
+            config.router = Some(Arc::new(components.router));
+            config.proxy_handler = Some(components.handler);
+            config.retry_manager = Some(Arc::new(components.retry_manager));
+            config.health_checker = components.health_checker.map(Arc::new);
+            home_servers = components.home_servers;
+            pools = components.pools;
+            #[cfg(feature = "tls")]
+            {
+                link_responses = components.link_responses;
+            }
 
             info!("RADIUS proxy initialized");
         }
@@ -715,6 +739,8 @@ impl RadiusServer {
             accounting_socket,
             home_servers,
             pools,
+            #[cfg(feature = "tls")]
+            link_responses: std::sync::Mutex::new(link_responses),
         })
     }
 
@@ -722,17 +748,7 @@ impl RadiusServer {
     async fn initialize_proxy(
         proxy_config: &ProxyConfig,
         socket: Arc<UdpSocket>,
-    ) -> Result<
-        (
-            Router,
-            Arc<ProxyHandler>,
-            RetryManager,
-            Option<crate::proxy::health::HealthChecker>,
-            Vec<Arc<crate::proxy::home_server::HomeServer>>,
-            Vec<Arc<crate::proxy::pool::HomeServerPool>>,
-        ),
-        ServerError,
-    > {
+    ) -> Result<ProxyComponents, ServerError> {
         use crate::proxy::cache::ProxyCache;
         use crate::proxy::health::HealthChecker;
 
@@ -822,6 +838,46 @@ impl RadiusServer {
             }
         }
 
+        // Start one RadSec link (RFC 6614) per `transport = "radsec"` home
+        // server. The TLS configuration is built here, so a bad certificate,
+        // key, CA bundle, CRL or server name fails startup. Responses from
+        // every link arrive on one bounded channel that `run` drains.
+        #[cfg(feature = "tls")]
+        let link_responses = {
+            use crate::proxy::home_server::HomeServerTransport;
+
+            let (link_tx, link_rx) =
+                tokio::sync::mpsc::channel::<LinkResponse>(proxy_config.max_outstanding.max(1));
+            let mut any_link = false;
+            for server in &all_servers {
+                if server.transport() != HomeServerTransport::Radsec {
+                    continue;
+                }
+                let params = LinkParams {
+                    connect_timeout: server.timeout,
+                    ..LinkParams::default()
+                };
+                let handle =
+                    spawn_link(Arc::clone(server), link_tx.clone(), params).map_err(|e| {
+                        ServerError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "Failed to start RadSec link to home server '{}': {}",
+                                server.name, e
+                            ),
+                        ))
+                    })?;
+                server.attach_link(handle);
+                any_link = true;
+                info!(
+                    server = %server.name,
+                    address = %server.address,
+                    "RadSec link to home server starting (RFC 6614, TLS 1.3, ML-KEM-1024-only, mTLS)"
+                );
+            }
+            any_link.then_some(link_rx)
+        };
+
         // Create health checker if enabled
         let health_checker = if proxy_config.health_check.enabled {
             if !all_servers.is_empty() {
@@ -850,14 +906,16 @@ impl RadiusServer {
             None
         };
 
-        Ok((
+        Ok(ProxyComponents {
             router,
-            proxy_handler,
+            handler: proxy_handler,
             retry_manager,
             health_checker,
-            all_servers,
-            all_pools,
-        ))
+            home_servers: all_servers,
+            pools: all_pools,
+            #[cfg(feature = "tls")]
+            link_responses,
+        })
     }
 
     /// Get the local address the server is listening on
@@ -924,6 +982,21 @@ impl RadiusServer {
             }))
         } else {
             None
+        };
+
+        // Start the RadSec link response listener if any home server uses RadSec
+        #[cfg(feature = "tls")]
+        let _link_task = {
+            let rx = self.link_responses.lock().ok().and_then(|mut g| g.take());
+            match (rx, &self.config.proxy_handler) {
+                (Some(rx), Some(proxy_handler)) => {
+                    let handler = Arc::clone(proxy_handler);
+                    Some(tokio::spawn(async move {
+                        Self::listen_for_link_responses(handler, rx).await;
+                    }))
+                }
+                _ => None,
+            }
         };
 
         // Serve the authentication socket and, when bound, the accounting
@@ -1020,6 +1093,36 @@ impl RadiusServer {
                 }
             }
         }
+    }
+
+    /// Relay responses read off the RadSec links (RFC 6614) into the proxy
+    /// handler, which correlates each by Proxy-State and home-server identity
+    /// exactly as it does for UDP responses. Ends when every link task is gone.
+    #[cfg(feature = "tls")]
+    async fn listen_for_link_responses(
+        proxy_handler: Arc<ProxyHandler>,
+        mut responses: tokio::sync::mpsc::Receiver<LinkResponse>,
+    ) {
+        info!("Proxy RadSec link response listener started");
+
+        while let Some(LinkResponse {
+            home_server,
+            packet,
+        }) = responses.recv().await
+        {
+            let handler = Arc::clone(&proxy_handler);
+            tokio::spawn(async move {
+                let name = home_server.name.clone();
+                if let Err(e) = handler.handle_link_response(packet, home_server).await {
+                    debug!(
+                        "Error handling proxy response from RadSec link {}: {}",
+                        name, e
+                    );
+                }
+            });
+        }
+
+        info!("Proxy RadSec link response listener stopped");
     }
 
     /// Handle a single RADIUS request received on `socket`, which plays `role`.
@@ -2092,11 +2195,10 @@ mod tests {
                     name: "home".to_string(),
                     strategy: Default::default(),
                     servers: vec![HomeServerConfig {
-                        address: home.to_string(),
-                        secret: home_secret.to_string(),
                         timeout: 5,
                         max_outstanding: 10,
                         name: Some("home".to_string()),
+                        ..HomeServerConfig::udp(home.to_string(), home_secret)
                     }],
                 }],
                 realms: vec![RealmConfig {
@@ -2270,6 +2372,162 @@ mod tests {
                 .unwrap(),
             "welcome"
         );
+    }
+
+    // --- Proxy: upstream over RadSec (RFC 6614) ---
+
+    #[cfg(feature = "tls")]
+    mod radsec_upstream {
+        use super::*;
+        use crate::proxy::home_server::{HomeServerConfig, HomeServerTlsConfig};
+        use crate::test_pki::{TestPaths, gen_chain, lenient_server_config, spawn_radsec_home};
+        use radius_proto::auth::{
+            encrypt_user_password, generate_request_authenticator, verify_response_authenticator,
+        };
+
+        /// `proxy_config` with the home server reached over RadSec and the
+        /// realm stripped (the home server knows the bare user name).
+        fn radsec_proxy_config(home: SocketAddr, nas_secret: &str, paths: &TestPaths) -> Config {
+            let mut config = proxy_config(home, 0, nas_secret, "unused");
+            let proxy = config.proxy.as_mut().unwrap();
+            proxy.pools[0].servers = vec![HomeServerConfig {
+                timeout: 5,
+                max_outstanding: 10,
+                name: Some("home-radsec".to_string()),
+                ..HomeServerConfig::radsec(
+                    home.to_string(),
+                    HomeServerTlsConfig {
+                        ca_path: paths.ca.clone(),
+                        cert_path: paths.client_cert.clone(),
+                        key_path: paths.client_key.clone(),
+                        server_name: "localhost".to_string(),
+                        revocation: None,
+                    },
+                )
+            }];
+            proxy.realms[0].strip_realm = true;
+            config
+        }
+
+        fn pap_request(id: u8, user: &str, password: &str, nas_secret: &str) -> (Packet, [u8; 16]) {
+            let request_auth = generate_request_authenticator();
+            let mut request = Packet::new(Code::AccessRequest, id, request_auth);
+            request.add_attribute(Attribute::string(AttributeType::UserName as u8, user).unwrap());
+            request.add_attribute(
+                Attribute::new(
+                    AttributeType::UserPassword as u8,
+                    encrypt_user_password(password, nas_secret.as_bytes(), &request_auth),
+                )
+                .unwrap(),
+            );
+            request.add_attribute(
+                Attribute::string(AttributeType::NasIdentifier as u8, "nas").unwrap(),
+            );
+            (request, request_auth)
+        }
+
+        /// NAS -> proxy (UDP, NAS secret) -> RadSec link ("radsec") -> real
+        /// usg-radius listener -> back. The Accept and a Reject both reach the
+        /// NAS from the proxy's listening socket, signed with the NAS secret,
+        /// Proxy-State removed.
+        #[tokio::test]
+        async fn proxy_relays_radsec_home_server_responses_to_the_nas() {
+            let chain = gen_chain();
+            // Built at runtime, not a literal.
+            let password: String = ('a'..='p').collect();
+            let (home, _registry, paths) = spawn_radsec_home(
+                &chain,
+                false,
+                lenient_server_config(&[("alice", &password)]),
+            )
+            .await;
+            let nas_secret = random_secret_hex();
+            let server = proxy_server(radsec_proxy_config(home, &nas_secret, &paths))
+                .await
+                .expect("proxy with a RadSec home server starts");
+            let proxy_addr = server.local_addr().unwrap();
+            let home_server = Arc::clone(&server.home_servers[0]);
+            assert_eq!(home_server.secret(), b"radsec");
+            tokio::spawn(async move { server.run().await });
+
+            for _ in 0..500 {
+                if home_server.is_connected() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(home_server.is_connected(), "RadSec link must come up");
+
+            let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut buf = vec![0u8; 4096];
+
+            // Right password → Access-Accept.
+            let (request, request_auth) =
+                pap_request(42, "alice@home.test", &password, &nas_secret);
+            nas.send_to(&request.encode().unwrap(), proxy_addr)
+                .await
+                .unwrap();
+            let (len, from) = tokio::time::timeout(Duration::from_secs(5), nas.recv_from(&mut buf))
+                .await
+                .expect("NAS must receive the relayed Accept")
+                .unwrap();
+            assert_eq!(from, proxy_addr, "reply must come from the listener socket");
+            let relayed = Packet::decode(&buf[..len]).unwrap();
+            assert_eq!(relayed.code, Code::AccessAccept);
+            assert_eq!(relayed.identifier, 42);
+            assert!(verify_response_authenticator(
+                &relayed,
+                &request_auth,
+                nas_secret.as_bytes()
+            ));
+            assert!(
+                relayed
+                    .find_attribute(AttributeType::ProxyState as u8)
+                    .is_none()
+            );
+
+            // Wrong password → the home server's Access-Reject, re-signed.
+            let wrong: String = ('q'..='z').collect();
+            let (request, request_auth) = pap_request(43, "alice@home.test", &wrong, &nas_secret);
+            nas.send_to(&request.encode().unwrap(), proxy_addr)
+                .await
+                .unwrap();
+            let (len, _) = tokio::time::timeout(Duration::from_secs(5), nas.recv_from(&mut buf))
+                .await
+                .expect("NAS must receive the relayed Reject")
+                .unwrap();
+            let relayed = Packet::decode(&buf[..len]).unwrap();
+            assert_eq!(relayed.code, Code::AccessReject);
+            assert_eq!(relayed.identifier, 43);
+            assert!(verify_response_authenticator(
+                &relayed,
+                &request_auth,
+                nas_secret.as_bytes()
+            ));
+
+            assert_eq!(home_server.stats().responses_received(), 2);
+            assert_eq!(home_server.stats().outstanding(), 0);
+        }
+
+        #[tokio::test]
+        async fn radsec_home_server_with_a_missing_certificate_fails_startup() {
+            let chain = gen_chain();
+            let paths = chain.write_to_tempdir();
+            let home: SocketAddr = "127.0.0.1:2083".parse().unwrap();
+            let mut config = radsec_proxy_config(home, &random_secret_hex(), &paths);
+            config.proxy.as_mut().unwrap().pools[0].servers[0]
+                .tls
+                .as_mut()
+                .unwrap()
+                .cert_path = format!("{}.missing", paths.client_cert);
+
+            let err = match proxy_server(config).await {
+                Ok(_) => panic!("a missing client certificate must fail RadiusServer::new"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("RadSec link"), "{err}");
+            assert!(err.to_string().contains("home-radsec"), "{err}");
+        }
     }
 
     #[test]

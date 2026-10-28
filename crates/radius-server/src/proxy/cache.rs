@@ -149,12 +149,13 @@ impl ProxyCache {
         }
     }
 
-    /// Insert a new entry into the cache
+    /// Insert a new entry into the cache, or replace the entry with the same
+    /// Proxy-State (the retry manager re-inserts timed-out entries).
     ///
-    /// Returns error if cache is full (at max capacity)
+    /// Returns error if cache is full (at max capacity) and the entry is new.
     pub fn insert(&self, entry: ProxyCacheEntry) -> ProxyResult<()> {
-        // Check capacity
-        if self.cache.len() >= self.max_entries {
+        // Check capacity (a replacement does not grow the cache)
+        if self.cache.len() >= self.max_entries && !self.cache.contains_key(&entry.proxy_state) {
             return Err(ProxyError::CacheFull(self.cache.len()));
         }
 
@@ -236,11 +237,8 @@ mod tests {
 
     fn create_test_home_server() -> Arc<HomeServer> {
         let config = HomeServerConfig {
-            address: "192.168.1.1:1812".to_string(),
-            secret: "test_secret".to_string(),
-            timeout: 30,
-            max_outstanding: 100,
             name: Some("Test Server".to_string()),
+            ..HomeServerConfig::udp("192.168.1.1:1812", "test_secret")
         };
         Arc::new(HomeServer::new(config).unwrap())
     }

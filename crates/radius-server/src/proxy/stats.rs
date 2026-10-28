@@ -181,18 +181,12 @@ mod tests {
             strategy: LoadBalanceStrategy::RoundRobin,
             servers: vec![
                 HomeServerConfig {
-                    address: "127.0.0.1:1812".to_string(),
-                    secret: "secret1".to_string(),
-                    timeout: 30,
-                    max_outstanding: 100,
                     name: Some("server1".to_string()),
+                    ..HomeServerConfig::udp("127.0.0.1:1812", "secret1")
                 },
                 HomeServerConfig {
-                    address: "127.0.0.1:1813".to_string(),
-                    secret: "secret2".to_string(),
-                    timeout: 30,
-                    max_outstanding: 100,
                     name: Some("server2".to_string()),
+                    ..HomeServerConfig::udp("127.0.0.1:1813", "secret2")
                 },
             ],
         };
@@ -215,11 +209,8 @@ mod tests {
             name: "test_pool".to_string(),
             strategy: LoadBalanceStrategy::Failover,
             servers: vec![HomeServerConfig {
-                address: "127.0.0.1:1812".to_string(),
-                secret: "secret".to_string(),
-                timeout: 30,
-                max_outstanding: 100,
                 name: Some("test_server".to_string()),
+                ..HomeServerConfig::udp("127.0.0.1:1812", "secret")
             }],
         };
 

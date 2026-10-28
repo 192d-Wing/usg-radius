@@ -1,0 +1,71 @@
+# sites-enabled/radsec for the interop home server: the RFC 6614 RadSec
+# listener the usg-radius proxy connects to for realm radsec.test. Mounted at
+# /etc/freeradius/3.0/sites-enabled/radsec; the package's `default` site keeps
+# serving UDP 1812/1813 for realm freeradius.test, so the same FreeRADIUS shows
+# both transports side by side.
+#
+# One directive per line: FreeRADIUS does not parse single-line `{ ... }` blocks.
+listen {
+	ipaddr = *
+	# RFC 6614 section 2.1: RADIUS/TLS uses TCP port 2083.
+	port = 2083
+	type = auth
+	proto = tcp
+	# Requests go through the same virtual server as the UDP listener, so the
+	# authorize file and the eap module answer identically on both transports.
+	virtual_server = default
+	clients = radsec
+	limit {
+		max_connections = 16
+		# No lifetime cap. idle_timeout is FreeRADIUS's default; the proxy's
+		# RFC 5997 probes every 5 s keep its single connection busy.
+		lifetime = 0
+		idle_timeout = 30
+	}
+	tls {
+		# Server certificate: SAN "freeradius", EKU serverAuth (gen-certs.sh).
+		# The proxy verifies it against ca.crt with server_name "freeradius".
+		private_key_file = /etc/freeradius/interop-certs/freeradius-server.key
+		certificate_file = /etc/freeradius/interop-certs/freeradius-server.crt
+		ca_file = /etc/freeradius/interop-certs/ca.crt
+		fragment_size = 8192
+		# TLS 1.2 cipher list; irrelevant once the version is pinned to 1.3,
+		# where OpenSSL's default suites include TLS_AES_256_GCM_SHA384 (the
+		# only suite the proxy offers).
+		cipher_list = "DEFAULT"
+		cipher_server_preference = no
+		# RFC 6614 section 2.3 permits TLS 1.1+; the usg-radius client is TLS
+		# 1.3 only (usg-fips-tls), so pin it here too.
+		tls_min_version = "1.3"
+		tls_max_version = "1.3"
+		# Key exchange. FreeRADIUS hands this to SSL_CTX_set1_curves_list, so it
+		# is the TLS 1.3 groups list, and it MUST be set: the compiled-in
+		# default (prime256v1) and the OpenSSL default list ("") both reject the
+		# proxy's pure ML-KEM-1024 key share with "no suitable key share".
+		ecdh_curve = "MLKEM1024"
+		check_crl = no
+		cache {
+			enable = no
+		}
+		# RFC 6614 section 2.3: mutual authentication with X.509 certificates.
+		# The proxy presents usg-proxy.crt (EKU clientAuth); its chain is
+		# checked against ca_file.
+		require_client_cert = yes
+		verify {
+		}
+	}
+}
+
+# The client list for the listener above. RFC 6614 section 2.3: over
+# RADIUS/TLS the shared secret is the fixed string "radsec"; it still keys the
+# Request/Response Authenticators and Message-Authenticator inside the tunnel,
+# and the proxy re-keys User-Password and the MS-MPPE keys to it on this hop.
+clients radsec {
+	client usg-proxy-tls {
+		ipaddr = 10.77.0.20
+		proto = tls
+		secret = radsec
+		shortname = usg-proxy-tls
+		require_message_authenticator = yes
+	}
+}

@@ -4,13 +4,18 @@
 #
 #   nas (eapol_test, radclient) 10.77.0.40
 #     --[nas-proxy-secret-1]-->   usg-proxy 10.77.0.20
-#                                   --[proxy-freeradius-secret-2]--> freeradius 10.77.0.10  (realm freeradius.test)
+#                                   --[proxy-freeradius-secret-2]--> freeradius 10.77.0.10:1812  (UDP, realm freeradius.test)
+#                                   --[RadSec, TLS 1.3 ML-KEM-1024, mTLS, secret "radsec"]--> freeradius 10.77.0.10:2083  (realm radsec.test)
 #                                   --[proxy-usghome-secret-4]-->    usg-home   10.77.0.30  (realm usg.test)
 #     --[nas-usghome-secret-3]--> usg-home  10.77.0.30   (EAP-TLS with CRL checking, no proxy)
 #     --[nas-usghome-secret-3]--> usg-home  10.77.0.30:1813  (Accounting-Request, Status-Server -> Accounting-Response)
 #
 # Fixed addresses: the servers' client lists and the proxy's home-server entry
 # are plain IPs, which keeps the configs free of DNS and of compose internals.
+#
+# The RadSec hop (RFC 6614) is the one RADIUS hop carried over TLS: the proxy
+# authenticates with certs/usg-proxy.crt, FreeRADIUS with
+# certs/freeradius-server.crt (server_name "freeradius"), both under certs/ca.crt.
 name: usg-radius-interop
 
 networks:
@@ -31,6 +36,7 @@ services:
       - ./freeradius/clients.conf:/etc/freeradius/3.0/clients.conf:ro
       - ./freeradius/eap:/etc/freeradius/3.0/mods-available/eap:ro
       - ./freeradius/authorize:/etc/freeradius/3.0/mods-config/files/authorize:ro
+      - ./freeradius/sites-radsec:/etc/freeradius/3.0/sites-enabled/radsec:ro
       - ./certs:/etc/freeradius/interop-certs:ro
 
   usg-proxy:
@@ -48,6 +54,8 @@ services:
         ipv4_address: 10.77.0.20
     volumes:
       - ./usg-radius/proxy.json:/etc/radius/proxy.json:ro
+      # CA bundle, client certificate and key for the RadSec home server.
+      - ./certs:/certs:ro
     depends_on:
       - freeradius
 

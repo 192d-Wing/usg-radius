@@ -265,6 +265,42 @@ printf 'Acct-Status-Type = Start\nAcct-Session-Id = "interop-acct-0002"\nUser-Na
 check "Accounting-Request to the authentication port with a dedicated accounting socket: silently discarded" grep -q 'No reply' "$LOG"
 
 # ---------------------------------------------------------------------------
+section "15. EAP-TLS and PAP: eapol_test/radclient -> usg-radius proxy -> FreeRADIUS over RadSec (RFC 6614)"
+# Realm radsec.test goes to the same FreeRADIUS as scenarios 1-3, but over the
+# proxy's persistent TLS 1.3 connection to 10.77.0.10:2083 (mutual certificates,
+# ML-KEM-1024) instead of UDP 1812. The hop secret is the fixed "radsec" (RFC
+# 6614 2.3), so the proxy re-keys User-Password, the MS-MPPE keys and both
+# authenticators between nas-proxy-secret-1 and "radsec". The nas container sees
+# only the UDP side; run.sh proves from the logs that the requests arrived on
+# port 2083 over TLS 1.3 / TLS_AES_256_GCM_SHA384 and never on 1812.
+LOG=$LOGDIR/eap-tls-via-proxy-radsec.log
+eapol_test -c /etc/eapol_test/eap-tls-radsec.conf -a "$PROXY" -p 1812 \
+    -s "$NAS_PROXY_SECRET" -r 0 -t 15 -e >"$LOG" 2>&1
+rc=$?
+summarize_eapol "$LOG"
+check "eapol_test exit status 0 (rc=$rc)" test "$rc" -eq 0
+check "eapol_test printed SUCCESS" grep -qx 'SUCCESS' "$LOG"
+check "EAP-Success received through the proxy over RadSec" grep -q 'EAP: Status notification: completion (param=success)' "$LOG"
+check "MS-MPPE keys re-keyed from the RadSec hop to the NAS secret match the supplicant MSK (MPPE keys OK: 1  mismatch: 0)" \
+    grep -q 'MPPE keys OK: 1  mismatch: 0' "$LOG"
+check "no PMK mismatch reported" sh -c "! grep -q 'PMK mismatch' '$LOG'"
+
+LOG=$LOGDIR/pap-via-proxy-radsec.log
+printf 'User-Name = "papuser@radsec.test"\nUser-Password = "pap-password-123"\nNAS-Identifier = "interop-nas"\nMessage-Authenticator = 0x00\n' |
+    radclient -x -t 3 -r 1 "$PROXY" auth "$NAS_PROXY_SECRET" >"$LOG" 2>&1
+rc=$?
+grep -E 'Received|Reply-Message|Sent|No reply' "$LOG" | sed 's/^/    /'
+check "radclient exit status 0 (rc=$rc)" test "$rc" -eq 0
+check "Access-Accept received (User-Password re-encrypted to the RadSec secret, RFC 6614 2.3)" grep -q 'Received Access-Accept' "$LOG"
+check "FreeRADIUS Reply-Message from the RadSec realm relayed" grep -q 'PAP via usg-radius proxy over RadSec OK' "$LOG"
+
+LOG=$LOGDIR/pap-wrong-password-via-proxy-radsec.log
+printf 'User-Name = "papuser@radsec.test"\nUser-Password = "not-the-password"\nNAS-Identifier = "interop-nas"\nMessage-Authenticator = 0x00\n' |
+    radclient -x -t 3 -r 1 "$PROXY" auth "$NAS_PROXY_SECRET" >"$LOG" 2>&1
+grep -E 'Received|No reply' "$LOG" | sed 's/^/    /'
+check "wrong password over RadSec: Access-Reject received (not a timeout, not an accept)" grep -q 'Received Access-Reject' "$LOG"
+
+# ---------------------------------------------------------------------------
 section "result"
 if [ "$failures" -eq 0 ]; then
     echo "ALL CHECKS PASSED"

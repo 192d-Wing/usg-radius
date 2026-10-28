@@ -235,17 +235,24 @@ impl RevocationCheckingVerifier {
     /// - PreferOcsp: Try OCSP first, fall back to CRL when OCSP cannot answer
     /// - Both: Check both OCSP and CRL (fail if either indicates revoked)
     ///
+    /// This is the transport-agnostic entry point: the [`ClientCertVerifier`]
+    /// impl below calls it for peer (supplicant / NAS) certificates, and
+    /// radius-server's outbound RadSec `ServerCertVerifier` calls it for the
+    /// home server's certificate after WebPKI chain and name validation.
+    /// Nothing in here depends on which end of the handshake the certificate
+    /// came from.
+    ///
     /// # Arguments
     ///
-    /// * `cert_der` - DER-encoded client certificate
-    /// * `intermediates` - DER-encoded intermediate certificates the client
+    /// * `cert_der` - DER-encoded end-entity certificate
+    /// * `intermediates` - DER-encoded intermediate certificates the peer
     ///   sent (used to find the issuer for OCSP)
     ///
     /// # Returns
     ///
     /// * `Ok(())` - Certificate is NOT revoked (or the check failed under fail-open)
     /// * `Err(RevocationError)` - Certificate is revoked OR check failed under fail-closed
-    fn check_revocation(
+    pub fn check_revocation(
         &self,
         cert_der: &[u8],
         intermediates: &[&[u8]],

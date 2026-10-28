@@ -1,5 +1,5 @@
 {
-  "_comment": "usg-radius as the proxy. NAS hop secret differs from the home hop secrets, so every relayed attribute that depends on the secret (User-Password, MS-MPPE-*-Key, Message-Authenticator, Response Authenticator) must be re-keyed. Realm freeradius.test goes to FreeRADIUS, realm usg.test to the usg-radius home server (which enforces the CRL).",
+  "_comment": "usg-radius as the proxy. NAS hop secret differs from the home hop secrets, so every relayed attribute that depends on the secret (User-Password, MS-MPPE-*-Key, Message-Authenticator, Response Authenticator) must be re-keyed. Realm freeradius.test goes to FreeRADIUS over UDP, realm radsec.test to the same FreeRADIUS over RadSec (RFC 6614: TLS 1.3 to 10.77.0.10:2083, mutual certificates from /certs, fixed hop secret \"radsec\" so no secret key here), realm usg.test to the usg-radius home server (which enforces the CRL).",
   "listen_address": "0.0.0.0",
   "listen_port": 1812,
   "accounting_port": 1813,
@@ -27,6 +27,13 @@
         ]
       },
       {
+        "name": "freeradius-radsec",
+        "strategy": "failover",
+        "servers": [
+          { "name": "freeradius-radsec", "address": "10.77.0.10:2083", "transport": "radsec", "tls": { "ca_path": "/certs/ca.crt", "cert_path": "/certs/usg-proxy.crt", "key_path": "/certs/usg-proxy.key", "server_name": "freeradius" }, "timeout": 5, "max_outstanding": 100 }
+        ]
+      },
+      {
         "name": "usg-home",
         "strategy": "failover",
         "servers": [
@@ -36,6 +43,7 @@
     ],
     "realms": [
       { "name": "freeradius.test", "match": { "type": "suffix", "pattern": "freeradius.test" }, "pool": "freeradius", "strip_realm": false },
+      { "name": "radsec.test", "match": { "type": "suffix", "pattern": "radsec.test" }, "pool": "freeradius-radsec", "strip_realm": false },
       { "name": "usg.test", "match": { "type": "suffix", "pattern": "usg.test" }, "pool": "usg-home", "strip_realm": false }
     ],
     "health_check": { "enabled": true, "interval": 5, "timeout": 3, "failures_before_down": 3, "successes_before_up": 1 },

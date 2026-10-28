@@ -77,6 +77,34 @@
             "name": "eduroam-backup"
           }
         ]
+      },
+      {
+        "_comment": "Upstream over RadSec (RFC 6614): TLS 1.3, ML-KEM-1024-only, mutual authentication. No `secret` - the hop secret is the fixed string \"radsec\" (RFC 6614 section 2.3). `tls.revocation` is the same block as `eap.tls.revocation` and needs the `revocation` cargo feature.",
+        "name": "radsec_pool",
+        "strategy": "failover",
+        "servers": [
+          {
+            "address": "10.0.3.10:2083",
+            "transport": "radsec",
+            "tls": {
+              "ca_path": "/etc/radius/proxy/partner-ca.pem",
+              "cert_path": "/etc/radius/proxy/proxy.pem",
+              "key_path": "/etc/radius/proxy/proxy.key",
+              "server_name": "radius.partner.example.net",
+              "revocation": {
+                "mode": "crl_only",
+                "on_error": "fail_closed",
+                "crl": {
+                  "static_files": ["/etc/radius/crl/partner-ca.crl"],
+                  "fetch": false
+                }
+              }
+            },
+            "timeout": 10,
+            "max_outstanding": 100,
+            "name": "partner-radsec"
+          }
+        ]
       }
     ],
 
@@ -115,6 +143,15 @@
           "pattern": "^.*@.*\\.edu$"
         },
         "pool": "eduroam_pool",
+        "strip_realm": false
+      },
+      {
+        "name": "partner",
+        "match": {
+          "type": "suffix",
+          "pattern": "partner.example.net"
+        },
+        "pool": "radsec_pool",
         "strip_realm": false
       }
     ],

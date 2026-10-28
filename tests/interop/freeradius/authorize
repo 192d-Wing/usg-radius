@@ -4,3 +4,9 @@
 # comparison fails and FreeRADIUS sends Access-Reject.
 papuser@freeradius.test    Cleartext-Password := "pap-password-123"
     Reply-Message = "PAP via usg-radius proxy OK"
+
+# Same proof over the RadSec hop (sites-radsec): the proxy re-encrypts
+# User-Password to the fixed RFC 6614 secret "radsec", and the distinct
+# Reply-Message shows the Access-Accept really came back through this realm.
+papuser@radsec.test        Cleartext-Password := "pap-password-123"
+    Reply-Message = "PAP via usg-radius proxy over RadSec OK"

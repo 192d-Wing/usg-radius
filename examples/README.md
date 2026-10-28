@@ -16,7 +16,8 @@ examples/
 │   ├── small-business.json  # SMB production config
 │   ├── enterprise.json      # Enterprise/high-scale config
 │   ├── docker.json          # Container/Kubernetes config (env-var driven)
-│   └── eap-tls-revocation.json  # EAP-TLS with the full `eap` block and CRL/OCSP revocation
+│   ├── eap-tls-revocation.json  # EAP-TLS with the full `eap` block and CRL/OCSP revocation
+│   └── proxy-radsec-upstream.json  # Proxy forwarding to home servers over RadSec (RFC 6614)
 ├── proxy_config.json        # RADIUS proxy configuration example
 ├── postgres_schema.sql      # PostgreSQL schema (auth + accounting)
 ├── postgres-schema.sql      # PostgreSQL schema (alternate)
@@ -121,11 +122,28 @@ Load with:
 psql -U radius -d radiusdb < examples/postgres_schema.sql
 ```
 
+### Proxy with RadSec upstream (`configs/proxy-radsec-upstream.json`)
+
+**Use case:** Forwarding a realm to home servers over RFC 6614 RadSec
+
+**Features:**
+
+- NAS hop over UDP with per-client secrets (`transport: udp-insecure`; the proxy
+  components only run under the UDP listener)
+- Home servers with `transport: radsec`: one persistent TLS 1.3 connection each,
+  ML-KEM-1024-only key exchange, mutual certificate authentication, no fallback
+  to UDP
+- No `secret` on a RadSec home server: RFC 6614 §2.3 fixes the hop secret to
+  `"radsec"`; the certificates authenticate the hop
+- Status-Server health probes over the same connection
+
 ## Proxy Configuration
 
 [`proxy_config.json`](proxy_config.json) is a complete RADIUS proxy configuration (home
-servers, pools, realms, health checks). See the [proxy documentation](../docs/docs/proxy/README.md)
-and the [`proxy_server.rs`](proxy_server.rs) example.
+servers, pools, realms, health checks), including a `radsec_pool` whose home server is
+reached over RadSec with CRL revocation checking of its certificate. See the
+[proxy documentation](../docs/docs/proxy/README.md) and the
+[`proxy_server.rs`](proxy_server.rs) example.
 
 ## Security Best Practices
 

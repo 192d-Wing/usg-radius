@@ -53,6 +53,8 @@ pub mod handler;
 pub mod health;
 pub mod home_server;
 pub mod pool;
+#[cfg(feature = "tls")]
+pub mod radsec_client;
 pub mod realm;
 pub mod retry;
 pub mod router;
@@ -62,7 +64,10 @@ pub use cache::{ProxyCache, ProxyCacheEntry, ProxyStateKey};
 pub use error::ProxyError;
 pub use handler::ProxyHandler;
 pub use health::{HealthCheckConfig, HealthChecker};
-pub use home_server::{HomeServer, HomeServerConfig, HomeServerState, HomeServerStats};
+pub use home_server::{
+    HomeServer, HomeServerConfig, HomeServerState, HomeServerStats, HomeServerTlsConfig,
+    HomeServerTransport,
+};
 pub use pool::{HomeServerPool, HomeServerPoolConfig, LoadBalanceStrategy};
 pub use realm::{Realm, RealmConfig, RealmMatchConfig, RealmMatcher};
 pub use retry::{RetryConfig, RetryManager};

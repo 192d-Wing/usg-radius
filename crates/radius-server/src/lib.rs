@@ -63,9 +63,14 @@ pub mod postgres_auth;
 pub mod proxy;
 #[cfg(feature = "tls")]
 pub mod radsec;
+pub mod radsec_frame;
 pub mod ratelimit;
 pub mod server;
+#[cfg(feature = "tls")]
+pub mod server_verifier;
 pub mod state;
+#[cfg(all(test, feature = "tls"))]
+pub(crate) mod test_pki;
 #[cfg(feature = "tls")]
 pub mod tls_certs;
 
