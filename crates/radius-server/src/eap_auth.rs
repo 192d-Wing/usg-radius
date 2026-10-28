@@ -1484,7 +1484,7 @@ mod tests {
 mod eap_tls_mppe_tests {
     use super::*;
     use crate::config::Config;
-    use crate::server::{RadiusServer, ServerConfig, SimpleAuthHandler};
+    use crate::server::{PortRole, RadiusServer, ServerConfig, SimpleAuthHandler};
     use radius_proto::eap::eap_tls::{EAP_TLS_TYPE_CODE, TlsFlags};
     use radius_proto::eap::{EapCode, eap_from_radius_packet};
     use radius_proto::mppe::{MICROSOFT_VENDOR_ID, MS_MPPE_RECV_KEY, MS_MPPE_SEND_KEY};
@@ -2152,11 +2152,16 @@ mod eap_tls_mppe_tests {
                 request.identifier < 64,
                 "EAP-TLS conversation did not converge"
             );
-            let bytes =
-                RadiusServer::process_request(&request.encode().unwrap(), nas_ip, SECRET, &cfg)
-                    .await
-                    .unwrap()
-                    .expect("Access-Request warrants a reply");
+            let bytes = RadiusServer::process_request(
+                &request.encode().unwrap(),
+                nas_ip,
+                SECRET,
+                PortRole::Auth,
+                &cfg,
+            )
+            .await
+            .unwrap()
+            .expect("Access-Request warrants a reply");
             let response = Packet::decode(&bytes).unwrap();
             // No reply before the Accept may leak key material.
             assert!(

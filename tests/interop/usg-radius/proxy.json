@@ -2,6 +2,7 @@
   "_comment": "usg-radius as the proxy. NAS hop secret differs from the home hop secrets, so every relayed attribute that depends on the secret (User-Password, MS-MPPE-*-Key, Message-Authenticator, Response Authenticator) must be re-keyed. Realm freeradius.test goes to FreeRADIUS, realm usg.test to the usg-radius home server (which enforces the CRL).",
   "listen_address": "0.0.0.0",
   "listen_port": 1812,
+  "accounting_port": 1813,
   "transport": "udp-insecure",
   "secret": "unused-default-secret",
   "clients": [

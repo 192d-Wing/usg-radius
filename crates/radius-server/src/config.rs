@@ -104,6 +104,63 @@ impl Client {
     }
 }
 
+/// Where Accounting-Request (RFC 2866) is accepted over UDP. Ignored under
+/// `transport = "radsec"`, where accounting shares the TLS connection
+/// (RFC 6614 §2.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AccountingPort {
+    /// `"accounting_port": 1813` — a dedicated UDP socket on
+    /// `listen_address:<port>` (RFC 2866 §2). Default.
+    Dedicated(u16),
+    /// `"accounting_port": "shared"` | `"disabled"`.
+    Named(AccountingPortMode),
+}
+
+/// The two non-numeric forms of [`AccountingPort`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountingPortMode {
+    /// No second socket; Accounting-Request is accepted on the authentication
+    /// socket (the pre-1813 behaviour).
+    Shared,
+    /// No second socket and Accounting-Request is discarded over UDP.
+    Disabled,
+}
+
+impl Default for AccountingPort {
+    fn default() -> Self {
+        AccountingPort::Dedicated(default_accounting_port())
+    }
+}
+
+impl AccountingPort {
+    /// The port of the dedicated accounting socket, `Some(p)` only for
+    /// [`AccountingPort::Dedicated`].
+    pub fn dedicated(self) -> Option<u16> {
+        match self {
+            AccountingPort::Dedicated(port) => Some(port),
+            AccountingPort::Named(_) => None,
+        }
+    }
+
+    /// Whether Accounting-Request is admitted on the authentication socket.
+    /// True only for `"shared"`.
+    pub fn accepts_accounting_on_auth_socket(self) -> bool {
+        matches!(self, AccountingPort::Named(AccountingPortMode::Shared))
+    }
+}
+
+impl std::fmt::Display for AccountingPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AccountingPort::Dedicated(port) => write!(f, "{port}"),
+            AccountingPort::Named(AccountingPortMode::Shared) => f.write_str("shared"),
+            AccountingPort::Named(AccountingPortMode::Disabled) => f.write_str("disabled"),
+        }
+    }
+}
+
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -114,6 +171,13 @@ pub struct Config {
     /// Server listen port
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
+
+    /// UDP accounting port (RFC 2866 §2). An integer binds a dedicated socket
+    /// on `listen_address:<port>` (default 1813); `"shared"` accepts
+    /// Accounting-Request on the authentication socket instead; `"disabled"`
+    /// turns UDP accounting off. Ignored under `transport = "radsec"`.
+    #[serde(default)]
+    pub accounting_port: AccountingPort,
 
     /// Default shared secret (used if client doesn't specify one)
     #[serde(default = "default_secret")]
@@ -609,6 +673,10 @@ fn default_listen_port() -> u16 {
     1812 // Standard RADIUS authentication port
 }
 
+fn default_accounting_port() -> u16 {
+    1813 // Standard RADIUS accounting port (RFC 2866 §2)
+}
+
 fn default_radsec_port() -> u16 {
     2083 // RadSec (RADIUS over TLS), IANA-assigned
 }
@@ -626,6 +694,7 @@ impl Default for Config {
         Config {
             listen_address: default_listen_address(),
             listen_port: default_listen_port(),
+            accounting_port: AccountingPort::default(),
             secret: default_secret(),
             clients: vec![],
             users: vec![],
@@ -691,6 +760,19 @@ impl Config {
         Ok(SocketAddr::new(addr, self.listen_port))
     }
 
+    /// Socket address of the dedicated UDP accounting socket (RFC 2866 §2), or
+    /// `None` when `accounting_port` is `"shared"` or `"disabled"`. Same IP as
+    /// `socket_addr()`, so dual-stack (`::`) binding applies to both.
+    pub fn accounting_socket_addr(&self) -> Result<Option<SocketAddr>, ConfigError> {
+        let addr: IpAddr = self.listen_address.parse().map_err(|_| {
+            ConfigError::Invalid(format!("Invalid IP address: {}", self.listen_address))
+        })?;
+        Ok(self
+            .accounting_port
+            .dedicated()
+            .map(|port| SocketAddr::new(addr, port)))
+    }
+
     /// Find a client by source IP address
     ///
     /// Returns the first enabled client that matches the source IP.
@@ -730,6 +812,22 @@ impl Config {
         // Validate port
         if self.listen_port == 0 {
             return Err(ConfigError::Invalid("Port cannot be 0".to_string()));
+        }
+
+        // Accounting port (RFC 2866 §2): a dedicated socket needs a real port
+        // distinct from the authentication socket's.
+        match self.accounting_port {
+            AccountingPort::Dedicated(0) => {
+                return Err(ConfigError::Invalid(
+                    "accounting_port cannot be 0 (use \"disabled\" or \"shared\")".to_string(),
+                ));
+            }
+            AccountingPort::Dedicated(p) if p == self.listen_port => {
+                return Err(ConfigError::Invalid(format!(
+                    "accounting_port {p} must differ from listen_port"
+                )));
+            }
+            _ => {}
         }
 
         // Validate secret is not empty
@@ -834,6 +932,7 @@ impl Config {
         Config {
             listen_address: "::".to_string(),
             listen_port: 1812,
+            accounting_port: AccountingPort::default(),
             secret: "testing123".to_string(),
             clients: vec![
                 Client {
@@ -933,6 +1032,153 @@ mod tests {
 
         config.secret = "".to_string();
         assert!(config.validate().is_err());
+    }
+
+    // --- accounting_port (RFC 2866 §2) ---
+
+    #[test]
+    fn accounting_port_defaults_to_1813() {
+        assert_eq!(
+            Config::default().accounting_port,
+            AccountingPort::Dedicated(1813)
+        );
+        let from_json: Config = serde_json::from_str(r#"{"secret":"s"}"#).unwrap();
+        assert_eq!(from_json.accounting_port, AccountingPort::Dedicated(1813));
+        assert_eq!(
+            from_json.accounting_socket_addr().unwrap(),
+            Some("[::]:1813".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn accounting_port_named_modes_parse_and_round_trip() {
+        let cases = [
+            (
+                r#"{"secret":"s","accounting_port":"shared"}"#,
+                AccountingPort::Named(AccountingPortMode::Shared),
+                serde_json::json!("shared"),
+            ),
+            (
+                r#"{"secret":"s","accounting_port":"disabled"}"#,
+                AccountingPort::Named(AccountingPortMode::Disabled),
+                serde_json::json!("disabled"),
+            ),
+            (
+                r#"{"secret":"s","accounting_port":1813}"#,
+                AccountingPort::Dedicated(1813),
+                serde_json::json!(1813),
+            ),
+        ];
+        for (json, expected, wire) in cases {
+            let config: Config = serde_json::from_str(json).unwrap();
+            assert_eq!(config.accounting_port, expected);
+            assert_eq!(serde_json::to_value(config.accounting_port).unwrap(), wire);
+            config.validate().unwrap();
+            assert_eq!(
+                config.accounting_socket_addr().unwrap().is_some(),
+                expected.dedicated().is_some()
+            );
+        }
+        assert!(
+            AccountingPort::Named(AccountingPortMode::Shared).accepts_accounting_on_auth_socket()
+        );
+        assert!(
+            !AccountingPort::Named(AccountingPortMode::Disabled)
+                .accepts_accounting_on_auth_socket()
+        );
+        assert!(!AccountingPort::Dedicated(1813).accepts_accounting_on_auth_socket());
+    }
+
+    #[test]
+    fn accounting_port_zero_is_rejected() {
+        let config = Config {
+            accounting_port: AccountingPort::Dedicated(0),
+            ..Config::default()
+        };
+        match config.validate() {
+            Err(ConfigError::Invalid(msg)) => {
+                assert!(msg.contains("accounting_port cannot be 0"), "{msg}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accounting_port_equal_to_listen_port_is_rejected() {
+        let config = Config {
+            listen_port: 1812,
+            accounting_port: AccountingPort::Dedicated(1812),
+            ..Config::default()
+        };
+        match config.validate() {
+            Err(ConfigError::Invalid(msg)) => {
+                assert!(msg.contains("must differ from listen_port"), "{msg}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        let config = Config {
+            listen_port: 1812,
+            accounting_port: AccountingPort::Dedicated(1813),
+            ..Config::default()
+        };
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn accounting_port_rejects_unknown_strings() {
+        let result = serde_json::from_str::<Config>(r#"{"secret":"s","accounting_port":"both"}"#);
+        assert!(result.is_err(), "\"both\" is not a valid accounting_port");
+    }
+
+    #[test]
+    fn accounting_port_displays_all_three_forms() {
+        assert_eq!(AccountingPort::Dedicated(1813).to_string(), "1813");
+        assert_eq!(
+            AccountingPort::Named(AccountingPortMode::Shared).to_string(),
+            "shared"
+        );
+        assert_eq!(
+            AccountingPort::Named(AccountingPortMode::Disabled).to_string(),
+            "disabled"
+        );
+    }
+
+    /// Every shipped example config parses and validates, and every UDP
+    /// example names the RFC 2866 accounting port explicitly.
+    #[test]
+    fn example_configs_parse_and_validate() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/configs");
+        let mut seen = 0;
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !name.ends_with(".json") || name == "access-policy.example.json" {
+                continue;
+            }
+            let contents = fs::read_to_string(&path).unwrap();
+            let config: Config = serde_json::from_str(&contents)
+                .unwrap_or_else(|e| panic!("{name}: does not parse: {e}"));
+            // `${VAR}` placeholders in secrets are non-empty strings, so
+            // validation does not need the expansion `from_file` performs.
+            // `docker.json` is a shell template (`${VAR:-default}` in client
+            // addresses and more) expanded before the server reads it; its
+            // raw form cannot validate, so only its shape is checked here.
+            let shell_template = contents.contains(":-");
+            if !shell_template {
+                config
+                    .validate()
+                    .unwrap_or_else(|e| panic!("{name}: does not validate: {e}"));
+            }
+            if config.transport == Transport::UdpInsecure {
+                assert_eq!(
+                    config.accounting_port,
+                    AccountingPort::Dedicated(1813),
+                    "{name}: UDP example should set accounting_port 1813"
+                );
+            }
+            seen += 1;
+        }
+        assert!(seen >= 8, "expected the example configs, found {seen}");
     }
 
     /// Minimal config with an EAP-TLS block carrying the given `revocation` JSON

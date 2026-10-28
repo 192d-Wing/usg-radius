@@ -11,6 +11,7 @@
 
   "listen_address": "::",
   "listen_port": 1812,
+  "accounting_port": 1813,
   "secret": "${RADIUS_DEFAULT_SECRET}",
 
   "clients": [

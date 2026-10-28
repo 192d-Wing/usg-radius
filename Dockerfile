@@ -68,7 +68,7 @@ RUN apk add --no-cache ca-certificates libgcc \
 COPY --from=builder /build/target/release/usg-radius /usr/local/bin/usg-radius
 COPY examples/configs/docker.json /etc/radius/config.example.json
 USER radius
-# RADIUS auth (1812/udp) + accounting (1813/udp); health (2812/tcp); metrics (3812/tcp)
+# RADIUS auth (1812/udp) + accounting (1813/udp, config accounting_port); health (2812/tcp); metrics (3812/tcp)
 EXPOSE 1812/udp 1813/udp 2812/tcp 3812/tcp
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/usg-radius", "--version"]

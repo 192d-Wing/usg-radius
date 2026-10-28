@@ -7,6 +7,7 @@
 #                                   --[proxy-freeradius-secret-2]--> freeradius 10.77.0.10  (realm freeradius.test)
 #                                   --[proxy-usghome-secret-4]-->    usg-home   10.77.0.30  (realm usg.test)
 #     --[nas-usghome-secret-3]--> usg-home  10.77.0.30   (EAP-TLS with CRL checking, no proxy)
+#     --[nas-usghome-secret-3]--> usg-home  10.77.0.30:1813  (Accounting-Request, Status-Server -> Accounting-Response)
 #
 # Fixed addresses: the servers' client lists and the proxy's home-server entry
 # are plain IPs, which keeps the configs free of DNS and of compose internals.

@@ -3,11 +3,19 @@
 //! This module implements health checks using Status-Server requests (RFC 5997).
 //! Health checks run in the background and automatically mark servers as up/down
 //! based on their responsiveness.
+//!
+//! Each probe is a conformant RFC 5997 client: random Request Authenticator
+//! (§3), a Message-Authenticator under the home server's secret (§4.1), and the
+//! reply's Response Authenticator verified before the probe counts (§4.4).
+//! Either Access-Accept or Accounting-Response marks the server alive (§4.2).
 
 use crate::proxy::home_server::{HomeServer, HomeServerState};
 use radius_proto::attributes::{Attribute, AttributeType};
-use radius_proto::{Code, Packet};
+use radius_proto::auth::{generate_request_authenticator, verify_response_authenticator};
+use radius_proto::{Code, Packet, calculate_message_authenticator};
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -145,25 +153,23 @@ impl Default for HealthCheckStats {
 pub struct HealthChecker {
     /// Health check configuration
     config: HealthCheckConfig,
-    /// Socket for sending Status-Server requests
-    socket: Arc<UdpSocket>,
+    /// `ip:0` template each probe binds its own ephemeral socket from. One
+    /// socket per probe keeps concurrent probes from reading each other's
+    /// replies (and failing both).
+    probe_bind_addr: SocketAddr,
     /// Running flag for background task
     running: Arc<AtomicBool>,
 }
 
 impl HealthChecker {
-    /// Create a new health checker
-    pub async fn new(
-        config: HealthCheckConfig,
-        bind_addr: std::net::SocketAddr,
-    ) -> std::io::Result<Self> {
-        let socket = UdpSocket::bind(bind_addr).await?;
-
-        Ok(HealthChecker {
+    /// Create a new health checker. `bind_addr` is the local address (normally
+    /// `0.0.0.0:0` or `[::]:0`) probes bind their per-probe sockets to.
+    pub fn new(config: HealthCheckConfig, bind_addr: SocketAddr) -> Self {
+        HealthChecker {
             config,
-            socket: Arc::new(socket),
+            probe_bind_addr: bind_addr,
             running: Arc::new(AtomicBool::new(false)),
-        })
+        }
     }
 
     /// Start background health checking task
@@ -172,7 +178,7 @@ impl HealthChecker {
     /// and updates their health state based on responses.
     pub fn start(&self, servers: Vec<Arc<HomeServer>>) -> tokio::task::JoinHandle<()> {
         let config = self.config.clone();
-        let socket = Arc::clone(&self.socket);
+        let probe_bind_addr = self.probe_bind_addr;
         let running = Arc::clone(&self.running);
 
         running.store(true, Ordering::Relaxed);
@@ -198,10 +204,9 @@ impl HealthChecker {
                 let mut check_tasks = vec![];
                 for server in &servers {
                     let server = Arc::clone(server);
-                    let socket = Arc::clone(&socket);
                     let timeout = Duration::from_secs(config.timeout);
                     let task = tokio::spawn(async move {
-                        Self::check_server_health(server, socket, timeout).await
+                        Self::check_server_health(server, probe_bind_addr, timeout).await
                     });
                     check_tasks.push(task);
                 }
@@ -230,26 +235,75 @@ impl HealthChecker {
         self.running.store(false, Ordering::Relaxed);
     }
 
-    /// Check health of a single server using Status-Server request
+    /// Check health of a single server using Status-Server request (RFC 5997).
+    ///
+    /// The probe binds its own ephemeral socket at `probe_bind_addr`, sends a
+    /// Status-Server with a random Request Authenticator and Identifier and a
+    /// Message-Authenticator under the server's secret, and counts the probe as
+    /// a success only when a datagram from the server's address carries the
+    /// same Identifier, Code 2 or 5, and a Response Authenticator that verifies
+    /// under that secret. Anything else — including a reply from the right
+    /// address that fails verification — is a failed probe, the same as a
+    /// timeout; a stray or forged datagram can never make a server look up.
     async fn check_server_health(
         server: Arc<HomeServer>,
-        socket: Arc<UdpSocket>,
+        probe_bind_addr: SocketAddr,
         timeout: Duration,
     ) {
         // Get or create health stats for this server
         let stats = server.health_stats();
 
-        // Create Status-Server packet (RFC 5997)
-        let mut request = Packet::new(Code::StatusServer, 1, [0u8; 16]);
+        let socket = match UdpSocket::bind(probe_bind_addr).await {
+            Ok(socket) => socket,
+            Err(e) => {
+                warn!(
+                    server = %server.name,
+                    error = %e,
+                    "Failed to bind a socket for the Status-Server probe"
+                );
+                stats.record_failure();
+                return;
+            }
+        };
 
-        // Add Message-Authenticator (required for Status-Server)
-        request.add_attribute(
-            Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16])
-                .expect("Failed to create Message-Authenticator"),
-        );
+        // RFC 5997 §3: random Request Authenticator; the Identifier is random
+        // too so a stale reply from an earlier probe cannot match.
+        let request_auth = generate_request_authenticator();
+        let identifier: u8 = rand::rng().random();
+        let mut request = Packet::new(Code::StatusServer, identifier, request_auth);
 
-        // Encode the request
+        // RFC 5997 §4.1: the request MUST carry a Message-Authenticator,
+        // HMAC-MD5 under the home server's secret over the packet with the
+        // attribute value zeroed (RFC 2869 §5.14).
+        let zeroed_ma =
+            match Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]) {
+                Ok(attr) => attr,
+                Err(e) => {
+                    warn!(
+                        server = %server.name,
+                        error = %e,
+                        "Failed to build the Status-Server Message-Authenticator"
+                    );
+                    stats.record_failure();
+                    return;
+                }
+            };
+        request.add_attribute(zeroed_ma);
         let request_data = match request.encode() {
+            Ok(bytes) => {
+                let mac = calculate_message_authenticator(&bytes, server.secret());
+                if let Some(ma) = request
+                    .attributes
+                    .iter_mut()
+                    .find(|a| a.attr_type == AttributeType::MessageAuthenticator as u8)
+                {
+                    ma.value = mac.to_vec();
+                }
+                request.encode()
+            }
+            Err(e) => Err(e),
+        };
+        let request_data = match request_data {
             Ok(data) => data,
             Err(e) => {
                 warn!(
@@ -263,8 +317,7 @@ impl HealthChecker {
         };
 
         // Send Status-Server request with timeout
-        let send_result = socket.send_to(&request_data, server.address).await;
-        if let Err(e) = send_result {
+        if let Err(e) = socket.send_to(&request_data, server.address).await {
             warn!(
                 server = %server.name,
                 error = %e,
@@ -293,24 +346,8 @@ impl HealthChecker {
                 }
 
                 // Decode the response
-                match Packet::decode(&buf[..len]) {
-                    Ok(response) => {
-                        // Status-Server response should be Access-Accept (RFC 5997)
-                        if response.code == Code::AccessAccept {
-                            debug!(
-                                server = %server.name,
-                                "Status-Server check successful"
-                            );
-                            stats.record_success();
-                        } else {
-                            warn!(
-                                server = %server.name,
-                                code = ?response.code,
-                                "Unexpected Status-Server response code"
-                            );
-                            stats.record_failure();
-                        }
-                    }
+                let response = match Packet::decode(&buf[..len]) {
+                    Ok(response) => response,
                     Err(e) => {
                         warn!(
                             server = %server.name,
@@ -318,8 +355,51 @@ impl HealthChecker {
                             "Failed to decode Status-Server response"
                         );
                         stats.record_failure();
+                        return;
                     }
+                };
+
+                if response.identifier != identifier {
+                    warn!(
+                        server = %server.name,
+                        expected = identifier,
+                        actual = response.identifier,
+                        "Status-Server response with the wrong Identifier"
+                    );
+                    stats.record_failure();
+                    return;
                 }
+
+                // RFC 5997 §4.2: Access-Accept from an authentication port,
+                // Accounting-Response from an accounting port.
+                if !matches!(response.code, Code::AccessAccept | Code::AccountingResponse) {
+                    warn!(
+                        server = %server.name,
+                        code = ?response.code,
+                        "Unexpected Status-Server response code"
+                    );
+                    stats.record_failure();
+                    return;
+                }
+
+                // RFC 5997 §4.4 / RFC 2865 §3: a reply whose Response
+                // Authenticator does not verify under the secret is discarded.
+                if !verify_response_authenticator(&response, &request_auth, server.secret()) {
+                    warn!(
+                        server = %server.name,
+                        code = ?response.code,
+                        "Status-Server response failed the Response Authenticator check"
+                    );
+                    stats.record_failure();
+                    return;
+                }
+
+                debug!(
+                    server = %server.name,
+                    code = ?response.code,
+                    "Status-Server check successful"
+                );
+                stats.record_success();
             }
             Ok(Err(e)) => {
                 warn!(
@@ -454,9 +534,7 @@ mod tests {
     #[tokio::test]
     async fn test_health_checker_creation() {
         let config = create_test_config();
-        let checker = HealthChecker::new(config, "127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
+        let checker = HealthChecker::new(config, "127.0.0.1:0".parse().unwrap());
 
         assert_eq!(checker.config.interval, 1);
         assert_eq!(checker.config.timeout, 1);
@@ -517,9 +595,7 @@ mod tests {
     #[tokio::test]
     async fn test_health_checker_start_stop() {
         let config = create_test_config();
-        let checker = HealthChecker::new(config, "127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
+        let checker = HealthChecker::new(config, "127.0.0.1:0".parse().unwrap());
 
         // Create a test server
         let server_config = HomeServerConfig {
@@ -544,5 +620,244 @@ mod tests {
 
         // Wait for task to finish
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    // --- The probe as an RFC 5997 client, against a verifying fake home server ---
+
+    use radius_proto::auth::calculate_response_authenticator;
+    use radius_proto::verify_message_authenticator;
+
+    const HOME_SECRET: &[u8] = b"home-secret";
+
+    fn home_server_at(addr: SocketAddr, secret: &[u8]) -> Arc<HomeServer> {
+        Arc::new(
+            HomeServer::new(HomeServerConfig {
+                address: addr.to_string(),
+                secret: String::from_utf8(secret.to_vec()).unwrap(),
+                timeout: 5,
+                max_outstanding: 10,
+                name: Some(format!("home-{}", addr.port())),
+            })
+            .unwrap(),
+        )
+    }
+
+    /// What a conformant home server does with a probe: decode, require a
+    /// non-zero Request Authenticator and a valid Message-Authenticator under
+    /// `secret` (RFC 5997 §4.1), and hand back the decoded request. Returns
+    /// `None` (no reply) when the probe fails those checks.
+    fn verify_probe(bytes: &[u8], secret: &[u8]) -> Option<Packet> {
+        let request = Packet::decode(bytes).ok()?;
+        if request.code != Code::StatusServer || request.authenticator == [0u8; 16] {
+            return None;
+        }
+        let mut offset = 20;
+        let mut ma_offset = None;
+        for attr in &request.attributes {
+            if attr.attr_type == AttributeType::MessageAuthenticator as u8 {
+                ma_offset = Some(offset + 2);
+                break;
+            }
+            offset += 2 + attr.value.len();
+        }
+        if !verify_message_authenticator(bytes, secret, ma_offset?) {
+            return None;
+        }
+        Some(request)
+    }
+
+    /// A signed reply to `request`: Response Authenticator under `secret`
+    /// (RFC 2865 §3) and a Message-Authenticator (RFC 5997 §4.1).
+    fn signed_reply(request: &Packet, code: Code, identifier: u8, secret: &[u8]) -> Vec<u8> {
+        let mut reply = Packet::new(code, identifier, request.authenticator);
+        reply.add_attribute(
+            Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]).unwrap(),
+        );
+        let mac = calculate_message_authenticator(&reply.encode().unwrap(), secret);
+        reply
+            .attributes
+            .iter_mut()
+            .find(|a| a.attr_type == AttributeType::MessageAuthenticator as u8)
+            .unwrap()
+            .value = mac.to_vec();
+        reply.authenticator =
+            calculate_response_authenticator(&reply, &request.authenticator, secret);
+        reply.encode().unwrap()
+    }
+
+    /// Fake home server: answers one probe with `respond(request)` (or nothing
+    /// when `respond` returns `None`), after `delay`.
+    fn spawn_fake_home(
+        delay: Duration,
+        respond: impl FnOnce(&Packet) -> Option<Vec<u8>> + Send + 'static,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let addr = sock.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let sock = UdpSocket::from_std(sock).unwrap();
+            let mut buf = vec![0u8; 4096];
+            let (len, from) = sock.recv_from(&mut buf).await.unwrap();
+            let Some(request) = verify_probe(&buf[..len], HOME_SECRET) else {
+                return; // RFC 5997 §4.1: silent discard
+            };
+            if let Some(reply) = respond(&request) {
+                tokio::time::sleep(delay).await;
+                sock.send_to(&reply, from).await.unwrap();
+            }
+        });
+        (addr, handle)
+    }
+
+    const PROBE_BIND: &str = "127.0.0.1:0";
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+    async fn probe(server: &Arc<HomeServer>) {
+        HealthChecker::check_server_health(
+            Arc::clone(server),
+            PROBE_BIND.parse().unwrap(),
+            PROBE_TIMEOUT,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn probe_is_accepted_by_a_verifying_home_server() {
+        let (addr, home) = spawn_fake_home(Duration::ZERO, |req| {
+            Some(signed_reply(
+                req,
+                Code::AccessAccept,
+                req.identifier,
+                HOME_SECRET,
+            ))
+        });
+        let server = home_server_at(addr, HOME_SECRET);
+        probe(&server).await;
+        home.await.unwrap();
+        assert_eq!(server.health_stats().consecutive_successes(), 1);
+        assert_eq!(server.health_stats().consecutive_failures(), 0);
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_accounting_response() {
+        let (addr, home) = spawn_fake_home(Duration::ZERO, |req| {
+            Some(signed_reply(
+                req,
+                Code::AccountingResponse,
+                req.identifier,
+                HOME_SECRET,
+            ))
+        });
+        let server = home_server_at(addr, HOME_SECRET);
+        probe(&server).await;
+        home.await.unwrap();
+        assert_eq!(
+            server.health_stats().consecutive_successes(),
+            1,
+            "RFC 5997 §4.2: Accounting-Response from an accounting port is alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_bad_response_authenticator() {
+        let (addr, home) = spawn_fake_home(Duration::ZERO, |req| {
+            Some(signed_reply(
+                req,
+                Code::AccessAccept,
+                req.identifier,
+                b"not-the-home-secret",
+            ))
+        });
+        let server = home_server_at(addr, HOME_SECRET);
+        probe(&server).await;
+        home.await.unwrap();
+        assert_eq!(server.health_stats().consecutive_failures(), 1);
+        assert_eq!(server.health_stats().consecutive_successes(), 0);
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_wrong_identifier_and_wrong_source() {
+        // Wrong Identifier, otherwise perfectly signed.
+        let (addr, home) = spawn_fake_home(Duration::ZERO, |req| {
+            Some(signed_reply(
+                req,
+                Code::AccessAccept,
+                req.identifier.wrapping_add(1),
+                HOME_SECRET,
+            ))
+        });
+        let server = home_server_at(addr, HOME_SECRET);
+        probe(&server).await;
+        home.await.unwrap();
+        assert_eq!(server.health_stats().consecutive_failures(), 1);
+
+        // Right reply, wrong source socket.
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let addr = sock.local_addr().unwrap();
+        let home = tokio::spawn(async move {
+            let sock = UdpSocket::from_std(sock).unwrap();
+            let mut buf = vec![0u8; 4096];
+            let (len, from) = sock.recv_from(&mut buf).await.unwrap();
+            let request = verify_probe(&buf[..len], HOME_SECRET).expect("probe is conformant");
+            let reply = signed_reply(
+                &request,
+                Code::AccessAccept,
+                request.identifier,
+                HOME_SECRET,
+            );
+            let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            other.send_to(&reply, from).await.unwrap();
+        });
+        let server = home_server_at(addr, HOME_SECRET);
+        probe(&server).await;
+        home.await.unwrap();
+        assert_eq!(server.health_stats().consecutive_failures(), 1);
+        assert_eq!(server.health_stats().consecutive_successes(), 0);
+    }
+
+    /// Two probes in flight at once each get their own reply. On the old
+    /// shared socket the fast server's reply reached whichever task was
+    /// waiting, and both probes failed.
+    #[tokio::test]
+    async fn concurrent_probes_do_not_cross() {
+        let (addr_a, home_a) = spawn_fake_home(Duration::from_millis(100), |req| {
+            Some(signed_reply(
+                req,
+                Code::AccessAccept,
+                req.identifier,
+                HOME_SECRET,
+            ))
+        });
+        let (addr_b, home_b) = spawn_fake_home(Duration::ZERO, |req| {
+            Some(signed_reply(
+                req,
+                Code::AccessAccept,
+                req.identifier,
+                HOME_SECRET,
+            ))
+        });
+        let server_a = home_server_at(addr_a, HOME_SECRET);
+        let server_b = home_server_at(addr_b, HOME_SECRET);
+        tokio::join!(probe(&server_a), probe(&server_b));
+        home_a.await.unwrap();
+        home_b.await.unwrap();
+        assert_eq!(server_a.health_stats().consecutive_successes(), 1);
+        assert_eq!(server_b.health_stats().consecutive_successes(), 1);
+    }
+
+    #[tokio::test]
+    async fn probe_times_out_without_reply() {
+        // A bound socket nobody reads from: the probe gets no datagram back.
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = home_server_at(silent.local_addr().unwrap(), HOME_SECRET);
+        HealthChecker::check_server_health(
+            Arc::clone(&server),
+            PROBE_BIND.parse().unwrap(),
+            Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(server.health_stats().consecutive_failures(), 1);
+        assert_eq!(server.health_stats().total_checks(), 1);
     }
 }

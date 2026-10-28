@@ -33,7 +33,7 @@ use tracing::{debug, info, warn};
 
 use crate::coa::{CoaJob, NasRegistry};
 use crate::config::RadSecConfig;
-use crate::server::{RadiusServer, ServerConfig};
+use crate::server::{PortRole, RadiusServer, ServerConfig};
 
 /// RFC 6614 §2.3: RadSec uses a fixed shared secret of the ASCII string
 /// `"radsec"` for the RADIUS Authenticator / Message-Authenticator computations.
@@ -285,7 +285,11 @@ async fn dispatch_inbound(
         return Ok(());
     }
 
-    match RadiusServer::process_request(frame, peer, RADSEC_SECRET, server_config).await {
+    // RFC 6614 §2.5: one TLS connection carries authentication, accounting and
+    // Status-Server alike, so every code is admitted here.
+    match RadiusServer::process_request(frame, peer, RADSEC_SECRET, PortRole::Any, server_config)
+        .await
+    {
         Ok(Some(response)) => {
             wr.write_all(&response).await?;
             wr.flush().await?;
@@ -532,13 +536,26 @@ mod tests {
             .unwrap()
     }
 
-    /// A 20-octet Status-Server request (RFC 5997): code 12, no attributes.
+    /// A Status-Server request (RFC 5997): code 12, random Request
+    /// Authenticator, and the Message-Authenticator §4.1 requires, keyed by
+    /// the fixed RadSec secret (RFC 6614 §2.3). The reply is a 20-octet
+    /// header plus an 18-octet Message-Authenticator.
     fn status_server_packet(id: u8) -> Vec<u8> {
-        let mut p = vec![0u8; RADIUS_HEADER_LEN];
-        p[0] = 12; // Status-Server
-        p[1] = id;
-        p[2..4].copy_from_slice(&(RADIUS_HEADER_LEN as u16).to_be_bytes());
-        p
+        use radius_proto::attributes::{Attribute, AttributeType};
+        use radius_proto::auth::generate_request_authenticator;
+        use radius_proto::{Code, Packet, calculate_message_authenticator};
+
+        let mut p = Packet::new(Code::StatusServer, id, generate_request_authenticator());
+        p.add_attribute(
+            Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]).unwrap(),
+        );
+        let mac = calculate_message_authenticator(&p.encode().unwrap(), RADSEC_SECRET);
+        p.attributes
+            .iter_mut()
+            .find(|a| a.attr_type == AttributeType::MessageAuthenticator as u8)
+            .unwrap()
+            .value = mac.to_vec();
+        p.encode().unwrap()
     }
 
     #[tokio::test]

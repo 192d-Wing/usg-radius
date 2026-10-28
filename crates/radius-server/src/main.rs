@@ -317,6 +317,7 @@ async fn main() {
         println!();
         println!("Configuration summary:");
         println!("  Listen: {}:{}", config.listen_address, config.listen_port);
+        println!("  Accounting: {}", config.accounting_port);
         println!("  Clients: {}", config.clients.len());
         println!("  Users: {}", config.users.len());
         println!(

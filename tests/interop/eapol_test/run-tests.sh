@@ -231,6 +231,33 @@ check "EAP-Failure received (rejected, not timed out)" grep -q 'EAP: Status noti
 check "no key material was emitted" sh -c "! grep -q 'MS-MPPE-' '$LOG'"
 
 # ---------------------------------------------------------------------------
+section "14. Status-Server (RFC 5997) and the accounting port (RFC 2866)"
+# radclient signs the Status-Server with the secret and verifies both the
+# Response Authenticator and the reply's Message-Authenticator before it prints
+# "Received ...", so the positive checks also cover the reply's authenticators.
+ss() { printf 'Message-Authenticator = 0x00\n' | radclient -x -t 3 -r 1 "$1" status "$2"; }
+LOG=$LOGDIR/status-server-proxy.log;      ss "$PROXY:1812"    "$NAS_PROXY_SECRET"   >"$LOG" 2>&1
+check "Status-Server to the proxy (1812): Access-Accept, answered by the proxy itself (RFC 5997 4.2, 4.3)" grep -q 'Received Access-Accept' "$LOG"
+LOG=$LOGDIR/status-server-home-auth.log;  ss "$USG_HOME:1812" "$NAS_USGHOME_SECRET" >"$LOG" 2>&1
+check "Status-Server to usg-home 1812: Access-Accept with a Message-Authenticator radclient verified" grep -q 'Received Access-Accept' "$LOG"
+LOG=$LOGDIR/status-server-home-acct.log;  ss "$USG_HOME:1813" "$NAS_USGHOME_SECRET" >"$LOG" 2>&1
+check "Status-Server to usg-home 1813: Accounting-Response (RFC 5997 4.2)" grep -q 'Received Accounting-Response' "$LOG"
+LOG=$LOGDIR/acct-start-home-1813.log
+printf 'Acct-Status-Type = Start\nAcct-Session-Id = "interop-acct-0001"\nUser-Name = "teapuser@usg.test"\nNAS-Identifier = "interop-nas"\n' |
+    radclient -x -t 3 -r 1 "$USG_HOME:1813" acct "$NAS_USGHOME_SECRET" >"$LOG" 2>&1
+check "Accounting-Request Start to usg-home 1813: Accounting-Response (RFC 2866)" grep -q 'Received Accounting-Response' "$LOG"
+LOG=$LOGDIR/status-server-wrong-secret.log; ss "$USG_HOME:1812" "not-the-secret" >"$LOG" 2>&1
+check "Status-Server with the wrong secret: silently discarded (RFC 5997 4.1)" grep -q 'No reply' "$LOG"
+LOG=$LOGDIR/access-request-on-1813.log
+printf 'User-Name = "teapuser@usg.test"\nUser-Password = "teap-password-456"\nNAS-Identifier = "interop-nas"\nMessage-Authenticator = 0x00\n' |
+    radclient -x -t 2 -r 1 "$USG_HOME:1813" auth "$NAS_USGHOME_SECRET" >"$LOG" 2>&1
+check "Access-Request to the accounting port: silently discarded (RFC 2866 2)" grep -q 'No reply' "$LOG"
+LOG=$LOGDIR/acct-start-on-1812.log
+printf 'Acct-Status-Type = Start\nAcct-Session-Id = "interop-acct-0002"\nUser-Name = "teapuser@usg.test"\nNAS-Identifier = "interop-nas"\n' |
+    radclient -x -t 2 -r 1 "$USG_HOME:1812" acct "$NAS_USGHOME_SECRET" >"$LOG" 2>&1
+check "Accounting-Request to the authentication port with a dedicated accounting socket: silently discarded" grep -q 'No reply' "$LOG"
+
+# ---------------------------------------------------------------------------
 section "result"
 if [ "$failures" -eq 0 ]; then
     echo "ALL CHECKS PASSED"

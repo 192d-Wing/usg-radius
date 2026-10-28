@@ -82,7 +82,7 @@ image build (default 2).
 
 ## What is checked
 
-Fifty-seven assertions across thirteen scenarios. All pass on the current tree
+Sixty-four assertions across fourteen scenarios. All pass on the current tree
 (run `tests/interop/run.sh`).
 
 ### 1 & 2 — EAP-TLS through the proxy to FreeRADIUS
@@ -244,6 +244,34 @@ Basic-Password-Auth-Resp with Result (Failure) inside the tunnel
 own Result (Failure), and the server sends Access-Reject + EAP-Failure
 (`completion (param=failure)`): non-zero exit, `FAILURE`, no `MS-MPPE-*` in the
 reject.
+
+### 14 — Status-Server (RFC 5997) and the accounting port (RFC 2866)
+
+radclient (FreeRADIUS's client) is the independent implementation here: it
+signs each Status-Server with a Message-Authenticator under the hop secret and
+verifies the reply's Response Authenticator and Message-Authenticator before it
+prints `Received ...`. Seven checks:
+
+- Status-Server to the proxy on 1812 → `Received Access-Accept`: the proxy
+  answers for itself and does not forward (RFC 5997 §4.2, §4.3).
+- Status-Server to usg-home on 1812 → `Received Access-Accept`, with the reply
+  Message-Authenticator radclient verified (§4.1).
+- Status-Server to usg-home on 1813 → `Received Accounting-Response` (§4.2).
+- Accounting-Request (Start) to usg-home on 1813 → `Received
+  Accounting-Response` from the dedicated accounting socket (RFC 2866 §2).
+- Status-Server signed with the wrong secret → `No reply`: silent discard
+  (§4.1).
+- Access-Request to the accounting port → `No reply` (RFC 2866 §2).
+- Accounting-Request to the authentication port → `No reply`: with a dedicated
+  accounting socket (`accounting_port: 1813`, as both interop configs set),
+  Code 4 on 1812 is discarded; `"accounting_port": "shared"` restores the old
+  single-socket behaviour.
+
+Not covered here: the proxy's own health probes against a verifying home
+server. The only observable is a debug line in the proxy's log, which the `nas`
+container cannot see; the unit tests in `crates/radius-server/src/proxy/health.rs`
+run the probe against a fake home server that performs the same
+HMAC-MD5-over-zeroed-MA check FreeRADIUS does.
 
 ### Server fixes this test drove out
 

@@ -2,7 +2,7 @@ use crate::accounting::AccountingHandler;
 use crate::audit::{AuditEntry, AuditEventType, AuditLogger};
 use crate::buffer_pool::BufferPool;
 use crate::cache::{RequestCache, RequestFingerprint};
-use crate::config::Config;
+use crate::config::{AccountingPort, AccountingPortMode, Config};
 use crate::proxy::ProxyConfig;
 use crate::proxy::handler::ProxyHandler;
 use crate::proxy::pool::HomeServerPool;
@@ -43,28 +43,102 @@ fn copy_proxy_state(request: &Packet, response: &mut Packet) {
     }
 }
 
-/// RFC 3579 §3.2: every Access-Accept / Access-Challenge / Access-Reject that
-/// carries an EAP-Message attribute MUST also include a valid
-/// Message-Authenticator. Computed per RFC 2869 §5.14: HMAC-MD5 over the full
-/// packet bytes with the Authenticator field set to the *request* Authenticator
-/// and the Message-Authenticator attribute value set to all zeros.
+/// Which listener a request arrived on. Decides which codes are admitted
+/// (RFC 2866 §2) and which code answers Status-Server (RFC 5997 §4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PortRole {
+    /// UDP authentication socket (`listen_port`).
+    Auth,
+    /// UDP accounting socket (`accounting_port`).
+    Accounting,
+    /// RadSec connection: every code on one stream (RFC 6614 §2.5).
+    Any,
+}
+
+impl PortRole {
+    /// Whether a packet with `code` belongs on this listener.
+    /// `accounting_on_auth` is
+    /// `AccountingPort::accepts_accounting_on_auth_socket()` — true only in
+    /// the legacy single-socket (`"shared"`) mode.
+    fn admits(self, code: Code, accounting_on_auth: bool) -> bool {
+        match (self, code) {
+            (PortRole::Any, _) => true,
+            // RFC 2866 §2: accounting has its own port; Code 4 on the
+            // authentication socket is a misconfigured NAS unless "shared".
+            (PortRole::Auth, Code::AccountingRequest) => accounting_on_auth,
+            // RFC 2866 §2: nothing but accounting (and Status-Server, RFC 5997
+            // §2) belongs on the accounting port.
+            (PortRole::Accounting, Code::AccessRequest) => false,
+            // Status-Server is accepted everywhere; other codes fall through
+            // to the existing "Unsupported" dispatch arm.
+            _ => true,
+        }
+    }
+
+    /// RFC 5997 §4.2: Status-Server is answered with Access-Accept on the
+    /// authentication port and Accounting-Response on the accounting port.
+    fn status_server_reply_code(self) -> Code {
+        match self {
+            PortRole::Accounting => Code::AccountingResponse,
+            PortRole::Auth | PortRole::Any => Code::AccessAccept,
+        }
+    }
+}
+
+/// Outcome of checking a request's Message-Authenticator against a secret.
+enum MessageAuthenticatorCheck {
+    /// The request carries no Message-Authenticator attribute.
+    Absent,
+    /// Present and verified under the secret.
+    Valid,
+    /// Present but the HMAC-MD5 does not match (or the value is malformed).
+    Invalid,
+}
+
+/// RFC 2869 §5.14: re-encode `request`, locate the first Message-Authenticator
+/// value (header 20 octets + 2 per attribute header + preceding values) and
+/// verify it with the shared secret. The offset walk uses the decoded
+/// attributes and the canonical re-encoding, so the two always agree.
+fn check_message_authenticator(
+    request: &Packet,
+    secret: &[u8],
+) -> Result<MessageAuthenticatorCheck, PacketError> {
+    // Packet structure: Code (1) + ID (1) + Length (2) + Authenticator (16) + Attributes
+    let mut offset = 20;
+    let mut msg_auth_offset = None;
+    for attr in &request.attributes {
+        if attr.attr_type == AttributeType::MessageAuthenticator as u8 {
+            // Attribute structure: Type (1) + Length (1) + Value
+            msg_auth_offset = Some(offset + 2);
+            break;
+        }
+        offset += 2 + attr.value.len();
+    }
+    let Some(offset) = msg_auth_offset else {
+        return Ok(MessageAuthenticatorCheck::Absent);
+    };
+    let packet_bytes = request.encode()?;
+    if verify_message_authenticator(&packet_bytes, secret, offset) {
+        Ok(MessageAuthenticatorCheck::Valid)
+    } else {
+        Ok(MessageAuthenticatorCheck::Invalid)
+    }
+}
+
+/// Sign `response` with a Message-Authenticator. Computed per RFC 2869 §5.14:
+/// HMAC-MD5 over the full packet bytes with the Authenticator field set to the
+/// *request* Authenticator and the Message-Authenticator attribute value set to
+/// all zeros.
 ///
-/// This function appends a zeroed Message-Authenticator attribute (if EAP-Message
-/// is present and no MA already exists), computes the HMAC, and patches the value
-/// in place. Must be called BEFORE calculate_response_authenticator so that
-/// Response-Authenticator covers the final MA bytes.
-fn add_message_authenticator_if_eap(
+/// Appends a zeroed Message-Authenticator attribute if none exists, computes
+/// the HMAC, and patches the value in place. Must be called BEFORE
+/// calculate_response_authenticator so that Response-Authenticator covers the
+/// final MA bytes.
+fn add_message_authenticator(
     response: &mut Packet,
     request_authenticator: &[u8; 16],
     secret: &[u8],
 ) -> Result<(), PacketError> {
-    let has_eap = response
-        .attributes
-        .iter()
-        .any(|a| a.attr_type == AttributeType::EapMessage as u8);
-    if !has_eap {
-        return Ok(());
-    }
     let already_has_ma = response
         .attributes
         .iter()
@@ -96,6 +170,25 @@ fn add_message_authenticator_if_eap(
         ma_attr.value = mac.to_vec();
     }
     Ok(())
+}
+
+/// RFC 3579 §3.2: every Access-Accept / Access-Challenge / Access-Reject that
+/// carries an EAP-Message attribute MUST also include a valid
+/// Message-Authenticator. Gate around [`add_message_authenticator`]: a reply
+/// without EAP-Message is left unchanged.
+fn add_message_authenticator_if_eap(
+    response: &mut Packet,
+    request_authenticator: &[u8; 16],
+    secret: &[u8],
+) -> Result<(), PacketError> {
+    let has_eap = response
+        .attributes
+        .iter()
+        .any(|a| a.attr_type == AttributeType::EapMessage as u8);
+    if !has_eap {
+        return Ok(());
+    }
+    add_message_authenticator(response, request_authenticator, secret)
 }
 
 /// RADIUS attribute numbers that may appear at most once in a reply. When a policy
@@ -349,6 +442,10 @@ impl AuthHandler for SimpleAuthHandler {
 pub struct ServerConfig {
     /// Bind address for the server
     pub bind_addr: SocketAddr,
+    /// Where Accounting-Request is accepted over UDP (RFC 2866 §2): a dedicated
+    /// socket on `bind_addr.ip():<port>`, the authentication socket
+    /// (`"shared"`), or nowhere (`"disabled"`).
+    pub accounting_port: AccountingPort,
     /// Shared secret for authenticating clients (used if no client config provided)
     pub secret: Vec<u8>,
     /// Authentication handler
@@ -399,6 +496,9 @@ impl ServerConfig {
 
         ServerConfig {
             bind_addr,
+            // The library constructor keeps its single-socket contract:
+            // Accounting-Request is accepted on the one bound socket.
+            accounting_port: AccountingPort::Named(AccountingPortMode::Shared),
             secret: secret.into(),
             auth_handler,
             accounting_handler: None,
@@ -480,6 +580,7 @@ impl ServerConfig {
 
         Ok(ServerConfig {
             bind_addr,
+            accounting_port: config.accounting_port,
             secret,
             auth_handler,
             accounting_handler: None,
@@ -524,7 +625,11 @@ impl ServerConfig {
 /// RADIUS Server
 pub struct RadiusServer {
     config: Arc<ServerConfig>,
+    /// UDP authentication socket (`listen_port`).
     socket: Arc<UdpSocket>,
+    /// Dedicated UDP accounting socket (RFC 2866 §2), when `accounting_port`
+    /// names one.
+    accounting_socket: Option<Arc<UdpSocket>>,
     /// Home servers for health checking (if proxy is enabled)
     home_servers: Vec<Arc<crate::proxy::home_server::HomeServer>>,
     /// Home server pools (if proxy is enabled)
@@ -537,6 +642,21 @@ impl RadiusServer {
         let socket = UdpSocket::bind(config.bind_addr).await?;
         let socket = Arc::new(socket);
         info!("RADIUS server listening on {}", config.bind_addr);
+
+        // RFC 2866 §2: accounting has its own UDP port. Same IP as the
+        // authentication socket, so dual-stack (`::`) and the v4-mapped source
+        // canonicalisation in `handle_request` apply to both. A bind failure
+        // (including a port clash with the auth socket in a non-validated
+        // config) is fatal: the server does not start half-listening.
+        let accounting_socket = match config.accounting_port.dedicated() {
+            Some(port) => {
+                let acct_addr = SocketAddr::new(config.bind_addr.ip(), port);
+                let acct = UdpSocket::bind(acct_addr).await?;
+                info!("RADIUS accounting listening on {}", acct_addr);
+                Some(Arc::new(acct))
+            }
+            None => None,
+        };
 
         let mut home_servers = Vec::new();
         let mut pools = Vec::new();
@@ -565,6 +685,7 @@ impl RadiusServer {
         Ok(RadiusServer {
             config: Arc::new(config),
             socket,
+            accounting_socket,
             home_servers,
             pools,
         })
@@ -677,21 +798,15 @@ impl RadiusServer {
         // Create health checker if enabled
         let health_checker = if proxy_config.health_check.enabled {
             if !all_servers.is_empty() {
-                // Bind a separate socket for health checks on an ephemeral port
+                // Each probe binds its own socket on an ephemeral port of this
+                // address family (see `HealthChecker::check_server_health`).
                 let health_bind_addr = match socket.local_addr()? {
                     std::net::SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
                     std::net::SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
                 };
 
                 let checker =
-                    HealthChecker::new(proxy_config.health_check.clone(), health_bind_addr)
-                        .await
-                        .map_err(|e| {
-                            ServerError::Io(std::io::Error::other(format!(
-                                "Failed to create health checker: {}",
-                                e
-                            )))
-                        })?;
+                    HealthChecker::new(proxy_config.health_check.clone(), health_bind_addr);
 
                 info!(
                     server_count = all_servers.len(),
@@ -723,6 +838,15 @@ impl RadiusServer {
     /// This is useful for testing when binding to port 0 (OS-assigned port)
     pub fn local_addr(&self) -> Result<std::net::SocketAddr, ServerError> {
         self.socket.local_addr().map_err(ServerError::from)
+    }
+
+    /// Get the local address of the dedicated accounting socket, or `None`
+    /// when `accounting_port` is `"shared"` or `"disabled"`.
+    pub fn accounting_local_addr(&self) -> Result<Option<std::net::SocketAddr>, ServerError> {
+        self.accounting_socket
+            .as_ref()
+            .map(|s| s.local_addr().map_err(ServerError::from))
+            .transpose()
     }
 
     /// Get proxy statistics snapshot
@@ -775,12 +899,42 @@ impl RadiusServer {
             None
         };
 
+        // Serve the authentication socket and, when bound, the accounting
+        // socket (RFC 2866 §2) from this one task: each future only receives
+        // and spawns, and the first socket error ends `run` as before.
+        let auth = Self::serve_socket(
+            Arc::clone(&self.socket),
+            PortRole::Auth,
+            Arc::clone(&self.config),
+        );
+        match &self.accounting_socket {
+            Some(acct) => {
+                let acct = Self::serve_socket(
+                    Arc::clone(acct),
+                    PortRole::Accounting,
+                    Arc::clone(&self.config),
+                );
+                tokio::try_join!(auth, acct)?;
+            }
+            None => auth.await?,
+        }
+        Ok(())
+    }
+
+    /// Receive loop for one UDP listener: every datagram is handed to
+    /// `handle_request` with the socket it arrived on (so the reply leaves from
+    /// the same port) and that socket's `role`.
+    async fn serve_socket(
+        socket: Arc<UdpSocket>,
+        role: PortRole,
+        config: Arc<ServerConfig>,
+    ) -> Result<(), ServerError> {
         loop {
             // Acquire a buffer from the pool
-            let mut pooled_buf = self.config.buffer_pool.acquire().await;
+            let mut pooled_buf = config.buffer_pool.acquire().await;
 
             // Receive packet into pooled buffer
-            let (len, addr) = self.socket.recv_from(pooled_buf.as_mut()).await?;
+            let (len, addr) = socket.recv_from(pooled_buf.as_mut()).await?;
 
             // Copy the received data (only the received bytes, not the full buffer)
             let data = pooled_buf.as_ref()[..len].to_vec();
@@ -788,11 +942,11 @@ impl RadiusServer {
             // Buffer is automatically returned to pool when pooled_buf is dropped
 
             // Spawn a task to handle this request
-            let config = Arc::clone(&self.config);
-            let socket = Arc::clone(&self.socket);
+            let config = Arc::clone(&config);
+            let socket = Arc::clone(&socket);
 
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_request(data, addr, config, socket).await {
+                if let Err(e) = Self::handle_request(data, addr, role, config, socket).await {
                     debug!("Error handling request from {}: {}", addr, e);
                 }
             });
@@ -841,10 +995,11 @@ impl RadiusServer {
         }
     }
 
-    /// Handle a single RADIUS request
+    /// Handle a single RADIUS request received on `socket`, which plays `role`.
     async fn handle_request(
         data: Vec<u8>,
         addr: SocketAddr,
+        role: PortRole,
         config: Arc<ServerConfig>,
         socket: Arc<UdpSocket>,
     ) -> Result<(), ServerError> {
@@ -905,7 +1060,9 @@ impl RadiusServer {
         // UDP. RadSec calls `process_request` directly with the fixed "radsec"
         // secret and writes the response over its TLS stream.
         let secret = config.get_secret_for_client(addr.ip()).to_vec();
-        if let Some(response_data) = Self::process_request(&data, addr, &secret, &config).await? {
+        if let Some(response_data) =
+            Self::process_request(&data, addr, &secret, role, &config).await?
+        {
             socket.send_to(&response_data, addr).await?;
         }
 
@@ -920,11 +1077,15 @@ impl RadiusServer {
     /// computation — the per-client secret for UDP, or the fixed `"radsec"` for
     /// RadSec (RFC 6614 §2.3). `source` is the peer address, used for policy
     /// conditions (NAS-IP), logging, replay fingerprinting, and as the
-    /// destination of a proxied response.
+    /// destination of a proxied response. `role` is the listener the packet
+    /// arrived on: it gates which codes are admitted (RFC 2866 §2) and which
+    /// code answers Status-Server (RFC 5997 §4.2); RadSec passes
+    /// `PortRole::Any` (RFC 6614 §2.5).
     pub(crate) async fn process_request(
         data: &[u8],
         source: SocketAddr,
         secret: &[u8],
+        role: PortRole,
         config: &Arc<ServerConfig>,
     ) -> Result<Option<Vec<u8>>, ServerError> {
         let source_ip = source.ip();
@@ -951,6 +1112,23 @@ impl RadiusServer {
                 "Rejected malformed packet"
             );
             return Err(ServerError::Validation(e.to_string()));
+        }
+
+        // RFC 2866 §2: a code that does not belong on this listener is
+        // discarded silently, before the duplicate cache so the discard path
+        // leaves no state behind.
+        if !role.admits(
+            request.code,
+            config.accounting_port.accepts_accounting_on_auth_socket(),
+        ) {
+            warn!(
+                client_ip = %source_ip,
+                request_id = request.identifier,
+                packet_type = ?request.code,
+                port_role = ?role,
+                "Discarded packet: code not accepted on this port (RFC 2866 §2)"
+            );
+            return Ok(None);
         }
 
         // Check for duplicate request (replay attack prevention)
@@ -994,7 +1172,13 @@ impl RadiusServer {
             Code::AccountingRequest => {
                 Self::handle_accounting_request(&request, config, source_ip, secret).await?
             }
-            Code::StatusServer => Self::handle_status_server(&request, source_ip, secret)?,
+            Code::StatusServer => {
+                match Self::handle_status_server(&request, source_ip, secret, role)? {
+                    Some(response) => response,
+                    // RFC 5997 §4.1: silent discard, nothing on the wire.
+                    None => return Ok(None),
+                }
+            }
             _ => {
                 warn!(packet_type = ?request.code, "Unsupported packet type");
                 return Ok(None);
@@ -1168,57 +1352,39 @@ impl RadiusServer {
         // Message-Authenticator. Verify it whenever present, and reject an
         // EAP-bearing request that omits it — otherwise an attacker could strip
         // the attribute to defeat the integrity check.
-        if request
-            .find_attribute(AttributeType::MessageAuthenticator as u8)
-            .is_some()
-        {
-            // Encode the packet to get raw bytes for verification
-            let packet_bytes = request.encode()?;
-
-            // Find the offset of the Message-Authenticator value in the encoded packet
-            // Packet structure: Code (1) + ID (1) + Length (2) + Authenticator (16) + Attributes
-            let mut offset = 20; // Start after header (code + id + length + authenticator)
-
-            let mut msg_auth_offset = None;
-            for attr in &request.attributes {
-                if attr.attr_type == AttributeType::MessageAuthenticator as u8 {
-                    // Attribute structure: Type (1) + Length (1) + Value
-                    msg_auth_offset = Some(offset + 2); // Skip type and length bytes
-                    break;
-                }
-                // Move to next attribute: Type (1) + Length (1) + Value
-                offset += 2 + attr.value.len();
-            }
-
-            if let Some(offset) = msg_auth_offset {
-                if !verify_message_authenticator(&packet_bytes, secret, offset) {
-                    warn!(
-                        client_ip = %source_ip,
-                        request_id = request.identifier,
-                        "Invalid Message-Authenticator"
-                    );
-                    return Err(ServerError::Validation(
-                        "Invalid Message-Authenticator".to_string(),
-                    ));
-                }
+        match check_message_authenticator(request, secret)? {
+            MessageAuthenticatorCheck::Valid => {
                 debug!(
                     client_ip = %source_ip,
                     request_id = request.identifier,
                     "Message-Authenticator validated successfully"
                 );
             }
-        } else if request
-            .find_attribute(AttributeType::EapMessage as u8)
-            .is_some()
-        {
-            warn!(
-                client_ip = %source_ip,
-                request_id = request.identifier,
-                "Rejected EAP Access-Request without required Message-Authenticator (RFC 3579 / Blast-RADIUS)"
-            );
-            return Err(ServerError::Validation(
-                "EAP Access-Request missing required Message-Authenticator".to_string(),
-            ));
+            MessageAuthenticatorCheck::Invalid => {
+                warn!(
+                    client_ip = %source_ip,
+                    request_id = request.identifier,
+                    "Invalid Message-Authenticator"
+                );
+                return Err(ServerError::Validation(
+                    "Invalid Message-Authenticator".to_string(),
+                ));
+            }
+            MessageAuthenticatorCheck::Absent => {
+                if request
+                    .find_attribute(AttributeType::EapMessage as u8)
+                    .is_some()
+                {
+                    warn!(
+                        client_ip = %source_ip,
+                        request_id = request.identifier,
+                        "Rejected EAP Access-Request without required Message-Authenticator (RFC 3579 / Blast-RADIUS)"
+                    );
+                    return Err(ServerError::Validation(
+                        "EAP Access-Request missing required Message-Authenticator".to_string(),
+                    ));
+                }
+            }
         }
 
         // Audit log authentication attempt
@@ -1777,29 +1943,71 @@ impl RadiusServer {
         Ok(response)
     }
 
-    /// Handle Status-Server packet (RFC 5997)
+    /// Handle Status-Server packet (RFC 5997).
+    ///
+    /// Returns `Ok(None)` when the request must be silently discarded
+    /// (RFC 5997 §4.1: Message-Authenticator absent or invalid), otherwise the
+    /// reply the role calls for (§4.2): Access-Accept on the authentication
+    /// port and over RadSec, Accounting-Response on the accounting port. The
+    /// proxy answers for itself and never forwards (§4.3) because this runs
+    /// before any routing.
     fn handle_status_server(
         request: &Packet,
         source_ip: std::net::IpAddr,
         secret: &[u8],
-    ) -> Result<Packet, ServerError> {
+        role: PortRole,
+    ) -> Result<Option<Packet>, ServerError> {
         debug!(
             client_ip = %source_ip,
             request_id = request.identifier,
+            port_role = ?role,
             "Status-Server request received"
         );
 
-        // `secret` is provided by the caller (per-client for UDP, "radsec" for RadSec).
+        // RFC 5997 §4.1: the request MUST contain a Message-Authenticator, the
+        // server MUST validate it, and a packet failing the check MUST be
+        // silently discarded. `secret` is the hop's secret (per-client for
+        // UDP, "radsec" for RadSec).
+        match check_message_authenticator(request, secret)? {
+            MessageAuthenticatorCheck::Valid => {}
+            MessageAuthenticatorCheck::Absent => {
+                warn!(
+                    client_ip = %source_ip,
+                    request_id = request.identifier,
+                    "Discarded Status-Server without Message-Authenticator (RFC 5997 §4.1)"
+                );
+                return Ok(None);
+            }
+            MessageAuthenticatorCheck::Invalid => {
+                warn!(
+                    client_ip = %source_ip,
+                    request_id = request.identifier,
+                    "Discarded Status-Server with invalid Message-Authenticator (RFC 5997 §4.1)"
+                );
+                return Ok(None);
+            }
+        }
 
-        // Respond with Access-Accept to indicate server is alive
-        let mut response = Packet::new(Code::AccessAccept, request.identifier, [0u8; 16]);
+        // RFC 5997 §4.2: the reply code follows the port the request came in on.
+        let mut response = Packet::new(
+            role.status_server_reply_code(),
+            request.identifier,
+            [0u8; 16],
+        );
 
-        // Calculate and set Response Authenticator using client-specific secret
-        let response_auth =
+        // RFC 5997 §4.1 / RFC 2865 §5.33: Proxy-State is echoed unmodified.
+        copy_proxy_state(request, &mut response);
+
+        // RFC 5997 §4.1: the reply MUST contain a Message-Authenticator. Added
+        // before the Response Authenticator so the latter covers the MA bytes.
+        add_message_authenticator(&mut response, &request.authenticator, secret)?;
+
+        // RFC 2865 §3 / RFC 2866 §3: Response Authenticator over the final
+        // attribute bytes, keyed by the hop secret.
+        response.authenticator =
             calculate_response_authenticator(&response, &request.authenticator, secret);
-        response.authenticator = response_auth;
 
-        Ok(response)
+        Ok(Some(response))
     }
 }
 
@@ -1820,6 +2028,9 @@ mod tests {
         Config {
             listen_address: "127.0.0.1".to_string(),
             listen_port,
+            // No second socket: both proxy tests would otherwise race for
+            // 127.0.0.1:1813.
+            accounting_port: AccountingPort::Named(AccountingPortMode::Disabled),
             clients: vec![crate::config::Client {
                 address: "127.0.0.1/32".to_string(),
                 secret: "nas-secret".to_string(),
@@ -2037,7 +2248,14 @@ mod tests {
 
     async fn process(data: &[u8]) -> Result<Option<Vec<u8>>, ServerError> {
         let cfg = msgauth_test_config();
-        RadiusServer::process_request(data, "10.0.0.1:1812".parse().unwrap(), b"s3cret", &cfg).await
+        RadiusServer::process_request(
+            data,
+            "10.0.0.1:1812".parse().unwrap(),
+            b"s3cret",
+            PortRole::Auth,
+            &cfg,
+        )
+        .await
     }
 
     fn eap_identity_attr() -> Attribute {
@@ -2102,11 +2320,16 @@ mod tests {
             &secret,
         );
         let cfg = msgauth_test_config();
-        let reply =
-            RadiusServer::process_request(&data, "10.0.0.1:1812".parse().unwrap(), &secret, &cfg)
-                .await
-                .expect("reject is a normal reply")
-                .expect("a reply is sent");
+        let reply = RadiusServer::process_request(
+            &data,
+            "10.0.0.1:1812".parse().unwrap(),
+            &secret,
+            PortRole::Auth,
+            &cfg,
+        )
+        .await
+        .expect("reject is a normal reply")
+        .expect("a reply is sent");
         let reply = Packet::decode(&reply).unwrap();
         assert_eq!(reply.code, Code::AccessReject);
         let eap = reply
@@ -2157,5 +2380,475 @@ mod tests {
                 "non-EAP request wrongly rejected for Message-Authenticator: {m}"
             );
         }
+    }
+
+    // --- Status-Server (RFC 5997) and per-port admission (RFC 2866 §2) ---
+
+    use crate::accounting::SimpleAccountingHandler;
+    use radius_proto::auth::{
+        calculate_accounting_request_authenticator, generate_request_authenticator,
+        verify_response_authenticator,
+    };
+
+    /// A pipeline config with the given `accounting_port` and an accounting
+    /// handler, so Accounting-Request reaches the handler.
+    fn pipeline_config(accounting_port: AccountingPort) -> Arc<ServerConfig> {
+        let config = Config {
+            strict_rfc_compliance: false,
+            accounting_port,
+            ..Config::default()
+        };
+        let handler = Arc::new(SimpleAuthHandler::new());
+        Arc::new(
+            ServerConfig::from_config(config, handler)
+                .unwrap()
+                .with_accounting_handler(Arc::new(SimpleAccountingHandler::new())),
+        )
+    }
+
+    const NAS: &str = "10.0.0.1:1812";
+
+    /// Encode a Status-Server with a random Request Authenticator and a valid
+    /// Message-Authenticator under `secret`; returns the bytes and the Request
+    /// Authenticator the reply must be verified against.
+    fn signed_status_server_bytes(
+        id: u8,
+        secret: &[u8],
+        extra_attrs: Vec<Attribute>,
+    ) -> (Vec<u8>, [u8; 16]) {
+        let request_auth = generate_request_authenticator();
+        let mut p = Packet::new(Code::StatusServer, id, request_auth);
+        for a in extra_attrs {
+            p.add_attribute(a);
+        }
+        p.add_attribute(
+            Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]).unwrap(),
+        );
+        let mut bytes = p.encode().unwrap();
+        let ma = calculate_message_authenticator(&bytes, secret);
+        let needle = [
+            &[AttributeType::MessageAuthenticator as u8, 18][..],
+            &[0u8; 16],
+        ]
+        .concat();
+        let pos = bytes
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())
+            .expect("zeroed Message-Authenticator present");
+        bytes[pos + 2..pos + 18].copy_from_slice(&ma);
+        (bytes, request_auth)
+    }
+
+    /// The `handler.rs::message_authenticator_valid` check: zero the MA, set
+    /// Authenticator := request authenticator, recompute, compare.
+    fn reply_message_authenticator_valid(
+        reply: &Packet,
+        request_auth: &[u8; 16],
+        secret: &[u8],
+    ) -> bool {
+        let Some(received) = reply
+            .find_attribute(AttributeType::MessageAuthenticator as u8)
+            .map(|a| a.value.clone())
+        else {
+            return false;
+        };
+        let mut zeroed = reply.clone();
+        zeroed.authenticator = *request_auth;
+        for ma in zeroed
+            .attributes
+            .iter_mut()
+            .filter(|a| a.attr_type == AttributeType::MessageAuthenticator as u8)
+        {
+            ma.value = vec![0u8; 16];
+        }
+        calculate_message_authenticator(&zeroed.encode().unwrap(), secret).to_vec() == received
+    }
+
+    /// Decode a Status-Server reply and check everything RFC 5997 §4.1/§4.2
+    /// require of it: code, Identifier, Response Authenticator,
+    /// Message-Authenticator, and no State / EAP-Message.
+    fn assert_status_reply(
+        bytes: &[u8],
+        expected_code: Code,
+        id: u8,
+        request_auth: &[u8; 16],
+        secret: &[u8],
+    ) -> Packet {
+        let reply = Packet::decode(bytes).unwrap();
+        assert_eq!(reply.code, expected_code);
+        assert_eq!(reply.identifier, id);
+        assert!(
+            verify_response_authenticator(&reply, request_auth, secret),
+            "Response Authenticator must verify under the hop secret"
+        );
+        assert!(
+            reply_message_authenticator_valid(&reply, request_auth, secret),
+            "reply MUST carry a valid Message-Authenticator (RFC 5997 §4.1)"
+        );
+        assert!(reply.find_attribute(AttributeType::State as u8).is_none());
+        assert!(
+            reply
+                .find_attribute(AttributeType::EapMessage as u8)
+                .is_none()
+        );
+        reply
+    }
+
+    /// An Accounting-Request Start with its RFC 2866 §3 Request Authenticator.
+    fn accounting_start_bytes(id: u8, secret: &[u8]) -> (Vec<u8>, [u8; 16]) {
+        let mut p = Packet::new(Code::AccountingRequest, id, [0u8; 16]);
+        p.add_attribute(
+            Attribute::new(
+                AttributeType::AcctStatusType as u8,
+                (AcctStatusType::Start as u32).to_be_bytes().to_vec(),
+            )
+            .unwrap(),
+        );
+        p.add_attribute(
+            Attribute::string(AttributeType::AcctSessionId as u8, "sess-0001").unwrap(),
+        );
+        p.add_attribute(Attribute::string(AttributeType::UserName as u8, "alice").unwrap());
+        p.add_attribute(Attribute::string(AttributeType::NasIdentifier as u8, "test-nas").unwrap());
+        let request_auth = calculate_accounting_request_authenticator(&p, secret);
+        p.authenticator = request_auth;
+        (p.encode().unwrap(), request_auth)
+    }
+
+    async fn process_as(
+        data: &[u8],
+        secret: &[u8],
+        role: PortRole,
+        cfg: &Arc<ServerConfig>,
+    ) -> Result<Option<Vec<u8>>, ServerError> {
+        RadiusServer::process_request(data, NAS.parse().unwrap(), secret, role, cfg).await
+    }
+
+    fn random_secret() -> Vec<u8> {
+        use rand::RngExt;
+        rand::rng().random::<[u8; 16]>().to_vec()
+    }
+
+    #[tokio::test]
+    async fn status_server_without_message_authenticator_is_discarded() {
+        let secret = random_secret();
+        let cfg = pipeline_config(AccountingPort::default());
+        let p = Packet::new(Code::StatusServer, 7, generate_request_authenticator());
+        let out = process_as(&p.encode().unwrap(), &secret, PortRole::Auth, &cfg)
+            .await
+            .unwrap();
+        assert!(out.is_none(), "RFC 5997 §4.1: silent discard");
+    }
+
+    #[tokio::test]
+    async fn status_server_with_invalid_message_authenticator_is_discarded() {
+        let secret = random_secret();
+        let cfg = pipeline_config(AccountingPort::default());
+
+        // All-zero Message-Authenticator cannot match the HMAC.
+        let mut p = Packet::new(Code::StatusServer, 8, generate_request_authenticator());
+        p.add_attribute(
+            Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]).unwrap(),
+        );
+        let out = process_as(&p.encode().unwrap(), &secret, PortRole::Auth, &cfg)
+            .await
+            .unwrap();
+        assert!(out.is_none());
+
+        // Correctly signed, but under a different secret.
+        let other = random_secret();
+        let (bytes, _) = signed_status_server_bytes(9, &other, vec![]);
+        let out = process_as(&bytes, &secret, PortRole::Auth, &cfg)
+            .await
+            .unwrap();
+        assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn status_server_on_auth_port_answers_access_accept() {
+        let secret = random_secret();
+        let cfg = pipeline_config(AccountingPort::default());
+        let (bytes, request_auth) = signed_status_server_bytes(10, &secret, vec![]);
+        let out = process_as(&bytes, &secret, PortRole::Auth, &cfg)
+            .await
+            .unwrap()
+            .expect("a valid Status-Server is answered");
+        assert_status_reply(&out, Code::AccessAccept, 10, &request_auth, &secret);
+    }
+
+    #[tokio::test]
+    async fn status_server_on_accounting_port_answers_accounting_response() {
+        let secret = random_secret();
+        let cfg = pipeline_config(AccountingPort::default());
+        let (bytes, request_auth) = signed_status_server_bytes(11, &secret, vec![]);
+        let out = process_as(&bytes, &secret, PortRole::Accounting, &cfg)
+            .await
+            .unwrap()
+            .expect("a valid Status-Server is answered");
+        assert_status_reply(&out, Code::AccountingResponse, 11, &request_auth, &secret);
+    }
+
+    #[tokio::test]
+    async fn status_server_echoes_proxy_state() {
+        let secret = random_secret();
+        let cfg = pipeline_config(AccountingPort::default());
+        let ps1 = Attribute::new(AttributeType::ProxyState as u8, b"hop-one".to_vec()).unwrap();
+        let ps2 = Attribute::new(AttributeType::ProxyState as u8, b"hop-two".to_vec()).unwrap();
+        let (bytes, request_auth) =
+            signed_status_server_bytes(12, &secret, vec![ps1.clone(), ps2.clone()]);
+        let out = process_as(&bytes, &secret, PortRole::Auth, &cfg)
+            .await
+            .unwrap()
+            .unwrap();
+        let reply = assert_status_reply(&out, Code::AccessAccept, 12, &request_auth, &secret);
+        let echoed: Vec<&Attribute> = reply
+            .attributes
+            .iter()
+            .filter(|a| a.attr_type == AttributeType::ProxyState as u8)
+            .collect();
+        assert_eq!(echoed.len(), 2, "both Proxy-State echoed (RFC 2865 §5.33)");
+        assert_eq!(echoed[0].value, ps1.value);
+        assert_eq!(echoed[1].value, ps2.value);
+    }
+
+    #[tokio::test]
+    async fn status_server_over_radsec_answers_access_accept() {
+        let cfg = pipeline_config(AccountingPort::default());
+        let (bytes, request_auth) = signed_status_server_bytes(13, b"radsec", vec![]);
+        let out = process_as(&bytes, b"radsec", PortRole::Any, &cfg)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_status_reply(&out, Code::AccessAccept, 13, &request_auth, b"radsec");
+    }
+
+    #[tokio::test]
+    async fn access_request_on_accounting_port_is_discarded() {
+        let secret = random_secret();
+        let cfg = pipeline_config(AccountingPort::default());
+        let data = access_request_bytes(vec![
+            Attribute::string(AttributeType::UserName as u8, "nobody").unwrap(),
+            Attribute::new(AttributeType::UserPassword as u8, vec![0u8; 16]).unwrap(),
+        ]);
+        let out = process_as(&data, &secret, PortRole::Accounting, &cfg)
+            .await
+            .unwrap();
+        assert!(
+            out.is_none(),
+            "RFC 2866 §2: no Access-Request on the accounting port"
+        );
+    }
+
+    #[tokio::test]
+    async fn accounting_request_on_accounting_port_answers_accounting_response() {
+        let secret = random_secret();
+        let cfg = pipeline_config(AccountingPort::default());
+        let (bytes, request_auth) = accounting_start_bytes(20, &secret);
+        let out = process_as(&bytes, &secret, PortRole::Accounting, &cfg)
+            .await
+            .unwrap()
+            .expect("Accounting-Request is answered");
+        let reply = Packet::decode(&out).unwrap();
+        assert_eq!(reply.code, Code::AccountingResponse);
+        assert_eq!(reply.identifier, 20);
+        assert!(verify_response_authenticator(
+            &reply,
+            &request_auth,
+            &secret
+        ));
+    }
+
+    #[tokio::test]
+    async fn accounting_request_on_auth_port_is_discarded_unless_shared() {
+        let secret = random_secret();
+        let (bytes, request_auth) = accounting_start_bytes(21, &secret);
+
+        // Dedicated accounting socket: Code 4 on the auth socket is discarded.
+        let cfg = pipeline_config(AccountingPort::Dedicated(1813));
+        assert!(
+            process_as(&bytes, &secret, PortRole::Auth, &cfg)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Shared (legacy single socket): answered.
+        let cfg = pipeline_config(AccountingPort::Named(AccountingPortMode::Shared));
+        let out = process_as(&bytes, &secret, PortRole::Auth, &cfg)
+            .await
+            .unwrap()
+            .expect("shared mode answers accounting on the auth socket");
+        let reply = Packet::decode(&out).unwrap();
+        assert_eq!(reply.code, Code::AccountingResponse);
+        assert!(verify_response_authenticator(
+            &reply,
+            &request_auth,
+            &secret
+        ));
+
+        // Disabled: no UDP accounting anywhere.
+        let cfg = pipeline_config(AccountingPort::Named(AccountingPortMode::Disabled));
+        assert!(
+            process_as(&bytes, &secret, PortRole::Auth, &cfg)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn radsec_role_admits_every_code() {
+        let cfg = pipeline_config(AccountingPort::Named(AccountingPortMode::Disabled));
+
+        // Access-Request reaches authentication (unknown user → a reject, or
+        // at least not the admission discard).
+        let data = access_request_bytes(vec![
+            Attribute::string(AttributeType::UserName as u8, "nobody").unwrap(),
+            Attribute::new(AttributeType::UserPassword as u8, vec![0u8; 16]).unwrap(),
+        ]);
+        match process_as(&data, b"radsec", PortRole::Any, &cfg).await {
+            Ok(None) => panic!("RadSec must not discard Access-Request by admission"),
+            Ok(Some(bytes)) => {
+                assert_eq!(Packet::decode(&bytes).unwrap().code, Code::AccessReject)
+            }
+            Err(_) => {} // AuthFailed for the unknown user is also "handled"
+        }
+
+        // Accounting-Request is handled even though UDP accounting is disabled.
+        let (bytes, request_auth) = accounting_start_bytes(22, b"radsec");
+        let out = process_as(&bytes, b"radsec", PortRole::Any, &cfg)
+            .await
+            .unwrap()
+            .expect("RadSec carries accounting (RFC 6614 §2.5)");
+        let reply = Packet::decode(&out).unwrap();
+        assert_eq!(reply.code, Code::AccountingResponse);
+        assert!(verify_response_authenticator(
+            &reply,
+            &request_auth,
+            b"radsec"
+        ));
+    }
+
+    // --- Real sockets: two listeners, routing by port ---
+
+    fn dual_socket_config(accounting_port: AccountingPort) -> Config {
+        Config {
+            listen_address: "127.0.0.1".to_string(),
+            listen_port: 0,
+            accounting_port,
+            clients: vec![crate::config::Client {
+                address: "127.0.0.1/32".to_string(),
+                secret: "nas-secret".to_string(),
+                name: Some("test-nas".to_string()),
+                enabled: true,
+                nas_identifier: None,
+            }],
+            strict_rfc_compliance: false,
+            ..Config::default()
+        }
+    }
+
+    async fn dual_socket_server(config: Config) -> RadiusServer {
+        let handler = Arc::new(SimpleAuthHandler::new());
+        let server_config = ServerConfig::from_config(config, handler)
+            .unwrap()
+            .with_accounting_handler(Arc::new(SimpleAccountingHandler::new()));
+        RadiusServer::new(server_config).await.unwrap()
+    }
+
+    async fn recv_reply(sock: &UdpSocket, wait: Duration) -> Option<(Vec<u8>, SocketAddr)> {
+        let mut buf = vec![0u8; 4096];
+        match tokio::time::timeout(wait, sock.recv_from(&mut buf)).await {
+            Ok(Ok((len, from))) => Some((buf[..len].to_vec(), from)),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dual_sockets_route_by_port() {
+        let server = dual_socket_server(dual_socket_config(AccountingPort::Dedicated(0))).await;
+        let auth_addr = server.local_addr().unwrap();
+        let acct_addr = server
+            .accounting_local_addr()
+            .unwrap()
+            .expect("a dedicated accounting socket is bound");
+        assert_ne!(auth_addr, acct_addr);
+        tokio::spawn(async move { server.run().await });
+
+        let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let secret = b"nas-secret";
+        let long = Duration::from_secs(5);
+        let short = Duration::from_millis(500);
+
+        // Accounting-Request → accounting socket ⇒ Accounting-Response from it.
+        let (bytes, request_auth) = accounting_start_bytes(30, secret);
+        nas.send_to(&bytes, acct_addr).await.unwrap();
+        let (reply, from) = recv_reply(&nas, long)
+            .await
+            .expect("Accounting-Response from the accounting socket");
+        assert_eq!(from, acct_addr, "reply leaves from the accounting port");
+        let reply = Packet::decode(&reply).unwrap();
+        assert_eq!(reply.code, Code::AccountingResponse);
+        assert_eq!(reply.identifier, 30);
+        assert!(verify_response_authenticator(&reply, &request_auth, secret));
+
+        // Same kind of request (new id) → auth socket ⇒ silence (RFC 2866 §2).
+        let (bytes, _) = accounting_start_bytes(31, secret);
+        nas.send_to(&bytes, auth_addr).await.unwrap();
+        assert!(
+            recv_reply(&nas, short).await.is_none(),
+            "Accounting-Request on the auth socket is discarded"
+        );
+
+        // Status-Server → accounting socket ⇒ Accounting-Response (RFC 5997 §4.2).
+        let (bytes, request_auth) = signed_status_server_bytes(32, secret, vec![]);
+        nas.send_to(&bytes, acct_addr).await.unwrap();
+        let (reply, from) = recv_reply(&nas, long)
+            .await
+            .expect("Status-Server answered");
+        assert_eq!(from, acct_addr);
+        assert_status_reply(&reply, Code::AccountingResponse, 32, &request_auth, secret);
+
+        // Status-Server → auth socket ⇒ Access-Accept.
+        let (bytes, request_auth) = signed_status_server_bytes(33, secret, vec![]);
+        nas.send_to(&bytes, auth_addr).await.unwrap();
+        let (reply, from) = recv_reply(&nas, long)
+            .await
+            .expect("Status-Server answered");
+        assert_eq!(from, auth_addr);
+        assert_status_reply(&reply, Code::AccessAccept, 33, &request_auth, secret);
+
+        // Access-Request → accounting socket ⇒ silence.
+        let data = access_request_bytes(vec![
+            Attribute::string(AttributeType::UserName as u8, "nobody").unwrap(),
+            Attribute::new(AttributeType::UserPassword as u8, vec![0u8; 16]).unwrap(),
+        ]);
+        nas.send_to(&data, acct_addr).await.unwrap();
+        assert!(
+            recv_reply(&nas, short).await.is_none(),
+            "Access-Request on the accounting socket is discarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_mode_binds_one_socket() {
+        let server = dual_socket_server(dual_socket_config(AccountingPort::Named(
+            AccountingPortMode::Shared,
+        )))
+        .await;
+        let auth_addr = server.local_addr().unwrap();
+        assert!(server.accounting_local_addr().unwrap().is_none());
+        tokio::spawn(async move { server.run().await });
+
+        let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let secret = b"nas-secret";
+        let (bytes, request_auth) = accounting_start_bytes(40, secret);
+        nas.send_to(&bytes, auth_addr).await.unwrap();
+        let (reply, from) = recv_reply(&nas, Duration::from_secs(5))
+            .await
+            .expect("shared mode answers accounting on the auth socket");
+        assert_eq!(from, auth_addr);
+        let reply = Packet::decode(&reply).unwrap();
+        assert_eq!(reply.code, Code::AccountingResponse);
+        assert!(verify_response_authenticator(&reply, &request_auth, secret));
     }
 }
