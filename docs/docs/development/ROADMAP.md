@@ -15,8 +15,10 @@ See [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md) for detailed gap analysis
 - ❌ CoA/Disconnect only over RadSec (no UDP/3799 path)
 - ❌ No certificate hot-rotation for RadSec or EAP-TLS
 - ⚠️ CRL and OCSP response signatures are not verified by the revocation checker
-- ⚠️ Status-Server does not verify Message-Authenticator and always replies Access-Accept
-- ⚠️ Only one UDP socket is bound; 1813/udp is advertised but not listened on
+
+Closed since v0.12.0 (unreleased): Status-Server verifies Message-Authenticator and
+answers by port per RFC 5997, and a dedicated 1813/udp accounting socket is bound
+(`accounting_port`, RFC 2866 §2).
 
 ### Completed Features (v0.1.0 through v0.12.0)
 
@@ -1002,6 +1004,12 @@ let config = RevocationConfig::disabled();
 **Implementation Details**:
 
 - Status-Server packets (RFC 5997) sent at configurable intervals
+- Probes carry a random Request Authenticator and a Message-Authenticator
+  under the home server's secret, one ephemeral socket per probe; a reply
+  counts only if its source, Identifier, Response Authenticator and any
+  Message-Authenticator check out and its code is Access-Accept,
+  Accounting-Response or Access-Reject (unreleased; earlier probes were
+  unsigned and discarded by conformant home servers)
 - Servers marked Down after N consecutive failures
 - Servers marked Up after M consecutive successes
 - Dead servers can recover automatically
@@ -1351,8 +1359,7 @@ let config = RevocationConfig::disabled();
 
 1. Verify CRL and OCSP response signatures in the revocation checker
 2. EAP-TEAP inner methods with real keying material (EAP-MSCHAPv2)
-3. Status-Server Message-Authenticator verification (RFC 5997 §4.1)
-4. Dedicated accounting socket (1813/udp) or remove it from the manifests
+3. Administrative enable/disable switch for Status-Server acceptance (RFC 5997 §4.2 SHOULD)
 
 ### Nice to Have
 

@@ -544,7 +544,7 @@ RadSec (RADIUS over TLS, RFC 6614) shipped in v0.10.0 and is the **default trans
 - ✅ **Mutual TLS**: every NAS presents a client certificate verified against `radsec.client_ca_path`. The certificate Common Name is the server's authenticated notion of "which switch" and is the identity used to address CoA/Disconnect requests.
 - ✅ **Forward secrecy** from the ephemeral ML-KEM key exchange.
 - ✅ Inside the tunnel the payload is standard RADIUS using the fixed secret `"radsec"` (RFC 6614 §2.3); the real protection is the TLS layer.
-- ✅ Authentication, accounting, Status-Server and server-originated CoA/Disconnect (RFC 5176) share one long-lived connection per NAS on 2083/tcp.
+- ✅ Authentication, accounting, Status-Server and server-originated CoA/Disconnect (RFC 5176) share one long-lived connection per NAS on 2083/tcp. A Status-Server inside the tunnel must carry a Message-Authenticator under the fixed `"radsec"` secret or it is silently discarded (RFC 5997 §4.1); over UDP the same rule applies with the client's secret, on both the authentication and the accounting socket.
 
 **Configuration** (`transport` selects the listener; `radsec` is required when `transport` is `"radsec"`):
 
@@ -606,8 +606,7 @@ Remaining security work:
 
 1. **RadSec**: DTLS transport, certificate hot-rotation, revocation checking of NAS certificates
 2. **EAP**: EAP-TEAP inner methods with real IMSK, CRL/OCSP integration for client certificates
-3. **Status-Server**: verify Message-Authenticator (RFC 5997 §4.1)
-4. **Modern Crypto for UDP**: the UDP transport is bound to MD5 by RFC 2865; prefer RadSec rather than waiting for stronger UDP primitives
+3. **Modern Crypto for UDP**: the UDP transport is bound to MD5 by RFC 2865; prefer RadSec rather than waiting for stronger UDP primitives
 
 ## Security Checklist
 

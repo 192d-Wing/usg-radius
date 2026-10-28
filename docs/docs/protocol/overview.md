@@ -9,7 +9,7 @@ USG RADIUS implements the following RFCs:
 | RFC | Title | Status |
 |-----|-------|--------|
 | [RFC 2865](https://tools.ietf.org/html/rfc2865) | Remote Authentication Dial In User Service (RADIUS) | ✅ Implemented |
-| [RFC 2866](https://tools.ietf.org/html/rfc2866) | RADIUS Accounting | 🔄 Attributes Only |
+| [RFC 2866](https://tools.ietf.org/html/rfc2866) | RADIUS Accounting | ✅ Implemented (dedicated 1813/udp socket) |
 | [RFC 2869](https://tools.ietf.org/html/rfc2869) | RADIUS Extensions | ✅ Message-Authenticator |
 | [RFC 5997](https://tools.ietf.org/html/rfc5997) | Use of Status-Server Messages | ✅ Implemented |
 

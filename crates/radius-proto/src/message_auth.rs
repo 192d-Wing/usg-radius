@@ -10,7 +10,10 @@
 //! - Recommended for Access-Challenge, Access-Accept, Access-Reject with EAP
 //!
 //! The Message-Authenticator is computed over the entire RADIUS packet with:
-//! - Request Authenticator (for requests) or calculated Response Authenticator (for responses)
+//! - The *Request* Authenticator in the Authenticator field for both requests
+//!   and responses (RFC 2869 §5.14: for Access-Accept, Access-Challenge and
+//!   Access-Reject the HMAC is computed before the Response Authenticator, with
+//!   the Request Authenticator in the header)
 //! - Message-Authenticator field set to all zeros during calculation
 
 use hmac::{Hmac, KeyInit, Mac};
@@ -62,11 +65,11 @@ pub fn verify_message_authenticator(
     let mut packet_copy = packet_bytes.to_vec();
     packet_copy[message_auth_offset..message_auth_offset + 16].fill(0);
 
-    // Calculate expected Message-Authenticator
-    let expected_auth = calculate_message_authenticator(&packet_copy, secret);
-
-    // Constant-time comparison
-    received_auth == expected_auth
+    // Constant-time comparison (CWE-208): `Mac::verify_slice` compares through
+    // `subtle`, so a wrong guess costs the same whatever its first octets are.
+    let mut mac = HmacMd5::new_from_slice(secret).expect("HMAC can take key of any size");
+    mac.update(&packet_copy);
+    mac.verify_slice(received_auth).is_ok()
 }
 
 #[cfg(test)]

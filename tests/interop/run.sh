@@ -60,3 +60,30 @@ echo "== starting FreeRADIUS, usg-radius proxy, usg-radius home"
 compose up -d freeradius usg-proxy usg-home
 echo "== running checks in the nas container"
 compose run --rm --no-deps nas
+
+# The proxy's own RFC 5997 probes against real home servers: proxy.json enables
+# health checks, so usg-proxy sends a signed Status-Server to FreeRADIUS and to
+# usg-home every 5 s. The only observable is the proxy's debug line, which the
+# nas container cannot see, so it is scraped from the proxy's log here. Polled
+# for up to 20 s in case the last probe interval has not elapsed yet.
+echo "== checking the proxy's Status-Server probes were answered by both home servers"
+probe_answered() { # <home server name>: the proxy logged a verified reply from it
+    # Captured first, then grepped: with pipefail a grep -q that exits early would
+    # SIGPIPE the compose/ssh pipeline and turn a match into a failure.
+    local log
+    log=$(compose logs --no-color usg-proxy 2>/dev/null | perl -pe 's/\e\[[0-9;]*m//g') || true
+    grep -q "Status-Server check successful.*server=$1" <<<"$log"
+}
+for home in freeradius usg-home; do
+    i=0
+    until probe_answered "$home"; do
+        i=$((i + 1))
+        if [[ $i -ge 20 ]]; then
+            echo "FAIL  usg-proxy log has no 'Status-Server check successful' line for server=$home" >&2
+            echo "      (the proxy's RFC 5997 probe was not answered, or its reply failed verification)" >&2
+            exit 1
+        fi
+        sleep 1
+    done
+    echo "PASS  proxy Status-Server probe answered by $home"
+done

@@ -469,8 +469,8 @@ Automatic health monitoring using RFC 5997 Status-Server packets:
 
 **How It Works**:
 
-1. Background task sends Status-Server (RFC 5997) packets at configured intervals
-2. Expects Access-Accept response to consider server healthy
+1. Background task sends Status-Server (RFC 5997) packets at configured intervals, each with a random Request Authenticator and a Message-Authenticator computed under that home server's secret, from an ephemeral socket per probe
+2. Counts the probe as healthy only if the reply comes from the probed address with the same Identifier, its Response Authenticator (and Message-Authenticator, when present) verifies under the home server's secret, and its code is Access-Accept, Accounting-Response (accounting-port home servers) or Access-Reject (which RFC 5997 §4.2 permits); anything else is a failed probe
 3. Tracks consecutive failures and successes per server
 4. Automatically transitions server states: Up ↔ Down ↔ Dead
 5. Down/Dead servers can recover automatically after enough successful checks

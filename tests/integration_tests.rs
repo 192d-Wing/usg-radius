@@ -18,8 +18,8 @@ use radius_proto::auth::{
 use radius_proto::chap::{ChapChallenge, ChapResponse, compute_chap_response};
 use radius_proto::{Attribute, AttributeType, Code, Packet, calculate_message_authenticator};
 use radius_server::{
-    AccountingHandler, AuthHandler, AuthResult, AuthzProfile, Condition, Config, Effect,
-    PolicyConfig, PolicySet, RadiusServer, ReplyAttribute, Rule, ServerConfig,
+    AccountingHandler, AccountingPort, AuthHandler, AuthResult, AuthzProfile, Condition, Config,
+    Effect, PolicyConfig, PolicySet, RadiusServer, ReplyAttribute, Rule, ServerConfig,
     SimpleAccountingHandler, SimpleAuthHandler,
 };
 use std::net::SocketAddr;
@@ -100,6 +100,24 @@ fn create_chap_access_request(
     packet
 }
 
+/// `Config::default()` with an ephemeral dedicated accounting socket
+/// (`accounting_port = 0`), so parallel tests never race for 127.0.0.1:1813;
+/// the production default stays `Dedicated(1813)`.
+fn test_config() -> Config {
+    let mut config = Config::default();
+    config.accounting_port = AccountingPort::Dedicated(0);
+    config
+}
+
+/// The server's dedicated accounting socket (RFC 2866 §2), the only UDP
+/// socket on which Accounting-Request is accepted.
+fn accounting_addr(server: &RadiusServer) -> SocketAddr {
+    server
+        .accounting_local_addr()
+        .expect("Failed to get accounting address")
+        .expect("server has a dedicated accounting socket")
+}
+
 /// Test helper to send a RADIUS packet and receive response
 async fn send_radius_request(
     packet: &Packet,
@@ -123,7 +141,7 @@ async fn send_radius_request(
 #[tokio::test]
 async fn test_successful_authentication() {
     // Create test configuration
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0; // Let OS assign port
     config.secret = "testing123".to_string();
@@ -165,7 +183,7 @@ async fn test_successful_authentication() {
 /// Build + run a server (user testuser/testpass, secret testing123) with the given
 /// authorization policy enforced, and return its address.
 async fn spawn_server_with_policy(policy: PolicyConfig) -> SocketAddr {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -260,7 +278,7 @@ async fn test_empty_policy_does_not_change_accept() {
 
 #[tokio::test]
 async fn test_failed_authentication_wrong_password() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -295,7 +313,7 @@ async fn test_failed_authentication_wrong_password() {
 
 #[tokio::test]
 async fn test_failed_authentication_unknown_user() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -330,7 +348,7 @@ async fn test_failed_authentication_unknown_user() {
 
 #[tokio::test]
 async fn test_multiple_sequential_authentications() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -440,7 +458,7 @@ fn test_env_var_not_found() {
 
 #[tokio::test]
 async fn test_rate_limiting() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -533,6 +551,7 @@ async fn test_client_ip_validation() {
 
     // Override to use OS-assigned port for testing
     config.listen_port = 0;
+    config.accounting_port = AccountingPort::Dedicated(0); // ephemeral accounting socket
 
     let mut handler = SimpleAuthHandler::new();
     handler.add_user("testuser", "testpass");
@@ -594,6 +613,7 @@ async fn test_nas_identifier_validation() {
 
     let mut config = Config::from_file(temp_file.path()).expect("Failed to load config");
     config.listen_port = 0; // OS-assigned port
+    config.accounting_port = AccountingPort::Dedicated(0); // ephemeral accounting socket
 
     let mut handler = SimpleAuthHandler::new();
     handler.add_user("testuser", "testpass");
@@ -703,7 +723,7 @@ async fn test_ipv6_support() {
     }
     drop(ipv6_test);
 
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "::1".to_string(); // IPv6 loopback
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -758,7 +778,7 @@ async fn test_ipv6_support() {
 
 #[tokio::test]
 async fn test_duplicate_request_detection() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -811,7 +831,7 @@ async fn test_duplicate_request_detection() {
 #[tokio::test]
 async fn test_chap_successful_authentication() {
     // Create test configuration
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -847,7 +867,7 @@ async fn test_chap_successful_authentication() {
 
 #[tokio::test]
 async fn test_chap_failed_authentication_wrong_password() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -882,7 +902,7 @@ async fn test_chap_failed_authentication_wrong_password() {
 
 #[tokio::test]
 async fn test_chap_failed_authentication_unknown_user() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -918,7 +938,7 @@ async fn test_chap_failed_authentication_unknown_user() {
 #[tokio::test]
 async fn test_chap_and_pap_interleaved() {
     // Test that server can handle both PAP and CHAP requests
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -965,7 +985,7 @@ async fn test_chap_and_pap_interleaved() {
 #[tokio::test]
 async fn test_chap_different_identifiers() {
     // Test that CHAP works with different CHAP identifiers
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -1070,7 +1090,7 @@ impl AuthHandler for ChallengeAuthHandler {
 #[tokio::test]
 async fn test_access_challenge() {
     // Create test configuration
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -1156,7 +1176,7 @@ async fn test_access_challenge() {
 #[tokio::test]
 async fn test_access_challenge_wrong_pin() {
     // Create test configuration
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -1278,7 +1298,7 @@ fn create_accounting_request(
 #[tokio::test]
 async fn test_accounting_session_lifecycle() {
     // Create test configuration
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0; // Let OS assign a random port
 
@@ -1296,7 +1316,7 @@ async fn test_accounting_session_lifecycle() {
     let server = RadiusServer::new(server_config)
         .await
         .expect("Failed to create server");
-    let server_addr = server.local_addr().expect("Failed to get server address");
+    let server_addr = accounting_addr(&server);
 
     // Start server in background
     tokio::spawn(async move {
@@ -1427,7 +1447,7 @@ async fn test_accounting_session_lifecycle() {
 #[tokio::test]
 async fn test_accounting_nas_events() {
     // Create test configuration
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0; // Let OS assign a random port
 
@@ -1445,7 +1465,7 @@ async fn test_accounting_nas_events() {
     let server = RadiusServer::new(server_config)
         .await
         .expect("Failed to create server");
-    let server_addr = server.local_addr().expect("Failed to get server address");
+    let server_addr = accounting_addr(&server);
 
     // Start server in background
     tokio::spawn(async move {
@@ -1499,7 +1519,7 @@ async fn test_accounting_nas_events() {
 #[tokio::test]
 async fn test_accounting_without_handler() {
     // Create test configuration without accounting handler
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0; // Let OS assign a random port
 
@@ -1514,7 +1534,7 @@ async fn test_accounting_without_handler() {
     let server = RadiusServer::new(server_config)
         .await
         .expect("Failed to create server");
-    let server_addr = server.local_addr().expect("Failed to get server address");
+    let server_addr = accounting_addr(&server);
 
     // Start server in background
     tokio::spawn(async move {
@@ -1545,7 +1565,7 @@ async fn test_accounting_without_handler() {
 /// Test Message-Authenticator validation (RFC 2869)
 #[tokio::test]
 async fn test_message_authenticator_valid() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -1632,7 +1652,7 @@ async fn test_message_authenticator_valid() {
 /// Test Message-Authenticator validation with invalid authenticator
 #[tokio::test]
 async fn test_message_authenticator_invalid() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -1698,7 +1718,7 @@ async fn test_message_authenticator_invalid() {
 /// Test that requests without Message-Authenticator still work (it's optional)
 #[tokio::test]
 async fn test_message_authenticator_optional() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -1735,7 +1755,7 @@ async fn test_message_authenticator_optional() {
 /// Test session timeout handling
 #[tokio::test]
 async fn test_accounting_session_timeout() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -1754,7 +1774,7 @@ async fn test_accounting_session_timeout() {
     let server = RadiusServer::new(server_config)
         .await
         .expect("Failed to create server");
-    let server_addr = server.local_addr().expect("Failed to get server address");
+    let server_addr = accounting_addr(&server);
 
     tokio::spawn(async move {
         server.run().await.ok();
@@ -1807,7 +1827,7 @@ async fn test_accounting_session_timeout() {
 /// Test concurrent session limits
 #[tokio::test]
 async fn test_accounting_concurrent_session_limit() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -1826,7 +1846,7 @@ async fn test_accounting_concurrent_session_limit() {
     let server = RadiusServer::new(server_config)
         .await
         .expect("Failed to create server");
-    let server_addr = server.local_addr().expect("Failed to get server address");
+    let server_addr = accounting_addr(&server);
 
     tokio::spawn(async move {
         server.run().await.ok();
@@ -1912,7 +1932,7 @@ async fn test_accounting_concurrent_session_limit() {
 /// Test session query by user
 #[tokio::test]
 async fn test_accounting_query_by_user() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -1931,7 +1951,7 @@ async fn test_accounting_query_by_user() {
     let server = RadiusServer::new(server_config)
         .await
         .expect("Failed to create server");
-    let server_addr = server.local_addr().expect("Failed to get server address");
+    let server_addr = accounting_addr(&server);
 
     tokio::spawn(async move {
         server.run().await.ok();
@@ -1986,7 +2006,7 @@ async fn test_file_accounting_handler() {
     let accounting_file = temp_dir.path().join("accounting.jsonl");
 
     // Create test configuration
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -2010,7 +2030,7 @@ async fn test_file_accounting_handler() {
     let server = RadiusServer::new(server_config)
         .await
         .expect("Failed to create server");
-    let server_addr = server.local_addr().expect("Failed to get server address");
+    let server_addr = accounting_addr(&server);
 
     // Start server in background
     tokio::spawn(async move {
@@ -2184,7 +2204,7 @@ fn add_three_proxy_states(packet: &mut Packet) -> Vec<Vec<u8>> {
 
 #[tokio::test]
 async fn test_proxy_state_echoed_on_access_accept() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -2215,7 +2235,7 @@ async fn test_proxy_state_echoed_on_access_accept() {
 
 #[tokio::test]
 async fn test_proxy_state_echoed_on_access_reject() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -2247,7 +2267,7 @@ async fn test_proxy_state_echoed_on_access_reject() {
 
 #[tokio::test]
 async fn test_proxy_state_echoed_on_access_challenge() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();
@@ -2278,7 +2298,7 @@ async fn test_proxy_state_echoed_on_access_challenge() {
 
 #[tokio::test]
 async fn test_proxy_state_echoed_on_accounting_response() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
 
@@ -2290,7 +2310,7 @@ async fn test_proxy_state_echoed_on_accounting_response() {
         .expect("server config")
         .with_accounting_handler(acct_handler);
     let server = RadiusServer::new(server_config).await.expect("server");
-    let server_addr = server.local_addr().expect("server addr");
+    let server_addr = accounting_addr(&server);
 
     tokio::spawn(async move {
         let _ = server.run().await;
@@ -2324,7 +2344,7 @@ async fn test_proxy_state_echoed_on_accounting_response() {
 /// echo loop iterates `request.attributes` in receive order.
 #[tokio::test]
 async fn test_proxy_state_order_preserved_with_many_values() {
-    let mut config = Config::default();
+    let mut config = test_config();
     config.listen_address = "127.0.0.1".to_string();
     config.listen_port = 0;
     config.secret = "testing123".to_string();

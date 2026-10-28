@@ -9,12 +9,12 @@ A RADIUS (Remote Authentication Dial-In User Service) server implementation in R
 - **RFC 2865 Compliant**: Full implementation of the RADIUS authentication protocol
 - **RFC 2866 Accounting**: Complete accounting protocol support with session tracking
 - **Authentication**: Support for Access-Request, Access-Accept, Access-Reject, and Access-Challenge
-- **Accounting**: Accounting-Request and Accounting-Response with full session lifecycle
+- **Accounting**: Accounting-Request and Accounting-Response on a dedicated 1813/udp socket (`accounting_port`, RFC 2866 §2) with full session lifecycle
 - **EAP Support**: EAP-TLS (RFC 5216) and EAP-TEAP (RFC 7170) over EAP-Message (Type 79) for 802.1X, with fragmentation, MSK/EMSK derivation and Access-Challenge multi-round flows
 - **CHAP and PAP**: CHAP-Password (RFC 2865 §5.3) and User-Password authentication
 - **RadSec Transport**: RADIUS over mutually authenticated TLS 1.3 (RFC 6614) with ML-KEM-1024 key exchange; the default transport for config files, with `udp-insecure` as an explicit fallback
 - **CoA / Disconnect**: Server-originated Change-of-Authorization and Disconnect (RFC 5176) over RadSec, triggered from the management API
-- **Status Server**: RFC 5997 Status-Server support for monitoring
+- **Status Server**: RFC 5997 Status-Server with Message-Authenticator verification; Access-Accept on the authentication port, Accounting-Response on the accounting port; the proxy answers probes itself and probes its home servers the same way
 - **Password Encryption**: MD5-based User-Password encryption per RFC 2865 Section 5.2
 - **Packet Authentication**: Request/Response Authenticator validation
 - **Strict Validation**: RFC 2865 attribute validation with strict/lenient modes
@@ -60,7 +60,7 @@ A RADIUS (Remote Authentication Dial-In User Service) server implementation in R
 - **RFC 3748**: Extensible Authentication Protocol (EAP) - Core framework and state machine
 - **RFC 5176**: Dynamic Authorization Extensions - Server-originated CoA/Disconnect over RadSec
 - **RFC 5216**: EAP-TLS - Certificate-based authentication with RFC 5705 key export
-- **RFC 5997**: RADIUS Status-Server packets
+- **RFC 5997**: RADIUS Status-Server - Message-Authenticator required and verified, reply code by port, never forwarded by the proxy
 - **RFC 6614**: RADIUS over TLS (RadSec) - TLS 1.3 mutual authentication, default transport
 - **RFC 7170**: EAP-TEAP - TLS tunnel and TLV protocol with Crypto-Binding and MSK derivation (inner methods with real keying material pending)
 - **RFC 9190**: EAP-TLS 1.3 - Version-correct exporter labels and EAP-Key-Name
@@ -91,6 +91,7 @@ cargo run
 {
   "listen_address": "::",
   "listen_port": 1812,
+  "accounting_port": 1813,
   "secret": "testing123",
   "clients": [
     {
@@ -164,8 +165,9 @@ A complete JSON Schema is provided in [`config.schema.json`](config.schema.json)
 
 **Server Settings:**
 
-- `listen_address`: IP address to bind to (default: "0.0.0.0")
-- `listen_port`: Port to listen on (default: 1812)
+- `listen_address`: IP address to bind to (default: "::", dual-stack)
+- `listen_port`: UDP authentication port (default: 1812)
+- `accounting_port`: UDP accounting port (default: 1813); `"shared"` accepts accounting on the authentication socket, `"disabled"` turns UDP accounting off
 - `secret`: Default shared secret for clients
 
 **Security & Logging:**
@@ -272,7 +274,7 @@ Per RFC 2865 Section 3:
 
 **Monitoring (RFC 5997):**
 
-- **Status-Server (12)**: Server health check
+- **Status-Server (12)**: Liveness probe; must carry a Message-Authenticator, answered with Access-Accept on the authentication port or Accounting-Response on the accounting port (RFC 5997)
 - **Status-Client (13)**: Client health check response
 
 **Dynamic Authorization (RFC 5176, server-originated over RadSec):**
@@ -361,7 +363,7 @@ impl AuthHandler for DatabaseAuthHandler {
 
 4. **Network Security**: RADIUS does not encrypt the entire packet. Use VPNs or other network security measures for sensitive deployments.
 
-5. **Port Security**: Standard RADIUS uses UDP port 1812. Ensure proper firewall rules.
+5. **Port Security**: Standard RADIUS uses UDP ports 1812 (authentication) and 1813 (accounting); RadSec uses TCP 2083. Ensure proper firewall rules.
 
 ## Development
 

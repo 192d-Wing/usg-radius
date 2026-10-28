@@ -48,6 +48,7 @@
 
 use super::EapError;
 use super::eap_tls::{EapTlsPacket, EapTlsServer, LengthFlagPolicy, TlsFlags};
+use crate::auth::constant_time_eq;
 use std::sync::Arc;
 
 // Cryptographic imports for Crypto-Binding
@@ -1044,18 +1045,6 @@ impl CryptoBinding {
             client_nonce: None,
         }
     }
-}
-
-/// Constant-time equality of two byte strings (false if lengths differ).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// TEAP authentication phase

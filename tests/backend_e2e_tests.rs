@@ -15,7 +15,9 @@
 use radius_proto::auth::{encrypt_user_password, generate_request_authenticator};
 use radius_proto::chap::{ChapChallenge, ChapResponse, compute_chap_response};
 use radius_proto::{Attribute, AttributeType, Code, Packet};
-use radius_server::{AuthHandler, Config, RadiusServer, ServerConfig, SimpleAuthHandler};
+use radius_server::{
+    AccountingPort, AuthHandler, Config, RadiusServer, ServerConfig, SimpleAuthHandler,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::time::Duration;
@@ -108,7 +110,8 @@ async fn test_e2e_simple_auth_pap_success() {
     // Create minimal config
     let config = Config {
         listen_address: "127.0.0.1".to_string(),
-        listen_port: 0, // Random port
+        listen_port: 0,                                // Random port
+        accounting_port: AccountingPort::Dedicated(0), // ephemeral accounting socket
         secret: "testing123".to_string(),
         clients: vec![],
         ..Default::default()
@@ -150,6 +153,7 @@ async fn test_e2e_simple_auth_pap_failure() {
     let config = Config {
         listen_address: "127.0.0.1".to_string(),
         listen_port: 0,
+        accounting_port: AccountingPort::Dedicated(0), // ephemeral accounting socket
         secret: "testing123".to_string(),
         clients: vec![],
         ..Default::default()
@@ -188,6 +192,7 @@ async fn test_e2e_simple_auth_chap_success() {
     let config = Config {
         listen_address: "127.0.0.1".to_string(),
         listen_port: 0,
+        accounting_port: AccountingPort::Dedicated(0), // ephemeral accounting socket
         secret: "testing123".to_string(),
         clients: vec![],
         ..Default::default()
@@ -226,6 +231,7 @@ async fn test_e2e_simple_auth_chap_failure() {
     let config = Config {
         listen_address: "127.0.0.1".to_string(),
         listen_port: 0,
+        accounting_port: AccountingPort::Dedicated(0), // ephemeral accounting socket
         secret: "testing123".to_string(),
         clients: vec![],
         ..Default::default()
@@ -264,6 +270,7 @@ async fn test_e2e_simple_auth_unknown_user() {
     let config = Config {
         listen_address: "127.0.0.1".to_string(),
         listen_port: 0,
+        accounting_port: AccountingPort::Dedicated(0), // ephemeral accounting socket
         secret: "testing123".to_string(),
         clients: vec![],
         ..Default::default()
@@ -322,6 +329,7 @@ async fn test_e2e_simple_auth_accept_attributes() {
     let config = Config {
         listen_address: "127.0.0.1".to_string(),
         listen_port: 0,
+        accounting_port: AccountingPort::Dedicated(0), // ephemeral accounting socket
         secret: "testing123".to_string(),
         clients: vec![],
         ..Default::default()

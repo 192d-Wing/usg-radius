@@ -38,7 +38,7 @@
       { "name": "freeradius.test", "match": { "type": "suffix", "pattern": "freeradius.test" }, "pool": "freeradius", "strip_realm": false },
       { "name": "usg.test", "match": { "type": "suffix", "pattern": "usg.test" }, "pool": "usg-home", "strip_realm": false }
     ],
-    "health_check": { "enabled": false },
+    "health_check": { "enabled": true, "interval": 5, "timeout": 3, "failures_before_down": 3, "successes_before_up": 1 },
     "retry": { "max_retries": 1, "retry_interval": 2, "failover_on_timeout": false }
   }
 }

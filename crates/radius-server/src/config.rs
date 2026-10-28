@@ -1164,7 +1164,13 @@ mod tests {
             // addresses and more) expanded before the server reads it; its
             // raw form cannot validate, so only its shape is checked here.
             let shell_template = contents.contains(":-");
-            if !shell_template {
+            // `validate()` refuses an `eap.tls.revocation` block unless this
+            // binary has the `revocation` feature (CI runs the test suite both
+            // with and without it), so that example is only validated when
+            // the feature is on; its shape is still checked below.
+            let needs_revocation_feature =
+                contents.contains("\"revocation\"") && !cfg!(feature = "revocation");
+            if !shell_template && !needs_revocation_feature {
                 config
                     .validate()
                     .unwrap_or_else(|e| panic!("{name}: does not validate: {e}"));

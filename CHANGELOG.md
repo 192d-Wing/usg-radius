@@ -73,6 +73,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   worst case (4096 × a rustls connection plus at most 64 KiB of reassembly)
   under the default per-client (100 req/s) and global (1000 req/s) rate
   limits.
+- **Dedicated accounting socket (RFC 2866 §2): `accounting_port`.** In
+  `udp-insecure` mode the server bound one UDP socket on `listen_port` and
+  answered Accounting-Request there; 1813/udp was advertised (README,
+  Dockerfile `EXPOSE`, the Kubernetes Service) but nothing listened. The
+  server now binds a second socket on `listen_address:accounting_port`
+  (default **1813**, with the same dual-stack `::` and v4-mapped source
+  handling as the authentication socket) and answers Accounting-Request from
+  it, so Accounting-Response leaves from source port 1813 as a NAS expects.
+  The key takes three forms: a port number; `"shared"` (no second socket,
+  Accounting-Request accepted on the authentication socket: the previous
+  behaviour); `"disabled"` (no second socket, Accounting-Request discarded
+  over UDP). Validation rejects `0` and a port equal to `listen_port`, and a
+  bind failure is fatal, so the server never starts half-listening.
+  Access-Request arriving on the accounting socket is discarded silently.
+  RadSec is unchanged: authentication, accounting and Status-Server share one
+  TLS connection (RFC 6614 §2.5). `usg-radius --validate` prints the mode;
+  `examples/configs/*.json`, `deploy/base/radius-config.secret.yaml` and the
+  interop configs set `"accounting_port": 1813` explicitly.
+- **Status-Server per RFC 5997.** A Status-Server must carry a
+  Message-Authenticator under the client's secret (§4.1); the server verifies
+  it (the per-client secret over UDP, the RadSec secret inside a TLS
+  connection) and silently discards a request whose Message-Authenticator is
+  missing or wrong. The reply is Access-Accept on the authentication socket
+  and over RadSec, and Accounting-Response on the accounting socket (§4.2);
+  it carries a Response Authenticator over the request's Request
+  Authenticator, a Message-Authenticator of its own and any Proxy-State
+  echoed in order (§4.1, RFC 2865 §5.33), and no State or EAP-Message. The
+  proxy keeps answering Status-Server itself and never forwards it (§4.3).
+- **Interop scenario 14: Status-Server and the accounting port** (64
+  assertions, up from 57). radclient, which signs each Status-Server and
+  verifies the reply's Response Authenticator and Message-Authenticator
+  before it prints `Received`, gets Access-Accept from the proxy and from
+  usg-home on 1812, Accounting-Response from usg-home on 1813 for a
+  Status-Server and for an Accounting-Request Start, and `No reply` for a
+  Status-Server under the wrong secret, an Access-Request sent to 1813 and
+  an Accounting-Request sent to 1812.
 
 ### Changed
 
@@ -97,6 +133,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `EapTeapServer::process_client_message` takes the new `TeapPacket` (EAP-TLS
   packet plus version and Outer TLVs) and `CryptoBinding::new` takes the
   cipher-suite hash (`TeapHash`).
+- **Accounting-Request on the authentication port is discarded by default.**
+  With the new default `"accounting_port": 1813` (and with `"disabled"`) a
+  Code 4 packet arriving on `listen_port` gets no reply and one warn line
+  (`Discarded packet: code not accepted on this port (RFC 2866 §2)` with the
+  client IP and Identifier); previously it was answered there. A NAS that
+  sends accounting to 1812 stops getting Accounting-Response and will
+  retransmit. Migration: point the NAS's accounting server at 1813, or set
+  `"accounting_port": "shared"` to keep the single-socket behaviour until
+  every NAS has moved. Library embedders are unaffected: `ServerConfig::new()`
+  starts in `shared` mode and only `ServerConfig::from_config` reads the key.
+- **Status-Server without a valid Message-Authenticator is discarded**
+  (previously every Status-Server, signed or not, was answered with
+  Access-Accept). A monitor that sends a bare 20-octet Status-Server now gets
+  no reply; radclient's `status` command and FreeRADIUS proxies already sign
+  theirs, as RFC 5997 §4.1 requires.
 
 ### Security
 
@@ -186,6 +237,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TEAP fragmentation is cited by its own section (RFC 7170 §3.7, RFC 9930
   §3.3; was §3.1, which is Version Negotiation) in code comments,
   `RFC-COMPLIANCE.md`, `INTEROP_TESTING.md` and this file.
+- **Home-server health probes were discarded by conformant home servers.**
+  `check_server_health` sent a Status-Server with a zero Request
+  Authenticator and a zeroed Message-Authenticator, which an RFC 5997 home
+  server (FreeRADIUS with `status_server = yes`, and now usg-radius) drops
+  silently, so every probed home server read as dead. A probe now uses a
+  random Request Authenticator and Identifier and a Message-Authenticator
+  under the home server's secret, and a reply counts only if it comes from
+  the probed address with the matching Identifier, Code 2 or 5 and a
+  Response Authenticator that verifies under that secret (§4.4).
+- **Concurrent health probes shared one socket and could mis-attribute
+  replies.** Every probe read from the one health-check socket, so the reply
+  to one home server's probe could be consumed by another's receive and mark
+  the wrong server alive or dead. Each probe binds its own ephemeral socket
+  (`0.0.0.0:0` or `[::]:0`, matching the listener's address family) and
+  checks the reply's source address and Identifier; `HealthChecker::new` is
+  now synchronous.
 
 ### Changed
 

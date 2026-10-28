@@ -6,10 +6,16 @@
 //!
 //! Each probe is a conformant RFC 5997 client: random Request Authenticator
 //! (§3), a Message-Authenticator under the home server's secret (§4.1), and the
-//! reply's Response Authenticator verified before the probe counts (§4.4).
-//! Either Access-Accept or Accounting-Response marks the server alive (§4.2).
+//! reply's Response Authenticator (§4.4) and — when present — its
+//! Message-Authenticator (RFC 2869 §5.14 / RFC 3579 §3.2) verified before the
+//! probe counts. Access-Accept or Accounting-Response (§4.2), or an
+//! authenticated Access-Reject (which §4.2 permits as the reply), marks the
+//! server alive; Access-Challenge is NOT RECOMMENDED there and is not accepted.
+//! A datagram that fails any check is discarded and the probe keeps waiting
+//! until its deadline, so a stray datagram cannot fail a healthy server.
 
 use crate::proxy::home_server::{HomeServer, HomeServerState};
+use crate::server::{MessageAuthenticatorCheck, check_message_authenticator};
 use radius_proto::attributes::{Attribute, AttributeType};
 use radius_proto::auth::{generate_request_authenticator, verify_response_authenticator};
 use radius_proto::{Code, Packet, calculate_message_authenticator};
@@ -241,10 +247,12 @@ impl HealthChecker {
     /// Status-Server with a random Request Authenticator and Identifier and a
     /// Message-Authenticator under the server's secret, and counts the probe as
     /// a success only when a datagram from the server's address carries the
-    /// same Identifier, Code 2 or 5, and a Response Authenticator that verifies
-    /// under that secret. Anything else — including a reply from the right
-    /// address that fails verification — is a failed probe, the same as a
-    /// timeout; a stray or forged datagram can never make a server look up.
+    /// same Identifier, Code 2, 3 or 5, a Response Authenticator that verifies
+    /// under that secret and, if present, a Message-Authenticator that does
+    /// too. Anything else — including a reply from the right address that
+    /// fails verification — is discarded and the probe keeps waiting; only the
+    /// deadline (or a socket error) fails it. A stray or forged datagram can
+    /// therefore neither make a server look up nor make a healthy one look down.
     async fn check_server_health(
         server: Arc<HomeServer>,
         probe_bind_addr: SocketAddr,
@@ -327,76 +335,29 @@ impl HealthChecker {
             return;
         }
 
-        // Wait for response with timeout
+        // Wait for a verified reply until the deadline. RFC 5997 §4.4 /
+        // RFC 2865 §3: a datagram that fails any check is silently discarded
+        // and the client keeps waiting, so one stray or forged datagram cannot
+        // fail an otherwise healthy probe; only the deadline does. A socket
+        // error still ends the probe (bounded work, no busy loop).
         let mut buf = vec![0u8; 4096];
-        let recv_result = time::timeout(timeout, socket.recv_from(&mut buf)).await;
-
-        match recv_result {
-            Ok(Ok((len, addr))) => {
-                // Verify response is from the expected server
-                if addr != server.address {
-                    warn!(
-                        server = %server.name,
-                        expected = %server.address,
-                        actual = %addr,
-                        "Status-Server response from unexpected address"
-                    );
-                    stats.record_failure();
-                    return;
+        let wait = time::timeout(timeout, async {
+            loop {
+                let (len, addr) = socket.recv_from(&mut buf).await?;
+                if let Some(code) =
+                    Self::verify_probe_reply(&server, &buf[..len], addr, identifier, &request_auth)
+                {
+                    return Ok::<Code, std::io::Error>(code);
                 }
+            }
+        })
+        .await;
 
-                // Decode the response
-                let response = match Packet::decode(&buf[..len]) {
-                    Ok(response) => response,
-                    Err(e) => {
-                        warn!(
-                            server = %server.name,
-                            error = %e,
-                            "Failed to decode Status-Server response"
-                        );
-                        stats.record_failure();
-                        return;
-                    }
-                };
-
-                if response.identifier != identifier {
-                    warn!(
-                        server = %server.name,
-                        expected = identifier,
-                        actual = response.identifier,
-                        "Status-Server response with the wrong Identifier"
-                    );
-                    stats.record_failure();
-                    return;
-                }
-
-                // RFC 5997 §4.2: Access-Accept from an authentication port,
-                // Accounting-Response from an accounting port.
-                if !matches!(response.code, Code::AccessAccept | Code::AccountingResponse) {
-                    warn!(
-                        server = %server.name,
-                        code = ?response.code,
-                        "Unexpected Status-Server response code"
-                    );
-                    stats.record_failure();
-                    return;
-                }
-
-                // RFC 5997 §4.4 / RFC 2865 §3: a reply whose Response
-                // Authenticator does not verify under the secret is discarded.
-                if !verify_response_authenticator(&response, &request_auth, server.secret()) {
-                    warn!(
-                        server = %server.name,
-                        code = ?response.code,
-                        "Status-Server response failed the Response Authenticator check"
-                    );
-                    stats.record_failure();
-                    return;
-                }
-
+        match wait {
+            Ok(Ok(code)) => {
                 debug!(
                     server = %server.name,
-                    code = ?response.code,
+                    code = ?code,
                     "Status-Server check successful"
                 );
                 stats.record_success();
@@ -416,6 +377,107 @@ impl HealthChecker {
                     "Status-Server request timed out"
                 );
                 stats.record_failure();
+            }
+        }
+    }
+
+    /// Every check a probe reply must pass before `server` counts as alive.
+    /// Returns the reply code on success; on any failure logs at `debug!`
+    /// (naming the check — never the secret or the MAC bytes) and returns
+    /// `None` so the caller keeps waiting for the real reply.
+    fn verify_probe_reply(
+        server: &HomeServer,
+        bytes: &[u8],
+        from: SocketAddr,
+        identifier: u8,
+        request_auth: &[u8; 16],
+    ) -> Option<Code> {
+        // Source check. On a dual-stack probe socket an IPv4 home server's
+        // reply arrives from a v4-mapped address (RFC 4291 §2.5.5.2), so both
+        // sides are compared in canonical form.
+        if !same_peer(from, server.address) {
+            debug!(
+                server = %server.name,
+                expected = %server.address,
+                actual = %from,
+                "Ignoring Status-Server reply from an unexpected address"
+            );
+            return None;
+        }
+
+        let response = match Packet::decode(bytes) {
+            Ok(response) => response,
+            Err(e) => {
+                debug!(
+                    server = %server.name,
+                    error = %e,
+                    "Ignoring undecodable datagram on the probe socket"
+                );
+                return None;
+            }
+        };
+
+        if response.identifier != identifier {
+            debug!(
+                server = %server.name,
+                expected = identifier,
+                actual = response.identifier,
+                "Ignoring Status-Server reply with the wrong Identifier"
+            );
+            return None;
+        }
+
+        // RFC 5997 §4.2: Access-Accept from an authentication port,
+        // Accounting-Response from an accounting port; an Access-Reject "MAY be
+        // used" and, once authenticated, still proves the server is up.
+        // Access-Challenge is NOT RECOMMENDED there and is not accepted.
+        if !matches!(
+            response.code,
+            Code::AccessAccept | Code::AccessReject | Code::AccountingResponse
+        ) {
+            debug!(
+                server = %server.name,
+                code = ?response.code,
+                "Ignoring Status-Server reply with an unexpected code"
+            );
+            return None;
+        }
+
+        // RFC 5997 §4.4 / RFC 2865 §3: a reply whose Response Authenticator
+        // does not verify under the secret is discarded.
+        if !verify_response_authenticator(&response, request_auth, server.secret()) {
+            debug!(
+                server = %server.name,
+                code = ?response.code,
+                "Ignoring Status-Server reply that failed the Response Authenticator check"
+            );
+            return None;
+        }
+
+        // RFC 2869 §5.14 / RFC 3579 §3.2: a client receiving a reply that
+        // carries a Message-Authenticator MUST verify it (HMAC-MD5 with the
+        // Request Authenticator in the header) and silently discard the packet
+        // on mismatch. A reply without one is accepted: RFC 5997 §5 lists the
+        // attribute as 0-1 on Access-Accept / Accounting-Response.
+        match check_message_authenticator(&response, request_auth, server.secret()) {
+            Ok(MessageAuthenticatorCheck::Valid) | Ok(MessageAuthenticatorCheck::Absent) => {
+                Some(response.code)
+            }
+            Ok(MessageAuthenticatorCheck::Invalid) => {
+                debug!(
+                    server = %server.name,
+                    code = ?response.code,
+                    "Ignoring Status-Server reply that failed the Message-Authenticator check"
+                );
+                None
+            }
+            Err(e) => {
+                debug!(
+                    server = %server.name,
+                    error = %e,
+                    "Ignoring Status-Server reply that could not be re-encoded"
+                );
+                None
             }
         }
     }
@@ -473,6 +535,13 @@ impl Drop for HealthChecker {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Whether a reply from `actual` came from `expected`. An IPv4-mapped IPv6
+/// source (`::ffff:a.b.c.d`, RFC 4291 §2.5.5.2) — what a `[::]` probe socket
+/// sees from an IPv4 home server — is compared as its IPv4 address.
+fn same_peer(actual: SocketAddr, expected: SocketAddr) -> bool {
+    actual.port() == expected.port() && actual.ip().to_canonical() == expected.ip().to_canonical()
 }
 
 #[cfg(test)]
@@ -709,16 +778,47 @@ mod tests {
         (addr, handle)
     }
 
+    /// A reply whose Response Authenticator verifies but whose
+    /// Message-Authenticator does not (the MA is garbage, the RA is computed
+    /// over it): what a peer with a broken MA computation would send.
+    fn reply_with_bad_message_authenticator(
+        request: &Packet,
+        code: Code,
+        identifier: u8,
+        secret: &[u8],
+    ) -> Vec<u8> {
+        let mut reply = Packet::new(code, identifier, request.authenticator);
+        let mut wrong = calculate_message_authenticator(&reply.encode().unwrap(), secret);
+        wrong[0] ^= 0x01;
+        reply.add_attribute(
+            Attribute::new(AttributeType::MessageAuthenticator as u8, wrong.to_vec()).unwrap(),
+        );
+        reply.authenticator =
+            calculate_response_authenticator(&reply, &request.authenticator, secret);
+        reply.encode().unwrap()
+    }
+
     const PROBE_BIND: &str = "127.0.0.1:0";
     const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+    /// For probes expected to fail: the probe now waits out its whole deadline
+    /// after discarding a bad datagram, so keep that short.
+    const NEGATIVE_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
-    async fn probe(server: &Arc<HomeServer>) {
+    async fn probe_with(server: &Arc<HomeServer>, timeout: Duration) {
         HealthChecker::check_server_health(
             Arc::clone(server),
             PROBE_BIND.parse().unwrap(),
-            PROBE_TIMEOUT,
+            timeout,
         )
         .await;
+    }
+
+    async fn probe(server: &Arc<HomeServer>) {
+        probe_with(server, PROBE_TIMEOUT).await;
+    }
+
+    async fn probe_expecting_failure(server: &Arc<HomeServer>) {
+        probe_with(server, NEGATIVE_PROBE_TIMEOUT).await;
     }
 
     #[tokio::test]
@@ -769,7 +869,7 @@ mod tests {
             ))
         });
         let server = home_server_at(addr, HOME_SECRET);
-        probe(&server).await;
+        probe_expecting_failure(&server).await;
         home.await.unwrap();
         assert_eq!(server.health_stats().consecutive_failures(), 1);
         assert_eq!(server.health_stats().consecutive_successes(), 0);
@@ -787,7 +887,7 @@ mod tests {
             ))
         });
         let server = home_server_at(addr, HOME_SECRET);
-        probe(&server).await;
+        probe_expecting_failure(&server).await;
         home.await.unwrap();
         assert_eq!(server.health_stats().consecutive_failures(), 1);
 
@@ -810,7 +910,7 @@ mod tests {
             other.send_to(&reply, from).await.unwrap();
         });
         let server = home_server_at(addr, HOME_SECRET);
-        probe(&server).await;
+        probe_expecting_failure(&server).await;
         home.await.unwrap();
         assert_eq!(server.health_stats().consecutive_failures(), 1);
         assert_eq!(server.health_stats().consecutive_successes(), 0);
@@ -859,5 +959,179 @@ mod tests {
         .await;
         assert_eq!(server.health_stats().consecutive_failures(), 1);
         assert_eq!(server.health_stats().total_checks(), 1);
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_authenticated_access_reject() {
+        // RFC 5997 §4.2: "An Access-Reject response MAY be used." A server
+        // that answers with an authenticated Access-Reject is alive.
+        let (addr, home) = spawn_fake_home(Duration::ZERO, |req| {
+            Some(signed_reply(
+                req,
+                Code::AccessReject,
+                req.identifier,
+                HOME_SECRET,
+            ))
+        });
+        let server = home_server_at(addr, HOME_SECRET);
+        probe(&server).await;
+        home.await.unwrap();
+        assert_eq!(server.health_stats().consecutive_successes(), 1);
+        assert_eq!(server.health_stats().consecutive_failures(), 0);
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_access_reject_with_bad_response_authenticator() {
+        // Access-Reject counts only once authenticated: the same reply signed
+        // under the wrong secret is a failed probe.
+        let (addr, home) = spawn_fake_home(Duration::ZERO, |req| {
+            Some(signed_reply(
+                req,
+                Code::AccessReject,
+                req.identifier,
+                b"not-the-home-secret",
+            ))
+        });
+        let server = home_server_at(addr, HOME_SECRET);
+        probe_expecting_failure(&server).await;
+        home.await.unwrap();
+        assert_eq!(server.health_stats().consecutive_failures(), 1);
+        assert_eq!(server.health_stats().consecutive_successes(), 0);
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_access_challenge() {
+        // RFC 5997 §4.2: Access-Challenge is NOT RECOMMENDED as the reply and
+        // is not accepted, however well it is signed.
+        let (addr, home) = spawn_fake_home(Duration::ZERO, |req| {
+            Some(signed_reply(
+                req,
+                Code::AccessChallenge,
+                req.identifier,
+                HOME_SECRET,
+            ))
+        });
+        let server = home_server_at(addr, HOME_SECRET);
+        probe_expecting_failure(&server).await;
+        home.await.unwrap();
+        assert_eq!(server.health_stats().consecutive_failures(), 1);
+        assert_eq!(server.health_stats().consecutive_successes(), 0);
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_bad_message_authenticator() {
+        // RFC 2869 §5.14 / RFC 3579 §3.2: a reply whose Response Authenticator
+        // verifies but whose Message-Authenticator does not is discarded, so a
+        // peer with a broken MA computation is not marked alive.
+        for code in [Code::AccessAccept, Code::AccountingResponse] {
+            let (addr, home) = spawn_fake_home(Duration::ZERO, move |req| {
+                Some(reply_with_bad_message_authenticator(
+                    req,
+                    code,
+                    req.identifier,
+                    HOME_SECRET,
+                ))
+            });
+            let server = home_server_at(addr, HOME_SECRET);
+            probe_expecting_failure(&server).await;
+            home.await.unwrap();
+            assert_eq!(server.health_stats().consecutive_failures(), 1, "{code:?}");
+            assert_eq!(server.health_stats().consecutive_successes(), 0, "{code:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_reply_without_message_authenticator() {
+        // RFC 5997 §5 lists Message-Authenticator as 0-1 on the reply: a home
+        // server that signs only the Response Authenticator is still alive.
+        let (addr, home) = spawn_fake_home(Duration::ZERO, |req| {
+            let mut reply = Packet::new(Code::AccessAccept, req.identifier, req.authenticator);
+            reply.authenticator =
+                calculate_response_authenticator(&reply, &req.authenticator, HOME_SECRET);
+            Some(reply.encode().unwrap())
+        });
+        let server = home_server_at(addr, HOME_SECRET);
+        probe(&server).await;
+        home.await.unwrap();
+        assert_eq!(server.health_stats().consecutive_successes(), 1);
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_undecodable_reply() {
+        // A datagram from the right address that is not a RADIUS packet at
+        // all (below the 20-octet minimum) is ignored; with nothing else
+        // arriving the probe fails on its deadline, not with a crash and not
+        // with a success.
+        let (addr, home) = spawn_fake_home(Duration::ZERO, |_| Some(vec![0x02, 0x00, 0x00]));
+        let server = home_server_at(addr, HOME_SECRET);
+        probe_expecting_failure(&server).await;
+        home.await.unwrap();
+        assert_eq!(server.health_stats().consecutive_failures(), 1);
+        assert_eq!(server.health_stats().consecutive_successes(), 0);
+    }
+
+    #[tokio::test]
+    async fn stray_datagrams_do_not_fail_a_probe_the_real_reply_answers() {
+        // RFC 5997 §4.4 / RFC 2865 §3: the client discards what does not
+        // verify and keeps waiting. Three bad datagrams from the home server's
+        // own address — garbage, a wrong Identifier, a wrong secret — arrive
+        // before the genuine reply; the probe still succeeds.
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let addr = sock.local_addr().unwrap();
+        let home = tokio::spawn(async move {
+            let sock = UdpSocket::from_std(sock).unwrap();
+            let mut buf = vec![0u8; 4096];
+            let (len, from) = sock.recv_from(&mut buf).await.unwrap();
+            let request = verify_probe(&buf[..len], HOME_SECRET).expect("probe is conformant");
+            let id = request.identifier;
+            sock.send_to(&[0x02, 0x00, 0x00], from).await.unwrap();
+            sock.send_to(
+                &signed_reply(
+                    &request,
+                    Code::AccessAccept,
+                    id.wrapping_add(1),
+                    HOME_SECRET,
+                ),
+                from,
+            )
+            .await
+            .unwrap();
+            sock.send_to(
+                &signed_reply(&request, Code::AccessAccept, id, b"not-the-home-secret"),
+                from,
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            sock.send_to(
+                &signed_reply(&request, Code::AccessAccept, id, HOME_SECRET),
+                from,
+            )
+            .await
+            .unwrap();
+        });
+        let server = home_server_at(addr, HOME_SECRET);
+        probe(&server).await;
+        home.await.unwrap();
+        assert_eq!(server.health_stats().consecutive_successes(), 1);
+        assert_eq!(server.health_stats().consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn same_peer_canonicalises_v4_mapped_sources() {
+        // RFC 4291 §2.5.5.2: what a `[::]` probe socket reports for an IPv4
+        // home server's reply must match the configured IPv4 address.
+        let home: SocketAddr = "10.77.0.10:1812".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:10.77.0.10]:1812".parse().unwrap();
+        assert!(same_peer(home, home));
+        assert!(same_peer(mapped, home));
+        assert!(same_peer(home, mapped));
+        assert!(!same_peer(
+            "[::ffff:10.77.0.11]:1812".parse().unwrap(),
+            home
+        ));
+        assert!(!same_peer("10.77.0.10:1813".parse().unwrap(), home));
+        assert!(!same_peer("[::1]:1812".parse().unwrap(), home));
     }
 }

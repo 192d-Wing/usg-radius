@@ -13,8 +13,8 @@ use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use radius_proto::accounting::{AccountingError, AcctStatusType};
 use radius_proto::attributes::{Attribute, AttributeType};
 use radius_proto::auth::{
-    calculate_accounting_request_authenticator, calculate_response_authenticator,
-    decrypt_user_password,
+    calculate_response_authenticator, decrypt_user_password,
+    verify_accounting_request_authenticator,
 };
 use radius_proto::{
     ChapChallenge, ChapResponse, Code, MppeKeys, Packet, PacketError, ValidationMode,
@@ -44,7 +44,9 @@ fn copy_proxy_state(request: &Packet, response: &mut Packet) {
 }
 
 /// Which listener a request arrived on. Decides which codes are admitted
-/// (RFC 2866 §2) and which code answers Status-Server (RFC 5997 §4.2).
+/// (accounting has its own port, RFC 2866 §2; a code a listener does not serve
+/// is silently discarded, RFC 2865 §3) and which code answers Status-Server
+/// (RFC 5997 §4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PortRole {
     /// UDP authentication socket (`listen_port`).
@@ -56,22 +58,27 @@ pub(crate) enum PortRole {
 }
 
 impl PortRole {
-    /// Whether a packet with `code` belongs on this listener.
-    /// `accounting_on_auth` is
+    /// Whether a packet with `code` belongs on this listener. An allow-list:
+    /// a code not named here is discarded before the duplicate cache, so the
+    /// discard path leaves no state behind. `accounting_on_auth` is
     /// `AccountingPort::accepts_accounting_on_auth_socket()` — true only in
     /// the legacy single-socket (`"shared"`) mode.
     fn admits(self, code: Code, accounting_on_auth: bool) -> bool {
         match (self, code) {
+            // RFC 6614 §2.5: one TLS stream carries every code.
             (PortRole::Any, _) => true,
-            // RFC 2866 §2: accounting has its own port; Code 4 on the
+            // RFC 5997 §2 / §4.2: Status-Server is answered on both UDP ports.
+            (PortRole::Auth | PortRole::Accounting, Code::StatusServer) => true,
+            (PortRole::Auth, Code::AccessRequest) => true,
+            // Accounting has its own port (RFC 2866 §2); Code 4 on the
             // authentication socket is a misconfigured NAS unless "shared".
             (PortRole::Auth, Code::AccountingRequest) => accounting_on_auth,
-            // RFC 2866 §2: nothing but accounting (and Status-Server, RFC 5997
-            // §2) belongs on the accounting port.
-            (PortRole::Accounting, Code::AccessRequest) => false,
-            // Status-Server is accepted everywhere; other codes fall through
-            // to the existing "Unsupported" dispatch arm.
-            _ => true,
+            (PortRole::Accounting, Code::AccountingRequest) => true,
+            // Everything else — Access-Request on the accounting port, response
+            // codes, Status-Client, CoA/Disconnect — is not served on a UDP
+            // listener and is silently discarded (RFC 2865 §3). The dispatch
+            // "Unsupported" arm stays as the backstop for `Any`.
+            _ => false,
         }
     }
 
@@ -85,39 +92,59 @@ impl PortRole {
     }
 }
 
-/// Outcome of checking a request's Message-Authenticator against a secret.
-enum MessageAuthenticatorCheck {
-    /// The request carries no Message-Authenticator attribute.
+/// Outcome of checking a packet's Message-Authenticator against a secret.
+pub(crate) enum MessageAuthenticatorCheck {
+    /// The packet carries no Message-Authenticator attribute.
     Absent,
     /// Present and verified under the secret.
     Valid,
-    /// Present but the HMAC-MD5 does not match (or the value is malformed).
+    /// Present but the HMAC-MD5 does not match, the value is not 16 octets,
+    /// or the packet carries more than one Message-Authenticator.
     Invalid,
 }
 
-/// RFC 2869 §5.14: re-encode `request`, locate the first Message-Authenticator
-/// value (header 20 octets + 2 per attribute header + preceding values) and
-/// verify it with the shared secret. The offset walk uses the decoded
-/// attributes and the canonical re-encoding, so the two always agree.
-fn check_message_authenticator(
-    request: &Packet,
+/// RFC 2869 §5.14: locate the Message-Authenticator in `packet`, re-encode the
+/// packet with `authenticator` in the header and verify the HMAC-MD5 with the
+/// shared secret. `authenticator` is the packet's own Request Authenticator
+/// for a request; for a reply it is the Request Authenticator of the request
+/// being answered (§5.14, also what RFC 3579 §3.2 requires a client to check).
+/// The offset walk (header 20 octets + 2 per attribute header + preceding
+/// values) uses the decoded attributes and the canonical re-encoding, so the
+/// two always agree. A value that is not 16 octets, or a second
+/// Message-Authenticator, is `Invalid` before any HMAC is computed (§5.14:
+/// Length = 18, one attribute).
+pub(crate) fn check_message_authenticator(
+    packet: &Packet,
+    authenticator: &[u8; 16],
     secret: &[u8],
 ) -> Result<MessageAuthenticatorCheck, PacketError> {
     // Packet structure: Code (1) + ID (1) + Length (2) + Authenticator (16) + Attributes
     let mut offset = 20;
     let mut msg_auth_offset = None;
-    for attr in &request.attributes {
+    let mut count = 0usize;
+    for attr in &packet.attributes {
         if attr.attr_type == AttributeType::MessageAuthenticator as u8 {
+            count += 1;
+            if attr.value.len() != 16 {
+                return Ok(MessageAuthenticatorCheck::Invalid);
+            }
             // Attribute structure: Type (1) + Length (1) + Value
-            msg_auth_offset = Some(offset + 2);
-            break;
+            if msg_auth_offset.is_none() {
+                msg_auth_offset = Some(offset + 2);
+            }
         }
         offset += 2 + attr.value.len();
     }
     let Some(offset) = msg_auth_offset else {
         return Ok(MessageAuthenticatorCheck::Absent);
     };
-    let packet_bytes = request.encode()?;
+    if count > 1 {
+        return Ok(MessageAuthenticatorCheck::Invalid);
+    }
+    let mut packet_bytes = packet.encode()?;
+    // `Packet::encode` writes the packet's own Authenticator field; the HMAC
+    // input carries `authenticator` there instead (a no-op for a request).
+    packet_bytes[4..20].copy_from_slice(authenticator);
     if verify_message_authenticator(&packet_bytes, secret, offset) {
         Ok(MessageAuthenticatorCheck::Valid)
     } else {
@@ -1114,8 +1141,9 @@ impl RadiusServer {
             return Err(ServerError::Validation(e.to_string()));
         }
 
-        // RFC 2866 §2: a code that does not belong on this listener is
-        // discarded silently, before the duplicate cache so the discard path
+        // Accounting has its own port (RFC 2866 §2); a code this listener does
+        // not serve is silently discarded (RFC 2865 §3). `admits` is an
+        // allow-list and runs before the duplicate cache, so the discard path
         // leaves no state behind.
         if !role.admits(
             request.code,
@@ -1126,7 +1154,7 @@ impl RadiusServer {
                 request_id = request.identifier,
                 packet_type = ?request.code,
                 port_role = ?role,
-                "Discarded packet: code not accepted on this port (RFC 2866 §2)"
+                "Discarded packet: code not accepted on this port (accounting has its own port, RFC 2866 §2)"
             );
             return Ok(None);
         }
@@ -1352,7 +1380,7 @@ impl RadiusServer {
         // Message-Authenticator. Verify it whenever present, and reject an
         // EAP-bearing request that omits it — otherwise an attacker could strip
         // the attribute to defeat the integrity check.
-        match check_message_authenticator(request, secret)? {
+        match check_message_authenticator(request, &request.authenticator, secret)? {
             MessageAuthenticatorCheck::Valid => {
                 debug!(
                     client_ip = %source_ip,
@@ -1779,14 +1807,10 @@ impl RadiusServer {
 
         // `secret` is provided by the caller (per-client for UDP, "radsec" for RadSec).
 
-        // Validate Request Authenticator (RFC 2866 Section 3)
-        // The Request Authenticator must be MD5(Code + ID + Length + 16 zero octets + Attributes + Secret)
-        // We need to create a copy of the packet with authenticator set to zeros for validation
-        let mut validation_packet = request.clone();
-        validation_packet.authenticator = [0u8; 16];
-        let expected_auth = calculate_accounting_request_authenticator(&validation_packet, secret);
-
-        if request.authenticator != expected_auth {
+        // Validate the Request Authenticator (RFC 2866 §3):
+        // MD5(Code + ID + Length + 16 zero octets + Attributes + Secret),
+        // compared in constant time before any attribute is used.
+        if !verify_accounting_request_authenticator(request, secret) {
             warn!(
                 client_ip = %source_ip,
                 request_id = request.identifier,
@@ -1968,7 +1992,7 @@ impl RadiusServer {
         // server MUST validate it, and a packet failing the check MUST be
         // silently discarded. `secret` is the hop's secret (per-client for
         // UDP, "radsec" for RadSec).
-        match check_message_authenticator(request, secret)? {
+        match check_message_authenticator(request, &request.authenticator, secret)? {
             MessageAuthenticatorCheck::Valid => {}
             MessageAuthenticatorCheck::Absent => {
                 warn!(
@@ -1998,8 +2022,10 @@ impl RadiusServer {
         // RFC 5997 §4.1 / RFC 2865 §5.33: Proxy-State is echoed unmodified.
         copy_proxy_state(request, &mut response);
 
-        // RFC 5997 §4.1: the reply MUST contain a Message-Authenticator. Added
-        // before the Response Authenticator so the latter covers the MA bytes.
+        // A Message-Authenticator is included on every reply (permitted by
+        // RFC 5997 §5, computed per RFC 2869 §5.14 with the Request
+        // Authenticator in the header). Added before the Response
+        // Authenticator so the latter covers the MA bytes.
         add_message_authenticator(&mut response, &request.authenticator, secret)?;
 
         // RFC 2865 §3 / RFC 2866 §3: Response Authenticator over the final
@@ -2634,7 +2660,7 @@ mod tests {
             .unwrap();
         assert!(
             out.is_none(),
-            "RFC 2866 §2: no Access-Request on the accounting port"
+            "accounting has its own port (RFC 2866 §2): no Access-Request on it"
         );
     }
 
@@ -2791,7 +2817,8 @@ mod tests {
         assert_eq!(reply.identifier, 30);
         assert!(verify_response_authenticator(&reply, &request_auth, secret));
 
-        // Same kind of request (new id) → auth socket ⇒ silence (RFC 2866 §2).
+        // Same kind of request (new id) → auth socket ⇒ silence (accounting has
+        // its own port, RFC 2866 §2; Code 4 is not accepted on the other one).
         let (bytes, _) = accounting_start_bytes(31, secret);
         nas.send_to(&bytes, auth_addr).await.unwrap();
         assert!(
@@ -2850,5 +2877,338 @@ mod tests {
         let reply = Packet::decode(&reply).unwrap();
         assert_eq!(reply.code, Code::AccountingResponse);
         assert!(verify_response_authenticator(&reply, &request_auth, secret));
+    }
+
+    // --- QA: malformed Status-Server, reply attribute set, bad accounting
+    //     Request Authenticator, log hygiene ---
+
+    /// A Status-Server with an arbitrary (possibly malformed)
+    /// Message-Authenticator value, random Request Authenticator, and any
+    /// `trailing` attributes after it.
+    fn status_server_with_raw_ma(id: u8, ma: Vec<u8>, trailing: Vec<Attribute>) -> Vec<u8> {
+        let mut p = Packet::new(Code::StatusServer, id, generate_request_authenticator());
+        p.add_attribute(Attribute::new(AttributeType::MessageAuthenticator as u8, ma).unwrap());
+        for a in trailing {
+            p.add_attribute(a);
+        }
+        p.encode().unwrap()
+    }
+
+    fn random_bytes(n: usize) -> Vec<u8> {
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        (0..n).map(|_| rng.random::<u8>()).collect()
+    }
+
+    /// Nothing left the server: a silent discard (`Ok(None)`) or an error,
+    /// which `handle_request` never turns into a datagram either.
+    fn not_answered(out: &Result<Option<Vec<u8>>, ServerError>) -> bool {
+        !matches!(out, Ok(Some(_)))
+    }
+
+    #[tokio::test]
+    async fn status_server_with_wrong_length_message_authenticator_is_never_answered() {
+        let secret = random_secret();
+        let cfg = pipeline_config(AccountingPort::default());
+        let proxy_state = Attribute::new(AttributeType::ProxyState as u8, b"hop".to_vec()).unwrap();
+        let mut id = 50u8;
+        // RFC 2869 §5.14 fixes the value at 16 octets. The codec admits any
+        // 0..=253-octet value and the validator has no rule for it, so the
+        // handler is the only thing standing between a short or long value
+        // (with or without a following attribute whose bytes a naive 16-octet
+        // read would run into) and a reply.
+        for len in [0usize, 1, 15, 17, 32] {
+            for trailing in [vec![], vec![proxy_state.clone()]] {
+                for role in [PortRole::Auth, PortRole::Accounting, PortRole::Any] {
+                    id = id.wrapping_add(1);
+                    let bytes = status_server_with_raw_ma(id, random_bytes(len), trailing.clone());
+                    assert!(
+                        Packet::decode(&bytes).is_ok(),
+                        "codec admits a {len}-octet MA"
+                    );
+                    let out = process_as(&bytes, &secret, role, &cfg).await;
+                    assert!(
+                        not_answered(&out),
+                        "{len}-octet Message-Authenticator with {} trailing attribute(s) on {role:?} was answered: {out:?}",
+                        trailing.len()
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn status_server_with_two_message_authenticators_is_discarded() {
+        let secret = random_secret();
+        let cfg = pipeline_config(AccountingPort::default());
+        let zeroed_ma =
+            || Attribute::new(AttributeType::MessageAuthenticator as u8, vec![0u8; 16]).unwrap();
+
+        // Two zeroed Message-Authenticators.
+        let bytes = status_server_with_raw_ma(60, vec![0u8; 16], vec![zeroed_ma()]);
+        let out = process_as(&bytes, &secret, PortRole::Auth, &cfg).await;
+        assert!(matches!(out, Ok(None)), "{out:?}");
+
+        // First zeroed, second carrying the HMAC over the packet with both
+        // values zeroed. The server verifies the first attribute (RFC 2869
+        // §5.14 allows exactly one), so the HMAC it computes covers the
+        // second's non-zero bytes and cannot match the zeroed first value.
+        let mut bytes = status_server_with_raw_ma(61, vec![0u8; 16], vec![zeroed_ma()]);
+        let ma = calculate_message_authenticator(&bytes, &secret);
+        let len = bytes.len();
+        bytes[len - 16..].copy_from_slice(&ma);
+        for role in [PortRole::Auth, PortRole::Accounting, PortRole::Any] {
+            bytes[1] = bytes[1].wrapping_add(1); // fresh Identifier, same bytes otherwise
+            let out = process_as(&bytes, &secret, role, &cfg).await;
+            assert!(matches!(out, Ok(None)), "{role:?}: {out:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_status_server_is_never_answered() {
+        let secret = random_secret();
+        let cfg = pipeline_config(AccountingPort::default());
+        let (full, request_auth) = signed_status_server_bytes(70, &secret, vec![]);
+        assert_eq!(
+            full.len(),
+            38,
+            "20-octet header + 18-octet Message-Authenticator"
+        );
+
+        // Every proper prefix: below the 20-octet minimum, or shorter than the
+        // Length field says. All are decode errors, none is answered.
+        for cut in [0usize, 1, 4, 19, 20, 21, 22, 36, 37] {
+            let out = process_as(&full[..cut], &secret, PortRole::Auth, &cfg).await;
+            assert!(
+                out.is_err(),
+                "{cut}-octet prefix was not a decode error: {out:?}"
+            );
+        }
+
+        // Length field patched to 20 (a header-only Status-Server with the
+        // Message-Authenticator bytes left as trailing padding, RFC 2865 §3):
+        // decodes with no attributes → RFC 5997 §4.1 discard, not a reply.
+        let mut header_only = full.clone();
+        header_only[1] = 71;
+        header_only[2..4].copy_from_slice(&20u16.to_be_bytes());
+        let out = process_as(&header_only, &secret, PortRole::Auth, &cfg).await;
+        assert!(matches!(out, Ok(None)), "{out:?}");
+
+        // Length field larger than the datagram.
+        let mut overlong = full.clone();
+        overlong[1] = 72;
+        overlong[2..4].copy_from_slice(&40u16.to_be_bytes());
+        let out = process_as(&overlong, &secret, PortRole::Auth, &cfg).await;
+        assert!(out.is_err(), "{out:?}");
+
+        // Length field cutting through the Message-Authenticator attribute.
+        let mut mid_attribute = full.clone();
+        mid_attribute[1] = 73;
+        mid_attribute[2..4].copy_from_slice(&30u16.to_be_bytes());
+        let out = process_as(&mid_attribute, &secret, PortRole::Accounting, &cfg).await;
+        assert!(not_answered(&out), "{out:?}");
+
+        // Control: the intact datagram is answered, so the silences above are
+        // the server refusing, not the pipeline being broken.
+        let out = process_as(&full, &secret, PortRole::Auth, &cfg)
+            .await
+            .unwrap()
+            .expect("intact Status-Server answered");
+        assert_status_reply(&out, Code::AccessAccept, 70, &request_auth, &secret);
+    }
+
+    #[tokio::test]
+    async fn status_server_reply_carries_only_message_authenticator_and_proxy_state() {
+        let secret = random_secret();
+        let cfg = pipeline_config(AccountingPort::default());
+        let proxy_state =
+            Attribute::new(AttributeType::ProxyState as u8, b"hop-one".to_vec()).unwrap();
+        let nas_id = Attribute::string(AttributeType::NasIdentifier as u8, "probe-nas").unwrap();
+        let mut id = 80u8;
+        for (role, code) in [
+            (PortRole::Auth, Code::AccessAccept),
+            (PortRole::Accounting, Code::AccountingResponse),
+            (PortRole::Any, Code::AccessAccept),
+        ] {
+            for extra in [
+                vec![],
+                vec![proxy_state.clone()],
+                vec![nas_id.clone(), proxy_state.clone()],
+            ] {
+                id += 1;
+                let (bytes, request_auth) = signed_status_server_bytes(id, &secret, extra.clone());
+                let out = process_as(&bytes, &secret, role, &cfg)
+                    .await
+                    .unwrap()
+                    .expect("valid Status-Server answered");
+                let reply = assert_status_reply(&out, code, id, &request_auth, &secret);
+                let count = |t: AttributeType| {
+                    reply
+                        .attributes
+                        .iter()
+                        .filter(|a| a.attr_type == t as u8)
+                        .count()
+                };
+                let expected_proxy_state = count_of(&extra, AttributeType::ProxyState);
+                assert_eq!(count(AttributeType::MessageAuthenticator), 1);
+                assert_eq!(count(AttributeType::ProxyState), expected_proxy_state);
+                assert_eq!(
+                    reply.attributes.len(),
+                    1 + expected_proxy_state,
+                    "{role:?}: reply carries only Message-Authenticator and echoed Proxy-State, got types {:?}",
+                    reply
+                        .attributes
+                        .iter()
+                        .map(|a| a.attr_type)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    fn count_of(attrs: &[Attribute], t: AttributeType) -> usize {
+        attrs.iter().filter(|a| a.attr_type == t as u8).count()
+    }
+
+    #[tokio::test]
+    async fn accounting_request_with_bad_request_authenticator_is_not_answered() {
+        let secret = random_secret();
+        let cfg = pipeline_config(AccountingPort::default());
+
+        // RFC 2866 §3: signed under another client's secret.
+        let (bytes, _) = accounting_start_bytes(90, &random_secret());
+        let out = process_as(&bytes, &secret, PortRole::Accounting, &cfg).await;
+        assert!(not_answered(&out), "{out:?}");
+        // Zero Request Authenticator.
+        let (mut bytes, _) = accounting_start_bytes(91, &secret);
+        bytes[4..20].fill(0);
+        let out = process_as(&bytes, &secret, PortRole::Accounting, &cfg).await;
+        assert!(not_answered(&out), "{out:?}");
+        // One flipped bit in an otherwise correct authenticator, on both roles
+        // that carry accounting.
+        let (mut bytes, _) = accounting_start_bytes(92, &secret);
+        bytes[4] ^= 0x80;
+        let out = process_as(&bytes, &secret, PortRole::Accounting, &cfg).await;
+        assert!(not_answered(&out), "{out:?}");
+        bytes[1] = 93;
+        let out = process_as(&bytes, &secret, PortRole::Any, &cfg).await;
+        assert!(not_answered(&out), "{out:?}");
+
+        // On the wire: the dedicated accounting socket stays silent for a bad
+        // Request Authenticator, then answers a good one (so the silence is a
+        // refusal, not a dead server).
+        let server = dual_socket_server(dual_socket_config(AccountingPort::Dedicated(0))).await;
+        let acct_addr = server.accounting_local_addr().unwrap().unwrap();
+        tokio::spawn(async move { server.run().await });
+        let nas = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (bad, _) = accounting_start_bytes(94, b"not-the-nas-secret");
+        nas.send_to(&bad, acct_addr).await.unwrap();
+        assert!(
+            recv_reply(&nas, Duration::from_millis(500)).await.is_none(),
+            "RFC 2866 §3: an Accounting-Request with a bad Request Authenticator is not answered"
+        );
+        let (good, request_auth) = accounting_start_bytes(95, b"nas-secret");
+        nas.send_to(&good, acct_addr).await.unwrap();
+        let (reply, from) = recv_reply(&nas, Duration::from_secs(5))
+            .await
+            .expect("control: a correctly signed Accounting-Request is answered");
+        assert_eq!(from, acct_addr);
+        let reply = Packet::decode(&reply).unwrap();
+        assert_eq!(reply.code, Code::AccountingResponse);
+        assert_eq!(reply.identifier, 95);
+        assert!(verify_response_authenticator(
+            &reply,
+            &request_auth,
+            b"nas-secret"
+        ));
+    }
+
+    /// `io::Write` into a shared buffer, for capturing tracing output.
+    struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn discard_paths_do_not_log_the_secret() {
+        let secret = b"qa-log-hygiene-secret-7f3a9c".to_vec();
+        let secret_hex = hex::encode(&secret);
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer_sink = Arc::clone(&sink);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || LogSink(Arc::clone(&writer_sink)))
+            .finish();
+        // `#[tokio::test]` runs on the current thread, so the thread-local
+        // default subscriber sees every event the pipeline emits below.
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // tracing-core caches per-callsite interest. With exactly one
+        // registered `Dispatch` it computes that interest from whichever
+        // dispatcher is current on the thread that first hits the callsite —
+        // a sibling test thread with no subscriber caches `never`, and this
+        // thread then drops the event too. A second live `Dispatch` makes the
+        // registry consult every registered dispatcher instead; the rebuild
+        // refreshes callsites that were cached before either existed.
+        let _second_dispatch = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .finish(),
+        );
+        tracing::callsite::rebuild_interest_cache();
+
+        let cfg = pipeline_config(AccountingPort::default());
+        // Each new discard path once, plus the pre-existing accounting
+        // Request Authenticator rejection and one answered Status-Server.
+        let no_ma = Packet::new(Code::StatusServer, 100, generate_request_authenticator())
+            .encode()
+            .unwrap();
+        let _ = process_as(&no_ma, &secret, PortRole::Auth, &cfg).await;
+        let (wrong_secret, _) = signed_status_server_bytes(101, b"some-other-secret", vec![]);
+        let _ = process_as(&wrong_secret, &secret, PortRole::Accounting, &cfg).await;
+        let (acct_on_auth, _) = accounting_start_bytes(102, &secret);
+        let _ = process_as(&acct_on_auth, &secret, PortRole::Auth, &cfg).await;
+        let (bad_ra, _) = accounting_start_bytes(103, b"some-other-secret");
+        let _ = process_as(&bad_ra, &secret, PortRole::Accounting, &cfg).await;
+        let access_on_acct = access_request_bytes(vec![
+            Attribute::string(AttributeType::UserName as u8, "nobody").unwrap(),
+            Attribute::new(AttributeType::UserPassword as u8, vec![0u8; 16]).unwrap(),
+        ]);
+        let _ = process_as(&access_on_acct, &secret, PortRole::Accounting, &cfg).await;
+        let (answered, _) = signed_status_server_bytes(104, &secret, vec![]);
+        let _ = process_as(&answered, &secret, PortRole::Auth, &cfg).await;
+
+        let log = String::from_utf8_lossy(&sink.lock().unwrap()).into_owned();
+        for expected in [
+            "Discarded Status-Server without Message-Authenticator",
+            "Discarded Status-Server with invalid Message-Authenticator",
+            "code not accepted on this port",
+            "Invalid Request Authenticator in Accounting-Request",
+            "Status-Server request received",
+        ] {
+            assert!(
+                log.contains(expected),
+                "capture missed the {expected:?} line; captured:\n{log}"
+            );
+        }
+        assert!(
+            !log.contains("qa-log-hygiene-secret"),
+            "shared secret leaked into the log:\n{log}"
+        );
+        assert!(
+            !log.to_lowercase().contains(&secret_hex),
+            "shared secret (hex) leaked into the log:\n{log}"
+        );
+        assert!(
+            !log.contains("some-other-secret"),
+            "a foreign secret leaked into the log:\n{log}"
+        );
     }
 }

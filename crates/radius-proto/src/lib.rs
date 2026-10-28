@@ -57,7 +57,7 @@ pub use attributes::{Attribute, AttributeType, VendorSpecific};
 pub use auth::{
     calculate_accounting_request_authenticator, calculate_response_authenticator,
     decrypt_user_password, encrypt_user_password, generate_request_authenticator,
-    verify_response_authenticator,
+    verify_accounting_request_authenticator, verify_response_authenticator,
 };
 pub use chap::{
     ChapChallenge, ChapError, ChapResponse, compute_chap_response, verify_chap_response,
