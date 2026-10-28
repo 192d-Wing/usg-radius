@@ -347,7 +347,7 @@ Burst capacity for global rate limiting.
 ## EAP Settings
 
 The optional `eap` object enables EAP-TLS (RFC 5216) and/or EAP-TEAP
-(RFC 7170) and bounds the server's per-conversation EAP state. It needs a
+(RFC 9930) and bounds the server's per-conversation EAP state. It needs a
 binary built with the `tls` cargo feature (the release binary and the
 container image are); a binary built without it refuses a configuration that
 has an `eap` block. `examples/configs/eap-tls-revocation.json` shows the
@@ -373,6 +373,11 @@ store for TEAP's inner Basic-Password-Auth.
         "on_error": "fail_closed",
         "crl": { "static_files": ["/etc/radius/eap/supplicant-ca.crl"] }
       }
+    },
+    "teap_tls": {
+      "cert_path": "/etc/radius/eap/server.pem",
+      "key_path": "/etc/radius/eap/server.key",
+      "require_client_cert": false
     }
   }
 }
@@ -380,8 +385,8 @@ store for TEAP's inner Basic-Password-Auth.
 
 ### eap.tls
 
-TLS material shared by EAP-TLS and EAP-TEAP (Phase 1). Required when the
-`eap` block is present.
+TLS material for EAP-TLS, and for the EAP-TEAP tunnel (Phase 1) when
+`eap.teap_tls` is absent. Required when the `eap` block is present.
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
@@ -392,6 +397,16 @@ TLS material shared by EAP-TLS and EAP-TEAP (Phase 1). Required when the
 | `revocation` | Object | none | CRL/OCSP checking of supplicant certificates; requires `require_client_cert: true` and `ca_path`, and a binary built with the `revocation` feature. Fields as in `examples/configs/eap-tls-revocation.json` |
 
 The TLS stack is rustls with aws-lc-rs: TLS 1.2 and 1.3, no DTLS.
+
+### eap.teap_tls
+
+Optional TLS material for the EAP-TEAP tunnel, with the same keys as
+`eap.tls`. Use it when EAP-TLS must require (and revocation-check) supplicant
+certificates while TEAP authenticates the tunnel with the server certificate
+only and the user with a password inside it; `require_client_cert: false`
+makes the tunnel server-authenticated. Omitted, TEAP shares `eap.tls`,
+including its `require_client_cert`. The same validation applies (a
+`revocation` block needs `require_client_cert: true` and `ca_path`).
 
 ### eap.enable_tls
 
@@ -407,20 +422,22 @@ Offer EAP-TEAP (EAP Type 55).
 - **Type**: Boolean
 - **Default**: `false`
 
-When both methods are enabled the server proposes TEAP first and does not
-yet honour an EAP-Nak asking for EAP-TLS instead, so an EAP-TLS-only
-population should leave `enable_teap` off. TEAP's wire format is not
-yet interoperable with wpa_supplicant (see
-[RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md#rfc-7170---tunnel-eap-teap)).
+When both methods are enabled the server proposes TEAP first; a supplicant
+configured for EAP-TLS answers with an EAP-Nak listing Type 13 and is switched
+to EAP-TLS (RFC 3748 §5.3.1), once per conversation. TEAP with
+Basic-Password-Auth interoperates with wpa_supplicant 2.12 (see
+[RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md#rfc-9930---tunnel-eap-teap-version-1-obsoletes-rfc-7170));
+supplicants must validate the server certificate (`ca_cert` / `domain_match`),
+since the password is protected by the tunnel alone.
 
 !!! warning "EAP-TEAP is opt-in"
-    TEAP's only inner method is Basic-Password-Auth, which compares the
-    password the supplicant sends inside the TLS tunnel against the
-    password stored for that user in `users`. A user without a stored
-    password (unknown user, or a backend that does not supply cleartext
-    passwords) is always rejected; an empty stored or supplied password is
-    always rejected. Enable TEAP only for supplicants you have tested
-    against this server.
+    `enable_teap` defaults to `false`. TEAP's only inner method is
+    Basic-Password-Auth, which compares the password the supplicant sends
+    inside the TLS tunnel against the password stored for that user in
+    `users`. A user without a stored password (unknown user, or a backend
+    that does not supply cleartext passwords, such as PostgreSQL or LDAP) is
+    always rejected; an empty stored or supplied password is always rejected.
+    Enable TEAP only where the in-memory `users` list is the credential store.
 
 ### eap.session_idle_timeout_secs
 

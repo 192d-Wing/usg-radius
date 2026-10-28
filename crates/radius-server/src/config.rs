@@ -302,18 +302,26 @@ pub struct MgmtTlsConfig {
 /// EAP configuration block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EapConfig {
-    /// TLS certificate configuration shared by EAP-TLS and EAP-TEAP.
+    /// TLS certificate configuration for EAP-TLS, and for the EAP-TEAP
+    /// tunnel unless `teap_tls` is set.
     pub tls: EapTlsConfig,
+    /// TLS configuration of the EAP-TEAP Phase 1 tunnel (RFC 9930 §3.2) when
+    /// it differs from `tls`: typically the same certificate without
+    /// `require_client_cert`, so that TEAP peers authenticate with the inner
+    /// Basic-Password-Auth method instead of a client certificate. Omitted ⇒
+    /// TEAP uses `tls`.
+    #[serde(default)]
+    pub teap_tls: Option<EapTlsConfig>,
     /// Enable EAP-TLS (Type 13). Default: false.
     #[serde(default)]
     pub enable_tls: bool,
-    /// Enable EAP-TEAP (Type 55, RFC 7170). Default: false.
+    /// Enable EAP-TEAP (Type 55, RFC 9930). Default: false.
     ///
     /// Off by default: TEAP's only inner method is Basic-Password-Auth, which
-    /// needs the inner handler to supply the user's password (the in-memory
-    /// `users` list does; a user without one always fails), and the TEAP wire
-    /// format is not yet interoperable with wpa_supplicant. When enabled, TEAP
-    /// is offered before EAP-TLS.
+    /// needs the inner handler to supply the user's cleartext password (the
+    /// in-memory `users` list does; a user without one always fails). When
+    /// enabled, TEAP is offered before EAP-TLS; EAP-TLS supplicants switch
+    /// with an EAP-Nak.
     #[serde(default)]
     pub enable_teap: bool,
     /// Seconds an EAP conversation may sit without a packet from the peer
@@ -770,17 +778,21 @@ impl Config {
         }
 
         // Revocation checking is only meaningful for verified client certificates.
-        if let Some(eap) = &self.eap
-            && let Some(rev) = &eap.tls.revocation
-        {
-            if !eap.tls.require_client_cert || eap.tls.ca_path.is_none() {
-                return Err(ConfigError::Invalid(
-                    "eap.tls.revocation requires eap.tls.require_client_cert = true and \
-                     eap.tls.ca_path (there is no client certificate to check otherwise)"
-                        .to_string(),
-                ));
+        if let Some(eap) = &self.eap {
+            let blocks = [("eap.tls", &eap.tls)]
+                .into_iter()
+                .chain(eap.teap_tls.as_ref().map(|t| ("eap.teap_tls", t)));
+            for (at, tls) in blocks {
+                if let Some(rev) = &tls.revocation {
+                    if !tls.require_client_cert || tls.ca_path.is_none() {
+                        return Err(ConfigError::Invalid(format!(
+                            "{at}.revocation requires {at}.require_client_cert = true and \
+                             {at}.ca_path (there is no client certificate to check otherwise)"
+                        )));
+                    }
+                    rev.validate(&format!("{at}.revocation"))?;
+                }
             }
-            rev.validate("eap.tls.revocation")?;
         }
         if let Some(radsec) = &self.radsec
             && let Some(rev) = &radsec.revocation

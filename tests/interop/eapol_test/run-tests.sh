@@ -34,9 +34,10 @@ wait_ready() { # wait_ready <name> <ip> <secret>
     echo "ERROR: $1 ($2) did not answer Status-Server within 30 s"; return 1
 }
 
-# Lines worth keeping from an eapol_test run: outcome, TLS version, key material.
+# Lines worth keeping from an eapol_test run: outcome, TLS version, key material,
+# and for TEAP the version, Compound MAC algorithm and Phase 2 outcome.
 summarize_eapol() {
-    grep -E '^(SUCCESS|FAILURE)$|MPPE keys OK|Using TLS version|EAP: Status notification|EAP-Key-Name|PMK mismatch|MS-MPPE-(Send|Recv)-Key|EAP-TLS: Derived key|PMK from (EAPOL|AS)|RADIUS message: code=' "$1" |
+    grep -E '^(SUCCESS|FAILURE)$|MPPE keys OK|Using TLS version|EAP: Status notification|EAP-Key-Name|PMK mismatch|MS-MPPE-(Send|Recv)-Key|EAP-TLS: Derived key|PMK from (EAPOL|AS)|RADIUS message: code=|EAP-TEAP: (Using TEAP version|TLS cipher suite|MAC algorithm|Crypto-Binding TLV: Version|Authentication completed|Server rejected|Result:|Intermediate Result:|No username|.*did not match|Invalid)' "$1" |
         sed 's/^/    /'
 }
 
@@ -165,6 +166,69 @@ check "eapol_test exit status 0 (rc=$rc)" test "$rc" -eq 0
 check "eapol_test printed SUCCESS (fragment ACKs relayed by the proxy)" grep -qx 'SUCCESS' "$LOG"
 check "MS-MPPE keys re-keyed by the proxy match the supplicant MSK" \
     grep -q 'MPPE keys OK: 1  mismatch: 0' "$LOG"
+
+# ---------------------------------------------------------------------------
+section "10. EAP-TEAP (RFC 9930): eapol_test -> usg-radius home server (TLS 1.3, Basic-Password-Auth, SHA-384)"
+LOG=$LOGDIR/eap-teap-usg-home.log
+eapol_test -c /etc/eapol_test/eap-teap-usg.conf -a "$USG_HOME" -p 1812 \
+    -s "$NAS_USGHOME_SECRET" -r 0 -t 15 >"$LOG" 2>&1
+rc=$?
+summarize_eapol "$LOG"
+check "eapol_test exit status 0 (rc=$rc)" test "$rc" -eq 0
+check "eapol_test printed SUCCESS" grep -qx 'SUCCESS' "$LOG"
+check "TLS 1.3 negotiated for the TEAP tunnel" grep -q 'Using TLS version TLSv1.3' "$LOG"
+check "TEAP version 1 negotiated (RFC 9930 3.1)" grep -q 'EAP-TEAP: Using TEAP version 1' "$LOG"
+check "server Crypto-Binding TLV accepted: Version 1, Received Version 1, Flags 2 (MSK), Sub-Type 0 (RFC 9930 4.2.13)" \
+    grep -q 'EAP-TEAP: Crypto-Binding TLV: Version 1 Received Version 1 Flags 2 Sub-Type 0' "$LOG"
+check "Compound MAC computed with HMAC-SHA384 for TLS_AES_256_GCM_SHA384 (RFC 9930 6.3)" \
+    grep -q 'EAP-TEAP: MAC algorithm: HMAC-SHA384' "$LOG"
+check "no Compound MAC mismatch" sh -c "! grep -q 'Compound MAC did not match' '$LOG'"
+check "peer completed Phase 2 (Result and Intermediate-Result Success after a verified Crypto-Binding)" \
+    grep -q 'EAP-TEAP: Authentication completed successfully' "$LOG"
+check "EAP-Success received" grep -q 'EAP: Status notification: completion (param=success)' "$LOG"
+check "MS-MPPE keys from usg-radius match the supplicant TEAP MSK (RFC 9930 6.4, S-IMCK[1] from the zero IMSK)" \
+    grep -q 'MPPE keys OK: 1  mismatch: 0' "$LOG"
+
+# ---------------------------------------------------------------------------
+section "11. EAP-TEAP: eapol_test -> usg-radius proxy -> usg-radius home server"
+LOG=$LOGDIR/eap-teap-via-proxy.log
+eapol_test -c /etc/eapol_test/eap-teap-usg.conf -a "$PROXY" -p 1812 \
+    -s "$NAS_PROXY_SECRET" -r 0 -t 15 >"$LOG" 2>&1
+rc=$?
+summarize_eapol "$LOG"
+check "eapol_test exit status 0 (rc=$rc)" test "$rc" -eq 0
+check "eapol_test printed SUCCESS" grep -qx 'SUCCESS' "$LOG"
+check "peer completed Phase 2 through the proxy" grep -q 'EAP-TEAP: Authentication completed successfully' "$LOG"
+check "MS-MPPE keys re-keyed by the proxy match the supplicant TEAP MSK" \
+    grep -q 'MPPE keys OK: 1  mismatch: 0' "$LOG"
+
+# ---------------------------------------------------------------------------
+section "12. EAP-TEAP: TLS 1.2 with AES-128-GCM-SHA256 -> usg-radius home server (SHA-256 key schedule)"
+LOG=$LOGDIR/eap-teap-tls12-usg-home.log
+eapol_test -c /etc/eapol_test/eap-teap-usg-tls12.conf -a "$USG_HOME" -p 1812 \
+    -s "$NAS_USGHOME_SECRET" -r 0 -t 15 >"$LOG" 2>&1
+rc=$?
+summarize_eapol "$LOG"
+check "eapol_test exit status 0 (rc=$rc)" test "$rc" -eq 0
+check "eapol_test printed SUCCESS" grep -qx 'SUCCESS' "$LOG"
+check "TLS 1.2 negotiated for the TEAP tunnel" grep -q 'Using TLS version TLSv1.2' "$LOG"
+check "Compound MAC computed with HMAC-SHA256 for an AES-128-GCM-SHA256 suite (RFC 9930 6.3)" \
+    grep -q 'EAP-TEAP: MAC algorithm: HMAC-SHA256' "$LOG"
+check "MS-MPPE keys match the supplicant TEAP MSK (SHA-256 TLS-PRF)" \
+    grep -q 'MPPE keys OK: 1  mismatch: 0' "$LOG"
+
+# ---------------------------------------------------------------------------
+section "13. EAP-TEAP: wrong password -> usg-radius home server (protected failure, RFC 9930 3.6.6)"
+LOG=$LOGDIR/eap-teap-badpass-usg-home.log
+eapol_test -c /etc/eapol_test/eap-teap-usg-badpass.conf -a "$USG_HOME" -p 1812 \
+    -s "$NAS_USGHOME_SECRET" -r 0 -t 15 >"$LOG" 2>&1
+rc=$?
+summarize_eapol "$LOG"
+check "eapol_test exit status non-zero (rc=$rc)" test "$rc" -ne 0
+check "eapol_test printed FAILURE, not SUCCESS" sh -c "grep -qx 'FAILURE' '$LOG' && ! grep -qx 'SUCCESS' '$LOG'"
+check "peer saw the server's Result TLV (Failure) inside the tunnel" grep -q 'EAP-TEAP: Server rejected authentication' "$LOG"
+check "EAP-Failure received (rejected, not timed out)" grep -q 'EAP: Status notification: completion (param=failure)' "$LOG"
+check "no key material was emitted" sh -c "! grep -q 'MS-MPPE-' '$LOG'"
 
 # ---------------------------------------------------------------------------
 section "result"
