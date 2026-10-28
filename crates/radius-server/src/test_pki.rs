@@ -299,6 +299,60 @@ pub(crate) async fn spawn_fake_tls_home_with_provider(
     addr
 }
 
+/// A RadSec home server that completes the mTLS handshake and then never
+/// reads again, keeping the TCP connection open (no FIN, no RST): a wedged
+/// peer as the link's writer sees it. Its sockets get a small receive buffer
+/// so the kernel stops accepting our bytes after a handful of frames rather
+/// than after megabytes.
+pub(crate) async fn spawn_fake_tls_home_that_never_reads(chain: &TestChain) -> SocketAddr {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::server::WebPkiClientVerifier;
+    use tokio::net::TcpSocket;
+
+    let provider = Arc::new(usg_fips_tls::provider::fips_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(chain.ca_der.clone()).unwrap();
+    let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+        .build()
+        .unwrap();
+    let certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(chain.server_cert_pem.as_bytes())
+            .collect::<Result<_, _>>()
+            .unwrap();
+    let key = PrivateKeyDer::from_pem_slice(chain.server_key_pem.as_bytes()).unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&TLS13])
+        .unwrap()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+
+    // Accepted sockets inherit the listener's receive buffer size.
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(16).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                // Hold the connection open and never read from it.
+                let _deaf = tls;
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    addr
+}
+
 /// [`spawn_fake_tls_home_with_provider`] with the project's ML-KEM-1024-only
 /// FIPS provider — what a conformant usg-radius / FreeRADIUS peer offers.
 pub(crate) async fn spawn_fake_tls_home(

@@ -855,6 +855,7 @@ impl RadiusServer {
                 }
                 let params = LinkParams {
                     connect_timeout: server.timeout,
+                    write_timeout: server.timeout,
                     ..LinkParams::default()
                 };
                 let handle =
@@ -1108,12 +1109,16 @@ impl RadiusServer {
         while let Some(LinkResponse {
             home_server,
             packet,
+            generation,
         }) = responses.recv().await
         {
             let handler = Arc::clone(&proxy_handler);
             tokio::spawn(async move {
                 let name = home_server.name.clone();
-                if let Err(e) = handler.handle_link_response(packet, home_server).await {
+                if let Err(e) = handler
+                    .handle_link_response(packet, home_server, generation)
+                    .await
+                {
                     debug!(
                         "Error handling proxy response from RadSec link {}: {}",
                         name, e

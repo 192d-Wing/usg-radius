@@ -234,13 +234,23 @@ impl ProxyHandler {
     /// [`ProxyHandler::handle_response`]; the response is attributed to the
     /// link's home server by `Arc` identity instead of by source address,
     /// because the TLS peer — not an IP:port — is what authenticated it.
+    /// `generation` is the link connection the frame was read on
+    /// (`LinkResponse::generation`): a Response Authenticator failure closes
+    /// that connection and not a successor (RFC 6613 §2.6.4).
     pub async fn handle_link_response(
         &self,
         response: Packet,
         home_server: Arc<HomeServer>,
+        generation: u64,
     ) -> ProxyResult<()> {
-        self.handle_response_from(response, ResponseOrigin::Link(home_server))
-            .await
+        self.handle_response_from(
+            response,
+            ResponseOrigin::Link {
+                home_server,
+                generation,
+            },
+        )
+        .await
     }
 
     /// Shared body of the two `handle_*_response` entry points.
@@ -278,7 +288,9 @@ impl ProxyHandler {
                 entry.home_server.transport() == HomeServerTransport::Udp
                     && *addr == entry.home_server.address
             }
-            ResponseOrigin::Link(home_server) => Arc::ptr_eq(home_server, &entry.home_server),
+            ResponseOrigin::Link { home_server, .. } => {
+                Arc::ptr_eq(home_server, &entry.home_server)
+            }
         };
         if !from_expected {
             warn!(
@@ -308,13 +320,21 @@ impl ProxyHandler {
                 "Response authenticator from home server is invalid; dropping response"
             );
             // RFC 6613 §2.6.4: on a TCP connection a failed Response
-            // Authenticator MUST close the connection. The entry stays; the
-            // retry manager resends it on the next connection.
+            // Authenticator MUST close the connection — the one the frame was
+            // read on; if the link has moved on since, the reset is dropped.
+            // The entry stays; the retry manager resends it on the next
+            // connection.
             #[cfg(feature = "tls")]
-            if let ResponseOrigin::Link(home_server) = &origin
+            if let ResponseOrigin::Link {
+                home_server,
+                generation,
+            } = &origin
                 && let Some(link) = home_server.link()
             {
-                link.reset("response failed the Response Authenticator check (RFC 6613 §2.6.4)");
+                link.reset(
+                    *generation,
+                    "response failed the Response Authenticator check (RFC 6613 §2.6.4)",
+                );
             }
             return Err(ProxyError::InvalidResponseAuthenticator);
         }
@@ -370,15 +390,26 @@ impl ProxyHandler {
 enum ResponseOrigin {
     /// A datagram on the shared UDP socket, from this address.
     Udp(SocketAddr),
-    /// A frame on this home server's RadSec link.
-    Link(Arc<HomeServer>),
+    /// A frame on this home server's RadSec link, read on connection
+    /// `generation` (`RadsecLinkHandle::connections()` at the time).
+    Link {
+        home_server: Arc<HomeServer>,
+        generation: u64,
+    },
 }
 
 impl std::fmt::Display for ResponseOrigin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Udp(addr) => write!(f, "udp {addr}"),
-            Self::Link(hs) => write!(f, "radsec link {}", hs.name),
+            Self::Link {
+                home_server,
+                generation,
+            } => write!(
+                f,
+                "radsec link {} (connection {generation})",
+                home_server.name
+            ),
         }
     }
 }
@@ -1758,7 +1789,7 @@ mod tests {
         cache.insert(entry).unwrap();
 
         let err = handler
-            .handle_link_response(home_access_accept_with_keys(), same_address_other_server)
+            .handle_link_response(home_access_accept_with_keys(), same_address_other_server, 1)
             .await
             .unwrap_err();
         assert!(matches!(err, ProxyError::CorrelationFailed), "{err}");
@@ -1779,7 +1810,7 @@ mod tests {
         cache.insert(entry).unwrap();
 
         handler
-            .handle_link_response(home_access_accept_with_keys(), home_server)
+            .handle_link_response(home_access_accept_with_keys(), home_server, 1)
             .await
             .unwrap();
 
@@ -1975,7 +2006,7 @@ mod tests {
             let response =
                 home_response_under_radsec(Packet::new(Code::AccessAccept, 7, [0u8; 16]));
             let err = handler
-                .handle_link_response(response, impostor)
+                .handle_link_response(response, impostor, 1)
                 .await
                 .unwrap_err();
             assert!(matches!(err, ProxyError::CorrelationFailed), "{err}");
@@ -2037,7 +2068,7 @@ mod tests {
             response.authenticator =
                 calculate_response_authenticator(&response, &REQUEST_AUTH, RADSEC_SECRET);
             let err = handler
-                .handle_link_response(response, Arc::clone(&hs))
+                .handle_link_response(response, Arc::clone(&hs), 1)
                 .await
                 .unwrap_err();
             assert!(matches!(err, ProxyError::CorrelationFailed), "{err}");
@@ -2048,7 +2079,7 @@ mod tests {
             response.authenticator =
                 calculate_response_authenticator(&response, &REQUEST_AUTH, RADSEC_SECRET);
             let err = handler
-                .handle_link_response(response, Arc::clone(&hs))
+                .handle_link_response(response, Arc::clone(&hs), 1)
                 .await
                 .unwrap_err();
             assert!(matches!(err, ProxyError::CorrelationFailed), "{err}");
@@ -2061,7 +2092,7 @@ mod tests {
             response.authenticator =
                 calculate_response_authenticator(&response, &REQUEST_AUTH, RADSEC_SECRET);
             let err = handler
-                .handle_link_response(response, Arc::clone(&hs))
+                .handle_link_response(response, Arc::clone(&hs), 1)
                 .await
                 .unwrap_err();
             assert!(matches!(err, ProxyError::CorrelationFailed), "{err}");
@@ -2131,10 +2162,11 @@ mod tests {
             entry.sent_on_connection = Some(1);
             cache.insert(entry).unwrap();
 
-            // Signed under some other secret, delivered as if read off the link.
+            // Signed under some other secret, delivered as if read off the link
+            // on connection 1.
             let bad = finalize_home_response(Packet::new(Code::AccessAccept, 7, [0u8; 16]));
             let err = handler
-                .handle_link_response(bad, Arc::clone(&hs))
+                .handle_link_response(bad, Arc::clone(&hs), 1)
                 .await
                 .unwrap_err();
             assert!(
@@ -2154,11 +2186,31 @@ mod tests {
             );
             assert!(hs.is_connected());
 
+            // A second bad reply that was read on connection 1 and reaches the
+            // handler only now must not close connection 2 (SEC-008: a fault
+            // on N never closes N+1).
+            let late = finalize_home_response(Packet::new(Code::AccessAccept, 7, [0u8; 16]));
+            let err = handler
+                .handle_link_response(late, Arc::clone(&hs), 1)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ProxyError::InvalidResponseAuthenticator),
+                "{err}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                link.connections(),
+                2,
+                "a fault on the previous connection must not close the current one"
+            );
+            assert!(link.is_connected());
+
             // The same reply signed under "radsec" is relayed to the NAS
             // without touching the new connection.
             let good = home_response_under_radsec(Packet::new(Code::AccessAccept, 7, [0u8; 16]));
             handler
-                .handle_link_response(good, Arc::clone(&hs))
+                .handle_link_response(good, Arc::clone(&hs), link.connections())
                 .await
                 .unwrap();
             assert!(

@@ -58,9 +58,15 @@
 //! ([`RadsecLinkHandle::send`] records them, a frame coming back with that
 //! Identifier releases it, a reconnect clears them) and the Status-Server
 //! probe takes its Identifier from the ones that are free
-//! ([`RadsecLinkHandle::free_identifier`]), so a probe never shares an
-//! Identifier with a forwarded request; `max_outstanding` is bounded to 255
-//! for a RadSec home server at config load.
+//! ([`RadsecLinkHandle::free_identifier`]), so a probe is never *sent* under
+//! an Identifier that is in flight. The reservation is one-directional: a
+//! NAS request forwarded while the probe is waiting may still carry the
+//! probe's Identifier, because NAS Identifiers are forwarded unchanged (the
+//! gap below). Integrity does not depend on it — replies are demultiplexed
+//! by Proxy-State presence, not Identifier, and each is verified under its
+//! own random Request Authenticator — so a collision only matters to the home
+//! server's duplicate detection. `max_outstanding` is bounded to 255 for a
+//! RadSec home server at config load.
 //! TODO(gap): the proxy forwards the NAS Identifier unchanged over the link
 //! (as it does over the UDP socket) — there is no Identifier rewriting on the
 //! upstream hop. Two NASes using the same Identifier at the same time
@@ -87,7 +93,7 @@ use rustls::ClientConfig;
 use rustls::client::Resumption;
 use rustls::pki_types::ServerName;
 use rustls::version::TLS13;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -102,9 +108,13 @@ use crate::server_verifier::ServerVerifierError;
 /// A proxied response read off a RadSec link, for
 /// `ProxyHandler::handle_link_response`. `home_server` is the server the link
 /// belongs to; the handler checks it against the cache entry by `Arc` identity.
+/// `generation` is the connection ([`RadsecLinkHandle::connections`]) the
+/// frame was read on, so a fault the handler finds in it closes that
+/// connection and not a successor ([`RadsecLinkHandle::reset`]).
 pub struct LinkResponse {
     pub home_server: Arc<HomeServer>,
     pub packet: Packet,
+    pub generation: u64,
 }
 
 /// Errors building or running a RadSec link. `Display` carries no key material.
@@ -179,6 +189,13 @@ impl LinkSendError {
 pub struct LinkParams {
     /// Deadline for the TCP connect and, separately, for the TLS handshake.
     pub connect_timeout: Duration,
+    /// Deadline for writing one frame (request or NAK) to the connection. A
+    /// peer that stops reading while its TCP socket stays alive (wedged
+    /// process, zero window) would otherwise block the link task forever,
+    /// out of reach of the watchdog's reset; expiry ends the connection like
+    /// any other I/O error and the link reconnects with backoff. The server
+    /// sets it to the home server's `timeout`, as it does `connect_timeout`.
+    pub write_timeout: Duration,
     /// Delay before the first reconnect attempt after a failure.
     pub initial_backoff: Duration,
     /// Cap on the (doubling, ±25 % jittered) reconnect delay.
@@ -197,6 +214,7 @@ impl Default for LinkParams {
     fn default() -> Self {
         LinkParams {
             connect_timeout: Duration::from_secs(10),
+            write_timeout: Duration::from_secs(10),
             initial_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(30),
             stable_after: Duration::from_secs(10),
@@ -219,8 +237,9 @@ type InFlight = DashMap<u8, Instant>;
 #[derive(Clone)]
 pub struct RadsecLinkHandle {
     outbound: mpsc::Sender<Vec<u8>>,
-    /// One pending reset at most; the task drains it on every (re)connect.
-    reset: mpsc::Sender<String>,
+    /// One pending reset at most — `(connection generation, reason)`; the
+    /// task drains it on every (re)connect.
+    reset: mpsc::Sender<(u64, String)>,
     connected: Arc<AtomicBool>,
     probes: Arc<ProbeTable>,
     in_flight: Arc<InFlight>,
@@ -281,9 +300,11 @@ impl RadsecLinkHandle {
     /// An Identifier not in flight on the current connection and not held by
     /// a waiting probe, chosen at random among the free ones; `None` when all
     /// 256 are taken (RFC 6613 §2.6: one Identifier per connection is
-    /// reserved for the watchdog, so the probe never shares one with a
-    /// forwarded request). An Identifier unanswered for longer than
-    /// [`LinkParams::identifier_ttl`] counts as free again.
+    /// reserved for the watchdog, so the probe is never sent under an
+    /// Identifier a forwarded request holds — a request forwarded *after*
+    /// the probe may still reuse it, see the module docs). An Identifier
+    /// unanswered for longer than [`LinkParams::identifier_ttl`] counts as
+    /// free again.
     pub fn free_identifier(&self) -> Option<u8> {
         let now = Instant::now();
         let free: Vec<u8> = (0..=u8::MAX)
@@ -301,22 +322,34 @@ impl RadsecLinkHandle {
             .is_some_and(|sent| now.duration_since(*sent) < self.identifier_ttl)
     }
 
-    /// Close the current connection and reconnect with backoff, because the
+    /// Close connection `generation` and reconnect with backoff, because the
     /// peer broke the protocol on it (RFC 6613 §2.6.4: failed Response
     /// Authenticator or Message-Authenticator) or the watchdog gave up on it
-    /// (RFC 3539 §3.4). A no-op while the link is down; `reason` goes into
-    /// the "RadSec link lost" log line.
-    pub fn reset(&self, reason: &str) {
-        if !self.connected.load(Ordering::Acquire) {
+    /// (RFC 3539 §3.4). `generation` is the [`Self::connections`] value the
+    /// caller observed when it detected the fault (carried by the
+    /// [`LinkResponse`], or read before the probe was sent): a reset aimed at
+    /// a connection that has since been replaced is dropped, so a fault on
+    /// connection N never closes a healthy N+1. A no-op while the link is
+    /// down; `reason` goes into the "RadSec link lost" log line.
+    pub fn reset(&self, generation: u64, reason: &str) {
+        if !self.connected.load(Ordering::Acquire) || generation != self.connections() {
             return;
         }
-        // Full ⇒ a reset is already pending for this connection.
-        let _ = self.reset.try_send(reason.to_string());
+        // Full ⇒ a reset is already pending for this connection. The task
+        // compares the generation again when it takes the reset.
+        let _ = self.reset.try_send((generation, reason.to_string()));
     }
 
     /// Number of TLS connections established so far (for tests and stats).
     pub fn connections(&self) -> u64 {
         self.connections.load(Ordering::Relaxed)
+    }
+
+    /// Identifiers currently recorded as in flight on the connection (for
+    /// the watchdog's log line and stats). Includes Identifiers past
+    /// [`LinkParams::identifier_ttl`] that no frame has released yet.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.len()
     }
 }
 
@@ -488,7 +521,7 @@ struct Link {
     in_flight: Arc<InFlight>,
     connections: Arc<AtomicU64>,
     outbound: mpsc::Receiver<Vec<u8>>,
-    reset: mpsc::Receiver<String>,
+    reset: mpsc::Receiver<(u64, String)>,
 }
 
 impl Link {
@@ -636,13 +669,24 @@ impl Link {
                     Some(frame) => {
                         // RFC 6614 §3.4 item 1: the packet as is, delimited by
                         // its own Length, no extra framing.
-                        wr.write_all(&frame).await?;
-                        wr.flush().await?;
+                        write_frame(&mut wr, &frame, self.params.write_timeout).await?;
                     }
                     None => return Ok(LinkEnd::HandleDropped),
                 },
-                reason = self.reset.recv() => match reason {
-                    Some(reason) => return Ok(LinkEnd::Reset(reason)),
+                reset = self.reset.recv() => match reset {
+                    Some((generation, reason)) => {
+                        if generation == self.connections.load(Ordering::Relaxed) {
+                            return Ok(LinkEnd::Reset(reason));
+                        }
+                        // Aimed at a connection that is already gone: the
+                        // fault it reports was that connection's, not ours.
+                        debug!(
+                            server = %self.name,
+                            generation,
+                            reason = %reason,
+                            "RadSec link: ignoring reset for a previous connection"
+                        );
+                    }
                     None => return Ok(LinkEnd::HandleDropped),
                 },
             }
@@ -686,8 +730,7 @@ impl Link {
                 "RadSec link: answering unsupported server-originated request with a NAK (Error-Cause 406)"
             );
             let nak = unsupported_extension_nak(&packet)?;
-            wr.write_all(&nak).await?;
-            wr.flush().await?;
+            write_frame(wr, &nak, self.params.write_timeout).await?;
             return Ok(None);
         }
 
@@ -711,6 +754,7 @@ impl Link {
                 .send(LinkResponse {
                     home_server,
                     packet,
+                    generation: self.connections.load(Ordering::Relaxed),
                 })
                 .await
                 .is_err()
@@ -761,6 +805,27 @@ impl Link {
     }
 }
 
+/// Write one frame and flush it, or give up after `deadline`
+/// ([`LinkParams::write_timeout`]). A write that cannot complete means the
+/// peer has stopped reading while keeping the TCP connection alive; the
+/// watchdog cannot reach a task blocked in `write_all`, so the deadline is
+/// what turns that into a connection fault (`Timeout("write")`), and the
+/// caller ends the connection as for any other I/O error. The half-written
+/// frame dies with the connection; it is never continued on the next one.
+async fn write_frame<W: AsyncWrite + Unpin>(
+    wr: &mut W,
+    frame: &[u8],
+    deadline: Duration,
+) -> Result<(), RadsecClientError> {
+    time::timeout(deadline, async {
+        wr.write_all(frame).await?;
+        wr.flush().await
+    })
+    .await
+    .map_err(|_| RadsecClientError::Timeout("write"))??;
+    Ok(())
+}
+
 /// The CoA-NAK / Disconnect-NAK for a CoA-Request / Disconnect-Request the
 /// proxy does not handle: same Identifier, `Error-Cause (101) = 406`
 /// Unsupported Extension (RFC 6614 §2.5, RFC 5176 §3.5), a
@@ -809,7 +874,8 @@ mod tests {
     use crate::radsec_frame::RADSEC_SECRET;
     use crate::test_pki::{
         FakeAction, TestPaths, gen_chain, gen_chain_with, lenient_server_config,
-        spawn_fake_tls_home, spawn_fake_tls_home_with_provider, spawn_radsec_home,
+        spawn_fake_tls_home, spawn_fake_tls_home_that_never_reads,
+        spawn_fake_tls_home_with_provider, spawn_radsec_home,
     };
     use radius_proto::auth::{
         encrypt_user_password, generate_request_authenticator, verify_response_authenticator,
@@ -821,6 +887,7 @@ mod tests {
     fn fast() -> LinkParams {
         LinkParams {
             connect_timeout: Duration::from_secs(2),
+            write_timeout: Duration::from_secs(2),
             initial_backoff: Duration::from_millis(40),
             max_backoff: Duration::from_millis(160),
             stable_after: Duration::from_secs(10),
@@ -1172,8 +1239,8 @@ mod tests {
         for id in 0..=253u8 {
             link.send(forwarded_access_request(id, &pw)).unwrap();
         }
-        assert!(link.in_flight.len() >= 250);
-        link.reset("test");
+        assert!(link.in_flight() >= 250);
+        link.reset(link.connections(), "test");
         wait_for(
             || link.connections() == 2 && link.is_connected(),
             Duration::from_secs(5),
@@ -1196,9 +1263,20 @@ mod tests {
         let link = connected_link(&hs, tx, fast()).await;
         assert_eq!(link.connections(), 1);
 
+        // A reset aimed at a connection that does not exist (yet) is dropped;
+        // the fault it reports is not this connection's.
+        link.reset(2, "stale: not this connection");
+        time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            link.connections(),
+            1,
+            "a reset for another generation is ignored"
+        );
+        assert!(link.is_connected());
+
         // A probe waiting on the connection is told the link is gone.
         let mut probe = link.register_probe(1).unwrap();
-        link.reset("test: peer fault");
+        link.reset(1, "test: peer fault");
         let got = time::timeout(Duration::from_secs(5), probe.recv())
             .await
             .expect("probe receiver resolves on reset");
@@ -1212,8 +1290,10 @@ mod tests {
         assert_eq!(link.connections(), 2, "reset must reconnect exactly once");
         assert!(link.is_connected());
 
-        // The new connection works, and a reset while down is a no-op (it
-        // must not kill the connection that comes up next).
+        // The new connection works; a reset for the connection that was
+        // replaced is ignored (SEC-008: a fault on N must not close N+1), and
+        // a reset while down is a no-op (it must not kill the connection that
+        // comes up next).
         let mut probe = link.register_probe(2).unwrap();
         link.send(status_server(2)).unwrap();
         let reply = time::timeout(Duration::from_secs(5), probe.recv())
@@ -1222,12 +1302,199 @@ mod tests {
             .unwrap();
         assert_eq!(reply.identifier, 2);
         drop(probe);
+        link.reset(1, "late fault report for connection 1");
+        time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            link.connections(),
+            2,
+            "a reset for the previous connection must be dropped"
+        );
+        assert!(link.is_connected());
         link.connected.store(false, Ordering::Release);
-        link.reset("ignored while down");
+        link.reset(2, "ignored while down");
         link.connected.store(true, Ordering::Release);
         time::sleep(Duration::from_millis(100)).await;
         assert_eq!(link.connections(), 2, "a reset while down must be dropped");
         assert!(link.is_connected());
+    }
+
+    #[tokio::test]
+    async fn a_reset_queued_for_a_previous_generation_is_ignored_by_the_task() {
+        // The handle's own generation check can race the task: a reset for
+        // connection N is queued, N dies on its own, and the task reads the
+        // queued reset only once N+1 is up. The task compares the generation
+        // again and must keep N+1. Driven directly through the channel so the
+        // race is deterministic.
+        let chain = gen_chain();
+        let (addr, _registry, paths) =
+            spawn_radsec_home(&chain, false, lenient_server_config(&[])).await;
+        let hs = home_server(addr, tls_block(&paths, "localhost"));
+        let (tx, _rx) = mpsc::channel(4);
+        let link = connected_link(&hs, tx, fast()).await;
+        assert_eq!(link.connections(), 1);
+
+        // Connection 1 is replaced by a genuine reset ...
+        link.reset(1, "test");
+        wait_for(
+            || link.connections() == 2 && link.is_connected(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(link.connections(), 2);
+        // ... and a reset for connection 1 lands in the channel afterwards.
+        link.reset
+            .try_send((1, "stale".to_string()))
+            .expect("channel has room");
+        time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            link.connections(),
+            2,
+            "the task must ignore a reset for a previous generation"
+        );
+        assert!(link.is_connected());
+        // The connection is still served.
+        let mut probe = link.register_probe(3).unwrap();
+        link.send(status_server(3)).unwrap();
+        let reply = time::timeout(Duration::from_secs(5), probe.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.identifier, 3);
+    }
+
+    /// An `AsyncWrite` that is never ready: a peer that has stopped reading
+    /// with the TCP connection alive, as seen from `write_all`.
+    struct NeverReady;
+
+    impl AsyncWrite for NeverReady {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_that_never_completes_fails_with_a_write_timeout() {
+        // Deterministic form of the blocked-write fault: the writer is never
+        // ready, so only the deadline can end the write.
+        let started = Instant::now();
+        let err = write_frame(
+            &mut NeverReady,
+            &status_server(1),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RadsecClientError::Timeout("write")), "{err}");
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // A writer that completes is unaffected by the deadline.
+        let frame = status_server(2);
+        let mut sink: Vec<u8> = Vec::new();
+        write_frame(&mut sink, &frame, Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert_eq!(sink, frame, "the whole frame is written");
+    }
+
+    /// A maximum-size Access-Request as the proxy would forward it (padded
+    /// with 253-octet Reply-Message attributes up to just under 4096 octets).
+    fn max_size_frame(id: u8) -> Vec<u8> {
+        let auth = generate_request_authenticator();
+        let mut p = Packet::new(Code::AccessRequest, id, auth);
+        p.add_attribute(Attribute::string(AttributeType::UserName as u8, "alice").unwrap());
+        for _ in 0..15 {
+            p.add_attribute(
+                Attribute::new(AttributeType::ReplyMessage as u8, vec![b'x'; 253]).unwrap(),
+            );
+        }
+        p.add_attribute(
+            Attribute::new(AttributeType::ProxyState as u8, PROXY_STATE.to_vec()).unwrap(),
+        );
+        let bytes = p.encode().unwrap();
+        assert!(
+            bytes.len() > 3800 && bytes.len() <= RADIUS_MAX_LEN,
+            "{}",
+            bytes.len()
+        );
+        bytes
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_stops_reading_ends_the_connection_after_the_write_timeout() {
+        // The peer completes the handshake and never reads again, with a
+        // small receive buffer so the kernel stops accepting our bytes after a
+        // few frames (its socket stays alive: no FIN, no RST). Without a write
+        // deadline the task would sit in `write_all` for good; with one the
+        // connection is dropped and the link reconnects.
+        let chain = gen_chain();
+        let paths = chain.write_to_tempdir();
+        let addr = spawn_fake_tls_home_that_never_reads(&chain).await;
+        let hs = Arc::new(
+            HomeServer::new(HomeServerConfig {
+                name: Some("home-deaf".to_string()),
+                timeout: 2,
+                max_outstanding: 255,
+                ..HomeServerConfig::radsec(addr.to_string(), tls_block(&paths, "localhost"))
+            })
+            .unwrap(),
+        );
+        let (tx, _rx) = mpsc::channel(4);
+        let params = LinkParams {
+            write_timeout: Duration::from_millis(200),
+            ..fast()
+        };
+        let link = connected_link(&hs, tx, params).await;
+        assert_eq!(link.connections(), 1);
+
+        // Feed max-size frames until the write blocks and the deadline fires;
+        // `Busy` just means the task is already stuck behind a full queue.
+        let started = Instant::now();
+        let mut sent = 0u32;
+        while link.connections() < 2 && started.elapsed() < Duration::from_secs(8) {
+            assert!(
+                sent < 20_000,
+                "kernel buffers never filled after {sent} frames"
+            );
+            match link.send(max_size_frame((sent % 256) as u8)) {
+                Ok(()) => sent += 1,
+                Err(LinkSendError::Busy | LinkSendError::Down) => {
+                    time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        }
+        wait_for(
+            || link.connections() == 2 && link.is_connected(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            link.connections(),
+            2,
+            "a blocked write must end the connection and the link must reconnect \
+             (sent {sent} frames)"
+        );
+        assert!(link.is_connected());
+        assert!(
+            link.in_flight.is_empty(),
+            "the new connection starts with an empty Identifier space"
+        );
     }
 
     #[tokio::test]

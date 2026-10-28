@@ -214,7 +214,11 @@ impl RetryManager {
         // when the link is down (the send then fails fast and the entry just
         // waits) or when it is on a different connection from the one the
         // request was last written on; otherwise the deadline keeps running
-        // and the Access-Reject follows after `max_retries` as before.
+        // and the Access-Reject follows after `max_retries` as before. The
+        // generation is read just before the frame is queued, so a reconnect
+        // that lands in that window records N while the frame goes out on
+        // N+1 and the next timeout writes one extra copy on N+1 — a bounded
+        // duplicate the home server's duplicate detection absorbs, accepted.
         let resend = Self::may_resend(&home_server, entry.sent_on_connection);
 
         // Update entry with new home server and timestamp, and re-insert it
@@ -651,7 +655,7 @@ mod tests {
         assert_eq!(home_server.stats().outstanding(), 1);
 
         // The link moves to a new connection: the next timeout resends once.
-        link.reset("test");
+        link.reset(link.connections(), "test");
         wait_for(|| link.connections() == 2 && link.is_connected()).await;
         assert_eq!(link.connections(), 2);
         RetryManager::handle_timeout(&cache, &handler, &config, entry)

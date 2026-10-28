@@ -19,12 +19,13 @@
 //! stands in for the source-address check. There the probe is also the
 //! **application-layer watchdog** RFC 6613 §2.4/§2.6 require for RADIUS over
 //! TCP (RFC 3539 §3.4 algorithm, Status-Server as the watchdog message, RFC
-//! 5997 §4.3): the probe's Identifier is one the connection has free, a reply
-//! that fails the Response Authenticator or Message-Authenticator check closes
-//! the connection (RFC 6613 §2.6.4), and two consecutive unanswered probes
-//! close it too (RFC 3539 §3.4: not before the watchdog timer has expired
-//! twice), after which the link reconnects with backoff. Config validation
-//! therefore refuses a RadSec home server with `health_check.enabled = false`.
+//! 5997 §4.3): the probe's Identifier is one the connection has free when it
+//! is sent, a reply that fails the Response Authenticator or
+//! Message-Authenticator check closes the connection (RFC 6613 §2.6.4), and
+//! two consecutive unanswered probes on the same connection close it too (RFC
+//! 3539 §3.4: not before that connection's watchdog timer has expired twice),
+//! after which the link reconnects with backoff. Config validation therefore
+//! refuses a RadSec home server with `health_check.enabled = false`.
 
 use crate::proxy::error::ProxyResult;
 use crate::proxy::home_server::{HomeServer, HomeServerState, HomeServerTransport};
@@ -112,6 +113,10 @@ pub struct HealthCheckStats {
     consecutive_failures: AtomicU64,
     /// Consecutive successes
     consecutive_successes: AtomicU64,
+    /// Watchdog misses on the RadSec link, counted per connection — RFC 3539
+    /// §3.4 closes a connection only once *its own* timer has expired twice:
+    /// `(connection generation of the last miss, misses in a row on it)`.
+    watchdog_misses: std::sync::Mutex<(u64, u64)>,
 }
 
 impl HealthCheckStats {
@@ -122,6 +127,7 @@ impl HealthCheckStats {
             total_failures: AtomicU64::new(0),
             consecutive_failures: AtomicU64::new(0),
             consecutive_successes: AtomicU64::new(0),
+            watchdog_misses: std::sync::Mutex::new((0, 0)),
         }
     }
 
@@ -131,6 +137,30 @@ impl HealthCheckStats {
         self.total_successes.fetch_add(1, Ordering::Relaxed);
         self.consecutive_successes.fetch_add(1, Ordering::Relaxed);
         self.consecutive_failures.store(0, Ordering::Relaxed);
+        // A verified reply restarts the watchdog: misses must be consecutive.
+        self.watchdog_misses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1 = 0;
+    }
+
+    /// Record an unanswered Status-Server probe on link connection
+    /// `generation` and return how many misses in a row that connection now
+    /// has. A miss on a different connection from the last one starts the
+    /// count again, so misses while the link was down or on a connection that
+    /// has since been replaced never count against the current one (RFC 3539
+    /// §3.4). The per-server `consecutive_failures` is recorded separately
+    /// and keeps driving the pool's Up/Down decision.
+    fn record_watchdog_miss(&self, generation: u64) -> u64 {
+        let mut misses = self
+            .watchdog_misses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if misses.0 != generation {
+            *misses = (generation, 0);
+        }
+        misses.1 += 1;
+        misses.1
     }
 
     /// Record a failed health check
@@ -288,18 +318,11 @@ impl HealthChecker {
                 #[cfg(feature = "tls")]
                 match server.link() {
                     Some(link) => {
-                        let link = link.clone();
-                        Self::probe_over_link(Arc::clone(&server), &link, timeout).await;
-                        // RFC 3539 §3.4 (via RFC 6613 §2.6): the connection is
-                        // closed and re-established once the watchdog timer
-                        // has expired twice without a response — never after
-                        // a single miss. A reset on a link that is already
-                        // down is a no-op.
-                        if server.health_stats().consecutive_failures() >= 2 {
-                            link.reset(
-                                "watchdog: two Status-Server probes unanswered (RFC 3539 §3.4)",
-                            );
-                        }
+                        // The watchdog decision — two misses on the same
+                        // connection close it (RFC 3539 §3.4) — is taken in
+                        // there, where the probe knows which connection it
+                        // went out on.
+                        Self::probe_over_link(Arc::clone(&server), link, timeout).await;
                     }
                     None => {
                         warn!(
@@ -415,16 +438,25 @@ impl HealthChecker {
 
     /// The probe over a RadSec link — the RFC 6613 §2.6 watchdog message
     /// (RFC 3539 §3.4, RFC 5997 §4.3). Its Identifier is one the connection
-    /// has free (RFC 6613 §2.6: one Identifier per connection is reserved for
-    /// the watchdog, so the probe never shares one with a forwarded request);
-    /// the probe registers for it **before** sending so a fast reply cannot be
-    /// missed. A link that is down fails the probe at once (nothing to wait
-    /// for); a link lost while waiting fails it as soon as the link task says
-    /// so. A reply with the wrong Identifier or an unexpected code is
-    /// discarded and the probe keeps waiting, as over UDP; a reply that fails
-    /// the Response Authenticator or Message-Authenticator check fails the
-    /// probe **and closes the connection** (RFC 6613 §2.6.4). There is no
-    /// source-address check: the TLS peer is the authenticated home server.
+    /// has free when the probe is sent (RFC 6613 §2.6: one Identifier per
+    /// connection is reserved for the watchdog, so the probe never goes out
+    /// under an Identifier a forwarded request holds; a request forwarded
+    /// *later* may still carry the probe's Identifier because NAS Identifiers
+    /// are not rewritten — replies are told apart by Proxy-State presence and
+    /// verified by Request Authenticator, so only the home server's duplicate
+    /// detection can notice). When every Identifier is taken the probe is
+    /// skipped and **not** counted: nothing was sent, so nothing was learnt
+    /// about the peer. The probe registers for its Identifier **before**
+    /// sending so a fast reply cannot be missed. A link that is down fails the
+    /// probe at once (nothing to wait for); a link lost while waiting fails it
+    /// as soon as the link task says so. A reply with the wrong Identifier or
+    /// an unexpected code is discarded and the probe keeps waiting, as over
+    /// UDP; a reply that fails the Response Authenticator or
+    /// Message-Authenticator check fails the probe **and closes the
+    /// connection** (RFC 6613 §2.6.4). An unanswered probe is a watchdog miss
+    /// on the connection it went out on; the second miss in a row on the
+    /// same connection closes it (RFC 3539 §3.4). There is no source-address
+    /// check: the TLS peer is the authenticated home server.
     #[cfg(feature = "tls")]
     async fn probe_over_link(
         server: Arc<HomeServer>,
@@ -434,12 +466,17 @@ impl HealthChecker {
         let stats = server.health_stats();
 
         let Some(identifier) = link.free_identifier() else {
+            // Not a watchdog miss and not a health-check failure: no probe was
+            // sent, so this is no evidence about the peer. Counting it would
+            // let a burst of unanswered forwarded requests (256 distinct
+            // Identifiers within `identifier_ttl`) reset a healthy
+            // connection; the TTL bounds how long the skip can last.
             warn!(
                 server = %server.name,
+                in_flight = link.in_flight(),
                 "Status-Server probe skipped: every Identifier on the RadSec connection is in \
-                 flight (RFC 6613 §2.6.5)"
+                 flight (RFC 6613 §2.6.5); not counted as a watchdog miss"
             );
-            stats.record_failure();
             return;
         };
         let request_auth = generate_request_authenticator();
@@ -468,6 +505,9 @@ impl HealthChecker {
                 return;
             }
         };
+        // The connection this probe goes out on: a miss is counted against it
+        // and a reset for it is dropped once the link has moved on.
+        let generation = link.connections();
         if let Err(e) = link.send(request_data) {
             warn!(
                 server = %server.name,
@@ -523,18 +563,32 @@ impl HealthChecker {
                     "Status-Server reply failed verification; closing the RadSec connection \
                      (RFC 6613 §2.6.4)"
                 );
-                link.reset(&format!(
-                    "Status-Server reply failed the {reject} check (RFC 6613 §2.6.4)"
-                ));
+                link.reset(
+                    generation,
+                    &format!("Status-Server reply failed the {reject} check (RFC 6613 §2.6.4)"),
+                );
                 stats.record_failure();
             }
             Err(_) => {
+                let misses = stats.record_watchdog_miss(generation);
                 warn!(
                     server = %server.name,
                     timeout_secs = timeout.as_secs(),
+                    misses_on_connection = misses,
                     "Status-Server request timed out"
                 );
                 stats.record_failure();
+                // RFC 3539 §3.4 (via RFC 6613 §2.6): the connection is closed
+                // and re-established once *its* watchdog timer has expired
+                // twice without a response — never after a single miss, and
+                // never for misses on a previous connection. A reset on a
+                // link that is already down is a no-op.
+                if misses >= 2 {
+                    link.reset(
+                        generation,
+                        "watchdog: two Status-Server probes unanswered (RFC 3539 §3.4)",
+                    );
+                }
             }
         }
     }
@@ -1575,6 +1629,7 @@ mod tests {
         fn fast() -> LinkParams {
             LinkParams {
                 connect_timeout: Duration::from_secs(2),
+                write_timeout: Duration::from_secs(2),
                 initial_backoff: Duration::from_millis(40),
                 max_backoff: Duration::from_millis(160),
                 stable_after: Duration::from_secs(10),
@@ -1835,13 +1890,133 @@ mod tests {
             assert_eq!(server.health_stats().consecutive_successes(), 3);
             assert_eq!(*probe_ids.lock().unwrap(), vec![255, 255, 255]);
 
-            // With the whole space taken the probe is skipped and counted as
-            // a failure rather than colliding with a forwarded request.
+            // With the whole space taken the probe is skipped rather than
+            // colliding with a forwarded request — and a skipped probe is no
+            // evidence about the peer: not a failure, not a watchdog miss, no
+            // reset, the connection is kept (SEC-007).
             let request = Packet::new(Code::AccessRequest, 255, generate_request_authenticator());
             link.send(request.encode().unwrap()).unwrap();
+            assert_eq!(link.in_flight(), 256);
+            let checks_before = server.health_stats().total_checks();
+            probe_expecting_failure(&server).await;
+            probe_expecting_failure(&server).await;
+            assert_eq!(probe_ids.lock().unwrap().len(), 3, "no probe was sent");
+            assert_eq!(server.health_stats().consecutive_failures(), 0);
+            assert_eq!(server.health_stats().consecutive_successes(), 3);
+            assert_eq!(
+                server.health_stats().total_checks(),
+                checks_before,
+                "a skipped probe is not a check"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                link.connections(),
+                1,
+                "two skipped probes must not reset the connection"
+            );
+            assert!(link.is_connected());
+        }
+
+        #[tokio::test]
+        async fn watchdog_misses_are_counted_per_connection() {
+            // RFC 3539 §3.4: a connection is closed only once *its own*
+            // watchdog timer has expired twice. A miss on connection 1 and
+            // then a miss on connection 2 is one miss per connection — no
+            // reset, although the server's consecutive-failure count (which
+            // drives Up/Down) is 2. The second miss on connection 2 closes it.
+            let chain = gen_chain();
+            let paths = chain.write_to_tempdir();
+            let addr = spawn_fake_tls_home(&chain, |_, _| FakeAction::Reply(vec![])).await;
+            let server = radsec_home_server(addr, &paths);
+            let link = attach_connected_link(&server).await;
+
             probe_expecting_failure(&server).await;
             assert_eq!(server.health_stats().consecutive_failures(), 1);
-            assert_eq!(probe_ids.lock().unwrap().len(), 3, "no probe was sent");
+            assert_eq!(link.connections(), 1);
+
+            // Connection 1 is replaced for another reason (say a peer fault).
+            link.reset(1, "test");
+            wait_for(
+                || link.connections() == 2 && link.is_connected(),
+                Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(link.connections(), 2);
+
+            probe_expecting_failure(&server).await;
+            assert_eq!(
+                server.health_stats().consecutive_failures(),
+                2,
+                "the per-server count keeps growing"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                link.connections(),
+                2,
+                "one miss on connection 2 must not close it"
+            );
+            assert!(link.is_connected());
+
+            probe_expecting_failure(&server).await;
+            assert_eq!(server.health_stats().consecutive_failures(), 3);
+            wait_for(
+                || link.connections() == 3 && link.is_connected(),
+                Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(
+                link.connections(),
+                3,
+                "the second miss on connection 2 closes it"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_verified_reply_restarts_the_watchdog_miss_count() {
+            // Miss, verified reply, miss: the misses are not consecutive, so
+            // the connection is kept; the next miss is the second in a row and
+            // closes it (RFC 3539 §3.4).
+            let chain = gen_chain();
+            let paths = chain.write_to_tempdir();
+            let answer = Arc::new(AtomicBool::new(false));
+            let answering = Arc::clone(&answer);
+            let addr = spawn_fake_tls_home(&chain, move |_, request| {
+                if request.code == Code::StatusServer && answering.load(Ordering::SeqCst) {
+                    FakeAction::Reply(vec![probe_reply(request)])
+                } else {
+                    FakeAction::Reply(vec![])
+                }
+            })
+            .await;
+            let server = radsec_home_server(addr, &paths);
+            let link = attach_connected_link(&server).await;
+
+            probe_expecting_failure(&server).await;
+            assert_eq!(server.health_stats().consecutive_failures(), 1);
+
+            answer.store(true, Ordering::SeqCst);
+            probe(&server).await;
+            assert_eq!(server.health_stats().consecutive_successes(), 1);
+            assert_eq!(server.health_stats().consecutive_failures(), 0);
+
+            answer.store(false, Ordering::SeqCst);
+            probe_expecting_failure(&server).await;
+            assert_eq!(server.health_stats().consecutive_failures(), 1);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                link.connections(),
+                1,
+                "a miss after a verified reply is the first miss again"
+            );
+            assert!(link.is_connected());
+
+            probe_expecting_failure(&server).await;
+            wait_for(
+                || link.connections() == 2 && link.is_connected(),
+                Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(link.connections(), 2, "two misses in a row close it");
         }
 
         #[tokio::test]
