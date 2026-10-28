@@ -23,4 +23,4 @@ Layout:
 | `compose.yaml` | Network 10.77.0.0/24: freeradius .10, usg-proxy .20, usg-home .30, nas .40 |
 | `freeradius/` | Dockerfile, `clients.conf`, `eap` (mods-available), `authorize` |
 | `usg-radius/` | Dockerfile (Debian build of this checkout, features `observability,tls,revocation`), `proxy.json` (realms `freeradius.test` → FreeRADIUS, `usg.test` → usg-home), `home.json` (EAP-TLS with `eap.tls.revocation`, static CRL, fail-closed; EAP-TEAP with `eap.teap_tls`, Basic-Password-Auth user) |
-| `eapol_test/` | Dockerfile, wpa_supplicant `config`, supplicant `*.conf`, `run-tests.sh` (the assertions) |
+| `eapol_test/` | Dockerfile, wpa_supplicant `config`, supplicant `*.conf`, `run-tests.sh` (the assertions), `retransmit-tests.sh` (scenario 15: a bash NAS that retransmits signed Access-Requests) |

@@ -82,7 +82,7 @@ image build (default 2).
 
 ## What is checked
 
-Sixty-seven assertions across fourteen scenarios, plus one host-side check in
+Seventy-seven assertions across fifteen scenarios, plus one host-side check in
 `run.sh` (§14). All pass on the current tree (run `tests/interop/run.sh`).
 
 ### 1 & 2 — EAP-TLS through the proxy to FreeRADIUS
@@ -288,6 +288,34 @@ Authenticator and a Message-Authenticator under the home secret; the unit
 tests in `crates/radius-server/src/proxy/health.rs` additionally run the
 probe against a fake home server that verifies the Message-Authenticator and
 signs its reply.
+
+### 15 — Retransmitted Access-Requests get the cached reply (RFC 5080 §2.2.2)
+
+radclient and eapol_test never resend an Access-Request that was answered,
+so the NAS here is `eapol_test/retransmit-tests.sh`, a bash script that
+builds each Access-Request itself (User-Name, NAS-Identifier, EAP-Message,
+and a Message-Authenticator computed with `openssl` HMAC-MD5 under the NAS
+secret, RFC 3579 §3.2) and sends it twice from one `/dev/udp` socket: a true
+retransmission, same source port, RADIUS Identifier, Request Authenticator
+and bytes. Against usg-home:
+
+- EAP-Response/Identity → Access-Challenge whose Response Authenticator
+  (RFC 2865 §3) and Message-Authenticator (RFC 3579 §3.2) verify, carrying a 16-octet State that does not contain the
+  User-Name; the retransmission gets the **identical** Access-Challenge. The
+  State is random per conversation, so an identical second reply can only be
+  the cached one: processing the request again would have started a second
+  conversation with a different State. Before this change the retransmission
+  got no reply at all (the duplicate cache dropped it).
+- An EAP-Nak (RFC 3748 §5.3.1) answering the outstanding Request, offering no
+  method, ends the conversation: Access-Reject with an EAP-Failure carrying
+  the Nak's Identifier (RFC 3579 §2.6.3), both authenticators verified; its
+  retransmission gets the **identical** final Access-Reject, although the
+  conversation no longer exists.
+
+The final Access-Accept of a full EAP-TLS conversation, and the binding of
+the State to the NAS and User-Name, are covered by unit tests in
+`crates/radius-server/src/eap_auth.rs` (`retransmitted_requests_get_the_cached_reply_byte_for_byte`,
+`state_from_another_nas_or_user_is_rejected_without_touching_the_conversation`).
 
 ### Server fixes this test drove out
 
