@@ -7,6 +7,189 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **EAP conversations are named by an unpredictable State bound to the NAS
+  and the user.** The RADIUS State of an EAP conversation used to be
+  `username-millis-sequence`: predictable, usable from any NAS, able to
+  restart a live conversation when sent with a new Identity Response, and
+  longer than the 253-octet attribute limit for long User-Names (RFC 2865
+  §5.24, §5). It is now 16 octets from the operating system's CSPRNG
+  (`getrandom`), fixed for the conversation and never derived from the
+  User-Name or the time. Each conversation is bound to the RADIUS client
+  address that started it (UDP source / RadSec peer) and to the request's
+  NAS-IP-Address, NAS-IPv6-Address, NAS-Identifier and User-Name; a State
+  presented by anyone else gets an Access-Reject and leaves the live
+  conversation exactly as it was. An EAP-Response/Identity, or an
+  Access-Request without EAP-Message, always starts a new conversation and
+  ignores any State it carries.
+- **EAP-Responses must answer the outstanding EAP-Request (RFC 3748 §4.1).** Each conversation tracks the Identifier of the Request it sent last
+  and accepts one Response carrying it. A Response with another Identifier, or
+  a duplicate of one already processed that the NAS forwards under a new
+  RADIUS Identifier, is silently discarded (no RADIUS reply) without
+  advancing or refreshing the conversation; concurrent copies cannot both be
+  processed.
+
+- **The proxy verifies the NAS's Message-Authenticator before forwarding.**
+  The routing decision ran before the Message-Authenticator check, and the
+  proxy re-signs a forwarded request under the home server's secret, so an
+  EAP Access-Request with a missing or invalid Message-Authenticator from a
+  spoofed client address reached the home server validly signed (RFC 3579
+  §3.2, "Blast-RADIUS"). Access-Requests and Status-Server are now
+  authenticated before anything else, so a packet failing the check also
+  leaves the duplicate cache untouched (RFC 5080 §2.2.2).
+
+### Added
+
+- **Retransmitted Access-Requests get the cached reply (RFC 5080 §2.2.2).**
+  A NAS retransmits an Access-Request when it lost the reply; the duplicate
+  cache used to drop the retransmission, so the NAS never got an answer (and
+  past the cache TTL an EAP retransmission was rejected). The request cache
+  now keeps the encoded reply of every locally answered Access-Request (PAP,
+  CHAP, EAP) and answers a byte-identical retransmission, under the same
+  shared secret and from the same source address and port, within
+  `request_cache_ttl` with the identical reply, final Access-Accept /
+  Access-Reject included, without processing the request again. The replay
+  re-sends bytes already computed for exactly that request, at most 8 times.
+  A duplicate still in progress, one that got no reply, or a packet that
+  reuses an answered request's Identifier and Request Authenticator with
+  different content is dropped as before. At most `request_cache_max_entries`
+  replies (each at most 4096 octets) are kept. New counter
+  `radius_retransmissions_replayed_total`. Proxied requests (answered
+  asynchronously), Accounting-Request and Status-Server retransmissions are
+  still dropped.
+- Interop scenario 15 (77 assertions, up from 67): a bash NAS signs its own
+  Access-Requests and sends each twice from one socket; the retransmitted
+  EAP Identity Response gets the identical Access-Challenge (same random
+  State) and the retransmitted final request the identical Access-Reject.
+- `AuthHandler::authenticate_request_from(request, secret, client)`: the
+  server now passes the RADIUS client address to the handler (default
+  implementation delegates to `authenticate_request`), and
+  `AuthResult::Discard` lets a handler send no reply at all.
+- **The proxy reaches home servers over RadSec (RFC 6614).** A home server
+  takes `"transport": "radsec"` and a `tls` block (`ca_path`, `cert_path`,
+  `key_path`, `server_name`, optional `revocation` — the same block as
+  `eap.tls.revocation` and `radsec.revocation`) in place of a `secret`: the
+  hop secret is the fixed string `"radsec"` of RFC 6614 §2.3 and the
+  certificates authenticate the hop. The proxy keeps one persistent TLS 1.3
+  connection per RadSec home server (ML-KEM-1024-only key exchange,
+  `TLS_AES_256_GCM_SHA384`, mutual certificate authentication, the home
+  server's certificate verified against `ca_path` and `server_name`, the
+  post-handshake FIPS parameter check of the inbound listener), reconnects
+  with exponential backoff and jitter, and never falls back to UDP: a TLS
+  verification failure closes the connection. Requests cross the hop re-keyed
+  as over UDP (User-Password and Message-Authenticator under `"radsec"`; the
+  response's Response Authenticator verified under `"radsec"`, its MS-MPPE
+  keys, Tunnel-Password and Message-Authenticator re-encrypted under the
+  NAS's secret) and responses are correlated by Proxy-State exactly as on
+  the UDP path. On the connection the proxy follows RFC 6613: a request is
+  never retransmitted over the connection it went out on (§2.6.1); a
+  malformed packet, a failed Response Authenticator or a probe reply failing
+  its Message-Authenticator closes the connection (§2.6.4); the RFC 5997
+  Status-Server health probe runs over the connection and is its RFC 3539
+  §3.4 watchdog, two unanswered probes reset it (§2.4, §2.6); one Identifier
+  is kept free for the watchdog and a probe never reuses an Identifier in
+  flight (§2.6, §2.6.5). A CoA-Request or Disconnect-Request arriving from
+  the home server is answered with CoA-NAK / Disconnect-NAK, Error-Cause 406
+  (RFC 6614 §2.5, RFC 5176 §3.5). Without the `tls` cargo feature a `radsec`
+  home server is a configuration error. New example
+  `examples/configs/proxy-radsec-upstream.json`; `examples/proxy_config.json`
+  gains a `radsec_pool`. The Status-Server probe under `"radsec"` is pinned by
+  an independent Python known-answer vector
+  (`tests/vectors/radsec_status_server_vector.py`). Interop: a new scenario
+  (nine assertions) proxies EAP-TLS (eapol_test) and PAP (radclient) through
+  usg-radius to FreeRADIUS 3.2.7 over RadSec with a different secret on the
+  NAS hop (the supplicant's MS-MPPE keys match, the wrong password gets an
+  Access-Reject), and twelve host-side checks confirm from the FreeRADIUS and
+  proxy logs that the connection negotiated TLS 1.3, `TLS_AES_256_GCM_SHA384`
+  and ML-KEM-1024 (`group=Some(MLKEM1024)`), that FreeRADIUS verified the
+  proxy's client certificate, and that the RadSec realm never reached UDP
+  1812. Known gaps: the NAS's Identifier is forwarded unchanged on the one
+  connection (no Identifier rewriting on the upstream hop, as on the UDP
+  socket); a stapled OCSP response is ignored (revocation is decided by
+  `tls.revocation` alone); CRL-DP/OCSP fetches run inside the handshake; the
+  proxy is active only under the `udp-insecure` NAS listener, as before.
+
+### Fixed
+
+- RFC 3579 §2.6.2: an Access-Request carrying an EAP-Request (role
+  reversal), EAP-Success or EAP-Failure is rejected without touching any
+  conversation, the Reject for an EAP-Request carrying an EAP-Response/Nak;
+  it used to be processed as a Response.
+- RFC 3579 §2.1 EAP-Start (an EAP-Message of length 2) starts a
+  conversation; it used to be rejected.
+- `Debug` of `AuthResult` and of the request cache's entries shows key and
+  reply lengths only, never the MSK or a cached reply's MS-MPPE values.
+- The request cache deadlocked the request task once it held
+  `request_cache_max_entries` entries: the eviction path kept a DashMap
+  iterator (and its shard lock) alive across `remove`. The test for the bound
+  had been ignored as "hangs"; it runs again.
+- **The proxy retried a request forever when the resend failed.** The retry
+  manager bumped `retry_count` on a copy of the cache entry and re-inserted
+  it only after a successful resend, so a send error (unreachable home
+  server) left the old entry, with the old count, in the cache: the request
+  was retried on every tick and the NAS never got the signed Access-Reject
+  after `retry.max_retries`. The count, the timestamp and the cache entry
+  are now updated before the send and a failed send counts as an attempt.
+- **A home server's `outstanding` gauge could underflow.** `record_timeout`
+  and `record_response` decremented it unconditionally (a failed resend
+  recorded the timeout without the matching request), wrapping the gauge to
+  2^64 − 1; the decrement now saturates at zero.
+- **The proxy removed a request's cache entry before verifying the
+  response.** A response from the wrong source, or one whose Response
+  Authenticator failed, had already consumed the entry, so a stray or forged
+  datagram carrying a guessed Proxy-State could discard a live proxied
+  request and the NAS timed out. The entry is now looked up, the origin and
+  the Response Authenticator checked, and only then removed; a failing
+  response leaves it in place and is logged.
+- `ProxyCache::insert` refused to replace an existing Proxy-State's entry
+  when the cache was full, which the retry manager relies on to re-insert an
+  entry before resending it.
+
+### Changed
+
+- **The interop harness runs concurrently on one Docker host.**
+  `tests/interop/run.sh` gives every run its own compose project
+  (`INTEROP_PROJECT`, default `usg-radius-interop-<checkout path hash>-<pid>`),
+  image tag, `10.77.N.0/24` network (`INTEROP_NET`; the first free one, since
+  Docker refuses overlapping subnets) and run directory
+  (`tests/interop/.runs/<project>/`: test PKI, configs rendered for that /24,
+  server logs). Teardown, also on failure, `^C` or `SIGTERM`, removes only that
+  run's containers, network, volumes and images. Two worktrees sharing the
+  Lima VM no longer tear down or reuse each other's containers. CI pins
+  `INTEROP_PROJECT` so its log-collection step finds the containers.
+- **`health_check.enabled` is required when a RadSec home server is
+  configured.** The Status-Server probe is the RFC 6613 §2.6 watchdog of the
+  connection (RFC 3539 §3.4); `"enabled": false` together with a
+  `"transport": "radsec"` home server is now a configuration error. Keep
+  `health_check.interval` below the home server's TLS idle timeout
+  (FreeRADIUS's default `idle_timeout` is 30 s) so the connection stays warm.
+- **`max_outstanding` is capped at 255 for a RadSec home server** (RFC 6613
+  §2.6, §2.6.5: one Identifier space per connection, one Identifier kept free
+  for the watchdog). UDP home servers are unchanged.
+- The interop harness's FreeRADIUS image moves from Debian bookworm to
+  `debian:trixie-slim` (freeradius 3.2.7, OpenSSL 3.5), the first Debian
+  release whose OpenSSL has the ML-KEM TLS groups, so FreeRADIUS's RadSec
+  listener (`ecdh_curve = "MLKEM1024"`, TLS 1.3 only, client certificate
+  required) can complete a handshake with the ML-KEM-1024-only proxy; the
+  image build asserts that `openssl list -tls-groups` contains `MLKEM1024`.
+  The eapol_test image stays on bookworm. Harness only; the shipping image is
+  unchanged.
+
+## [0.13.0] - 2026-10-28
+
+EAP-TEAP now interoperates with wpa_supplicant: the RFC 9930 Crypto-Binding
+TLV, key schedule and protected termination are implemented and pinned by
+independent known-answer vectors, fragmentation works in both phases and
+directions, EAP-Nak method negotiation lets EAP-TLS and TEAP coexist, and four
+TEAP scenarios run in the interop harness. EAP session handling is hardened:
+the session store is bounded by an idle timeout and an LRU cap, TEAP Phase 2
+is bounded per conversation, Basic-Password-Auth fails closed (an empty-password
+bypass that existed only in unreleased builds is fixed), and `eap.enable_teap`
+now defaults to `false`. Status-Server follows RFC 5997 (Message-Authenticator
+required, reply code by port, conformant proxy health probes) and accounting
+gets its own 1813/udp socket through the new `accounting_port` key.
+
 ### Added
 
 - **EAP-TEAP interoperates with wpa_supplicant (RFC 9930).** The TEAP server
@@ -121,6 +304,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+**Two defaults change in this release.** `eap.enable_teap` is now `false`
+(TEAP must be enabled explicitly), and Accounting-Request is answered on a
+dedicated socket on port 1813 (`accounting_port`, default `1813`) instead of
+on `listen_port`; a NAS that sends accounting to 1812 gets no reply until it
+is pointed at 1813 or `"accounting_port": "shared"` is set. Details below.
+
 - **`eap.enable_teap` now defaults to `false`** (it defaulted to `true`).
   EAP-TEAP is opt-in: its only inner method, Basic-Password-Auth, needs the
   inner handler to supply the user's password (the in-memory `users` list
@@ -158,6 +347,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Access-Accept). A monitor that sends a bare 20-octet Status-Server now gets
   no reply; radclient's `status` command and FreeRADIUS proxies already sign
   theirs, as RFC 5997 §4.1 requires.
+- `EapTlsContext` and `CryptoBinding` no longer derive `Debug`: their
+  implementations print the lengths of the master secret, MSK, EMSK, IMCK and
+  CMK, never the bytes (as `MppeKeys` already did).
 
 ### Security
 
@@ -263,12 +455,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`0.0.0.0:0` or `[::]:0`, matching the listener's address family) and
   checks the reply's source address and Identifier; `HealthChecker::new` is
   now synchronous.
-
-### Changed
-
-- `EapTlsContext` and `CryptoBinding` no longer derive `Debug`: their
-  implementations print the lengths of the master secret, MSK, EMSK, IMCK and
-  CMK, never the bytes (as `MppeKeys` already did).
 
 ### Documentation
 

@@ -545,6 +545,7 @@ RadSec (RADIUS over TLS, RFC 6614) shipped in v0.10.0 and is the **default trans
 - ✅ **Forward secrecy** from the ephemeral ML-KEM key exchange.
 - ✅ Inside the tunnel the payload is standard RADIUS using the fixed secret `"radsec"` (RFC 6614 §2.3); the real protection is the TLS layer.
 - ✅ Authentication, accounting, Status-Server and server-originated CoA/Disconnect (RFC 5176) share one long-lived connection per NAS on 2083/tcp. A Status-Server inside the tunnel must carry a Message-Authenticator under the fixed `"radsec"` secret or it is silently discarded (RFC 5997 §4.1); over UDP the same rule applies with the client's secret, on both the authentication and the accounting socket.
+- ✅ **Outbound hop (proxy → home server)**: a home server configured with `transport: "radsec"` is reached over one persistent TLS 1.3 connection built with the same `usg-fips-tls` provider (ML-KEM-1024 only, `TLS_AES_256_GCM_SHA384`, parameters re-checked after every handshake, resumption disabled). The proxy presents its own client certificate (`tls.cert_path`/`tls.key_path`); the home server's chain is validated against `tls.ca_path` and must be valid for `tls.server_name`, with optional CRL/OCSP checking through the same `revocation` block used elsewhere. The hop secret is the fixed `"radsec"` (a configured `secret` is rejected), so the TLS certificates are the only authentication on that hop; the link therefore never falls back to UDP, and a response is attributed to the home server by the connection it arrived on, never by source address. The connection is closed and re-established with backoff on any protocol violation (RFC 6613 §2.6.4) and after two unanswered Status-Server probes (RFC 3539 §3.4 watchdog, mandatory: `health_check.enabled` is required for RadSec home servers). See [Proxy: RadSec to home servers](../proxy/README.md#radsec-to-home-servers-rfc-6614).
 
 **Configuration** (`transport` selects the listener; `radsec` is required when `transport` is `"radsec"`):
 
@@ -566,7 +567,7 @@ RadSec (RADIUS over TLS, RFC 6614) shipped in v0.10.0 and is the **default trans
 | `"radsec"` (default for config files) | 2083/tcp, TLS 1.3 mTLS | NAS client certificate | Requires the `tls` cargo feature (built into the container image since v0.10.1) |
 | `"udp-insecure"` | `listen_port`/udp (1812) | Shared secret + source IP | **Not FIPS-approved**, spoofable; logs a prominent startup warning. Only for development against legacy NASes |
 
-Limitations: no DTLS (RFC 7360), no certificate hot-rotation (restart the pod to pick up renewed certificates), and no CRL/OCSP check on NAS certificates yet (the `revocation` module in `radius-proto` is not wired into the server).
+Limitations: no DTLS (RFC 7360); no certificate hot-rotation for the listener or the proxy's outbound client certificate (restart the pod to pick up renewed certificates); no certificate pinning or TLS-PSK trust; CRL/OCSP checking of NAS certificates (`radsec.revocation`, v0.12.0) and of RadSec home-server certificates (`tls.revocation` on the home server) does not verify CRL/OCSP signatures, ignores stapled OCSP and runs its network fetches inside the handshake; the proxy components run only under the `udp-insecure` NAS listener, so RadSec-in → RadSec-out proxying is not available; the proxy forwards NAS Identifiers unchanged on its upstream hop (RFC 6613 §2.6).
 
 ## Management API Authentication
 
@@ -604,8 +605,8 @@ See [Management API Authentication](mgmt-api-auth.md) for the policy schema, con
 
 Remaining security work:
 
-1. **RadSec**: DTLS transport, certificate hot-rotation, revocation checking of NAS certificates
-2. **EAP**: EAP-TEAP inner methods with real IMSK, CRL/OCSP integration for client certificates
+1. **RadSec**: DTLS transport, certificate hot-rotation and pinning, proxying under the inbound RadSec listener, Identifier rewriting on the proxy's upstream hop, CRL/OCSP signature verification and revocation fetches off the handshake path
+2. **EAP**: EAP-TEAP inner methods with real IMSK
 3. **Modern Crypto for UDP**: the UDP transport is bound to MD5 by RFC 2865; prefer RadSec rather than waiting for stronger UDP primitives
 
 ## Security Checklist
@@ -613,6 +614,7 @@ Remaining security work:
 Before deploying to production:
 
 - [ ] RadSec transport enabled (`transport: "radsec"`) with a NAS client CA; `udp-insecure` only where unavoidable
+- [ ] Proxy home servers reached over RadSec (`"transport": "radsec"` with a `tls` block and, where a CRL or OCSP responder exists, `tls.revocation`); `health_check.interval` below the home server's TLS idle timeout
 - [ ] Management API protected (`mgmt.tls.client_ca_path` and `mgmt.access_policy_file` set)
 - [ ] Strong shared secrets (16+ characters) for any `udp-insecure` clients
 - [ ] Unique secrets per client
@@ -641,6 +643,7 @@ Before deploying to production:
 - [RFC 3579 - RADIUS EAP Support](https://tools.ietf.org/html/rfc3579)
 - [RFC 5176 - Dynamic Authorization Extensions (CoA/Disconnect)](https://tools.ietf.org/html/rfc5176)
 - [RFC 5216 - EAP-TLS](https://tools.ietf.org/html/rfc5216)
+- [RFC 6613 - RADIUS over TCP](https://tools.ietf.org/html/rfc6613)
 - [RFC 6614 - RADIUS over TLS (RadSec)](https://tools.ietf.org/html/rfc6614)
 - [RFC 7170 - EAP-TEAP](https://tools.ietf.org/html/rfc7170)
 - [NIST SP 800-63B - Digital Identity Guidelines](https://pages.nist.gov/800-63-3/sp800-63b.html)

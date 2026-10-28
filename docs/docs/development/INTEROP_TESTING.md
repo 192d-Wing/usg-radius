@@ -5,8 +5,12 @@ unit-tested against this codebase's own encoder and decoder. This test closes
 the gap: it runs usg-radius against two independent RADIUS implementations and
 asserts outcomes those implementations compute on their own.
 
-- **FreeRADIUS 3.2** (Debian package) as the home server behind the usg-radius
-  proxy, with EAP-TLS and a PAP user.
+- **FreeRADIUS 3.2.7** (Debian trixie package, OpenSSL 3.5.7) as the home
+  server behind the usg-radius proxy, with EAP-TLS and a PAP user, reached over
+  UDP and — for a second realm — over RadSec (RFC 6614: TLS 1.3, ML-KEM-1024,
+  mutual certificates). FreeRADIUS runs `-fxx -l stdout` (foreground, full
+  debug, threaded) because its TLS listener refuses to start single-threaded
+  (`-X`).
 - **eapol_test** from wpa_supplicant 2.12 as NAS + supplicant. It derives the
   EAP MSK from its own TLS stack (and, for TEAP, its own RFC 9930 key
   schedule), decrypts the MS-MPPE keys in the Access-Accept with *its* shared
@@ -18,9 +22,23 @@ asserts outcomes those implementations compute on their own.
 The shared secret differs on every hop, so nothing passes by accident:
 
 ```
-nas 10.77.0.40 ──[nas-proxy-secret-1]──▶ usg-proxy 10.77.0.20 ──[proxy-freeradius-secret-2]──▶ freeradius 10.77.0.10
+nas 10.77.0.40 ──[nas-proxy-secret-1]──▶ usg-proxy 10.77.0.20 ──[proxy-freeradius-secret-2, UDP 1812]──▶ freeradius 10.77.0.10  (realm freeradius.test)
+                                                               ──[RadSec 2083: TLS 1.3, ML-KEM-1024, mTLS, "radsec"]──▶ freeradius 10.77.0.10  (realm radsec.test)
+                                                               ──[proxy-usghome-secret-4, UDP 1812]────▶ usg-home 10.77.0.30    (realm usg.test)
 nas 10.77.0.40 ──[nas-usghome-secret-3]─▶ usg-home 10.77.0.30   (usg-radius as EAP-TLS / EAP-TEAP home server, no proxy)
 ```
+
+On the RadSec hop the secret is the fixed `"radsec"` of RFC 6614 §2.3 and the
+certificates authenticate the hop: the proxy presents `certs/usg-proxy.crt`
+(EKU clientAuth), FreeRADIUS presents `certs/freeradius-server.crt` (SAN
+`freeradius`, verified by the proxy with `server_name: "freeradius"`), both
+under `certs/ca.crt`. FreeRADIUS's listener (`freeradius/sites-radsec`) pins
+`tls_min_version`/`tls_max_version = "1.3"`, `ecdh_curve = "MLKEM1024"` and
+`require_client_cert = yes`; that needs OpenSSL 3.5, which is why the
+FreeRADIUS image moved from Debian bookworm to trixie (the eapol_test image
+stays on bookworm so that its ClientHello, without hybrid key shares, fits one
+EAP fragment). The EAP module's own TLS configuration keeps `prime256v1`, so
+EAP-TLS inside RADIUS is unaffected.
 
 ## Running it
 
@@ -82,8 +100,10 @@ image build (default 2).
 
 ## What is checked
 
-Sixty-seven assertions across fourteen scenarios, plus one host-side check in
-`run.sh` (§14). All pass on the current tree (run `tests/interop/run.sh`).
+Seventy-six assertions across fifteen scenarios inside the `nas` container,
+plus twelve host-side checks in `run.sh` (the proxy's probes to its three home
+servers, §14, and the RadSec hop, §15). All pass on the current tree (run
+`tests/interop/run.sh`).
 
 ### 1 & 2 — EAP-TLS through the proxy to FreeRADIUS
 
@@ -279,15 +299,73 @@ attribute dump of the reply (`Message-Authenticator = 0x...` after the
   single-socket behaviour.
 
 The proxy's own probes are covered from the host side: `proxy.json` runs with
-`health_check` enabled, and after the eapol_test/radclient suite `run.sh`
-asserts that the proxy's Status-Server probes against FreeRADIUS and against
-usg-home succeeded (the `nas` container cannot see the proxy's log, so the
-assertion runs on the host). FreeRADIUS answering the probe is the
-independent check of what the probe puts on the wire — random Request
-Authenticator and a Message-Authenticator under the home secret; the unit
-tests in `crates/radius-server/src/proxy/health.rs` additionally run the
-probe against a fake home server that verifies the Message-Authenticator and
-signs its reply.
+`health_check` enabled (every 5 s), and after the eapol_test/radclient suite
+`run.sh` asserts that the proxy's Status-Server probes against all three home
+servers — FreeRADIUS over UDP, FreeRADIUS over RadSec (inside the TLS
+connection, with the fixed `"radsec"` secret) and usg-home — succeeded (the
+`nas` container cannot see the proxy's log, so the assertion runs on the
+host). FreeRADIUS answering the probe is the independent check of what the
+probe puts on the wire — random Request Authenticator and a
+Message-Authenticator under the home secret; the unit tests in
+`crates/radius-server/src/proxy/health.rs` additionally run the probe against
+a fake home server that verifies the Message-Authenticator and signs its
+reply.
+
+### 15 — EAP-TLS and PAP through the proxy to FreeRADIUS over RadSec (RFC 6614)
+
+`proxy.json` routes realm `radsec.test` to the same FreeRADIUS as scenarios
+1–3, but through a home server entry with `"transport": "radsec"` and a `tls`
+block (`/certs/ca.crt`, `/certs/usg-proxy.crt`, `/certs/usg-proxy.key`,
+`server_name: "freeradius"`) and no `secret`: the proxy keeps one TLS 1.3
+connection to `10.77.0.10:2083` and re-keys User-Password, the MS-MPPE keys
+and both authenticators between `nas-proxy-secret-1` and the fixed `"radsec"`.
+FreeRADIUS's client entry for the proxy (`clients radsec`) has
+`require_message_authenticator = yes`, so nothing on that hop is accepted
+without a Message-Authenticator computed under `"radsec"`. Proven inside the
+`nas` container (nine assertions):
+
+- `eapol_test/eap-tls-radsec.conf` (identity `eaptls@radsec.test`): exits 0,
+  prints `SUCCESS`, EAP-Success arrives through the proxy, `MPPE keys OK: 1
+  mismatch: 0` and no PMK mismatch — the MS-MPPE keys FreeRADIUS encrypted
+  under `"radsec"` were decrypted by the proxy, re-encrypted under the NAS
+  secret and match the MSK eapol_test derived itself.
+- `papuser@radsec.test` with the correct password (radclient to the proxy):
+  exit 0, `Received Access-Accept`, and the RadSec realm's `Reply-Message`
+  (`PAP via usg-radius proxy over RadSec OK`) relayed — the request leg's
+  User-Password and Message-Authenticator were re-keyed to `"radsec"`, or
+  FreeRADIUS's PAP compare and Message-Authenticator check would have failed.
+- A wrong password gets `Received Access-Reject` (not a timeout, not an
+  accept).
+
+The `nas` container sees only the UDP side, so `run.sh` proves the hop from
+the FreeRADIUS and proxy logs (nine host-side checks, after the three probe
+checks above):
+
+- FreeRADIUS logged `RADIUS/TLS - Connection Established`,
+  `TLS-Session-Version = "TLS 1.3"`,
+  `TLS-Session-Cipher-Suite = "TLS_AES_256_GCM_SHA384"` (the only suite the
+  proxy offers) and `TLS-Client-Cert-Subject … CN=usg-proxy` (the proxy's
+  client certificate verified against `ca.crt`).
+- `papuser@radsec.test` was received on port 2083 and never on UDP 1812 (no
+  UDP fallback); control: `papuser@freeradius.test` still arrives on UDP 1812.
+  FreeRADIUS's `-fxx` output prints `(N) Received Access-Request Id I from
+  10.77.0.20:P to ADDR:PORT length L` per request followed by `(N)   Attr =
+  value` lines; `run.sh` maps request counters to ports and User-Names (the
+  TLS listener is bound to `*`, so its address prints as `0.0.0.0:2083`).
+- usg-proxy logged `RadSec link established` for `server=freeradius-radsec`
+  with `group=Some(MLKEM1024)` — rustls's own record of the negotiated
+  key-exchange group, so the ML-KEM-1024 claim is interop evidence rather than
+  an inference from "nothing else is offered".
+
+Together these show, against an independent implementation, RFC 6614 §2.1
+(TCP 2083), §2.3 (TLS 1.3, mutual X.509 authentication, fixed `"radsec"`
+secret), §2.5 (Access-Request and Status-Server on one connection) and §3.4
+(`Length`-delimited packets on the stream), plus the proxy's per-hop re-keying
+with `"radsec"` as the home secret. Not exercised here: a FreeRADIUS-initiated
+idle close and the reconnect that follows (the 5 s probes keep the connection
+inside FreeRADIUS's 30 s `idle_timeout`; reconnect is covered by the unit tests
+against an in-tree TLS home server), and `tls.revocation` on the RadSec hop
+(proven with rcgen-generated CRLs in the unit tests only).
 
 ### Server fixes this test drove out
 
@@ -335,3 +413,12 @@ docker compose run --rm --no-deps --entrypoint eapol_test nas \
 eapol_test at this debug level prints the TLS version, the decrypted MS-MPPE
 keys, the derived PMK/MSK, and `MPPE keys OK: N  mismatch: M`; a mismatch there
 isolates the break to the key material rather than the RADIUS transport.
+
+For the RadSec hop, `docker compose -f tests/interop/compose.yaml logs
+freeradius` shows the TLS handshake as FreeRADIUS saw it: a failed one logs
+`(TLS) Failed reading from OpenSSL: ... no suitable key share` (the client
+offered no group FreeRADIUS accepts — check `ecdh_curve`) or `peer did not
+return a certificate` (no client certificate), and the connection is closed. A
+clean close by the proxy logs `Unable to recover from TLS error, closing
+socket`, which is a normal `close_notify`, not a failure. The proxy's side is
+`RadSec link established` / `RadSec link lost` in `logs usg-proxy`.

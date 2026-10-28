@@ -6,7 +6,9 @@
     "Per home server, `transport` is `udp` (default; `secret` required) or `radsec` (`tls` block required; `secret` must be absent — RFC 6614 §2.3 fixes the hop secret to the string \"radsec\", and the TLS certificates are what authenticate the hop).",
     "`tls.server_name` is the DNS name or IP literal the home server's certificate must be valid for; it is also sent as SNI. The link verifies the certificate chain against `tls.ca_path` and never falls back to UDP.",
     "`tls.revocation` is the same block as `eap.tls.revocation` / `radsec.revocation` and checks the home server's certificate for revocation (needs a binary built with the `revocation` feature); see examples/proxy_config.json for a static-CRL example.",
-    "While the link is down, forwarded requests wait in the proxy cache and the retry manager resends them; after `retry.max_retries` the NAS receives a signed Access-Reject."
+    "While the link is down, forwarded requests wait in the proxy cache and the retry manager resends them; after `retry.max_retries` the NAS receives a signed Access-Reject.",
+    "`health_check.enabled` must be true when any home server uses `radsec`: the RFC 5997 Status-Server probe is the RFC 6613 §2.6 watchdog of the connection (two unanswered probes reset it), and `health_check.interval` should stay below the home server's TLS idle timeout so the connection stays warm.",
+    "`max_outstanding` is at most 255 per RadSec home server (RFC 6613 §2.6.5: one Identifier space per connection, one Identifier kept free for the watchdog)."
   ],
 
   "listen_address": "::",

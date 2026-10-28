@@ -30,7 +30,7 @@ Layout:
 
 | Path | Role |
 |------|------|
-| `run.sh` | Host driver (docker, or a running Lima VM with docker). After the `nas` run it checks, from the logs, the proxy's Status-Server probes to every home server and the RadSec hop: TLS 1.3, `TLS_AES_256_GCM_SHA384`, client certificate `CN=usg-proxy`, `papuser@radsec.test` received on 2083 and never on 1812, `RadSec link established` on the proxy |
+| `run.sh` | Host driver (docker, or a running Lima VM with docker). After the `nas` run (76 assertions in 15 scenarios) it checks, from the logs, the proxy's Status-Server probes to every home server and the RadSec hop: TLS 1.3, `TLS_AES_256_GCM_SHA384`, client certificate `CN=usg-proxy`, `papuser@radsec.test` received on 2083 and never on 1812, `RadSec link established` with `group=Some(MLKEM1024)` on the proxy (12 host-side checks) |
 | `gen-certs.sh` | Test PKI → `certs/` (git-ignored, regenerated on demand): CA, server certificates for FreeRADIUS (EAP-TLS and the RadSec listener) and usg-home, the proxy's RadSec client certificate `usg-proxy.crt` (EKU clientAuth), EAP-TLS client certificates, and `ca.crl`, which revokes `client-usg-revoked.crt` |
 | `compose.yaml` | Network 10.77.0.0/24: freeradius .10 (UDP 1812/1813, RadSec 2083), usg-proxy .20, usg-home .30, nas .40 |
 | `freeradius/` | Dockerfile (trixie: OpenSSL 3.5 for ML-KEM; runs `-fxx`, threaded, because TLS sockets need threads), `clients.conf` (UDP client), `sites-radsec` (RFC 6614 listener on 2083 with `ecdh_curve = "MLKEM1024"`, client `usg-proxy-tls` with secret `radsec`), `eap` (mods-available), `authorize` |

@@ -6,7 +6,7 @@ This document identifies gaps between the current USG RADIUS implementation and 
 
 **Overall Status**: Production-ready for modern enterprise authentication with EAP-TLS over RadSec, server-originated CoA/Disconnect, certificate revocation checking, comprehensive rate limiting, accounting, and security features. Reflects the code at **v0.12.0**.
 
-**Implemented**: Core RADIUS authentication (RFC 2865, PAP + CHAP), Accounting (RFC 2866) on a dedicated 1813/udp socket, Message-Authenticator (RFC 2869 / RFC 3579), EAP-TLS (RFC 5216 / RFC 9190), EAP-TEAP (RFC 9930, Basic-Password-Auth inner method, interoperable with wpa_supplicant), EAP-Nak method negotiation (RFC 3748 §5.3.1), MS-MPPE key delivery (RFC 2548), RadSec (RFC 6614), Status-Server (RFC 5997), CoA/Disconnect (RFC 5176), certificate revocation checking (RFC 5280 CRL, RFC 6960 OCSP) for EAP-TLS supplicant and RadSec NAS certificates, RADIUS proxy with secret re-keying on both legs, Rate Limiting, DoS Protection
+**Implemented**: Core RADIUS authentication (RFC 2865, PAP + CHAP), Accounting (RFC 2866) on a dedicated 1813/udp socket, Message-Authenticator (RFC 2869 / RFC 3579), EAP-TLS (RFC 5216 / RFC 9190), EAP-TEAP (RFC 9930, Basic-Password-Auth inner method, interoperable with wpa_supplicant), EAP-Nak method negotiation (RFC 3748 §5.3.1), MS-MPPE key delivery (RFC 2548), RadSec (RFC 6614), Status-Server (RFC 5997), CoA/Disconnect (RFC 5176), certificate revocation checking (RFC 5280 CRL, RFC 6960 OCSP) for EAP-TLS supplicant, RadSec NAS and RadSec home-server certificates, RADIUS proxy with secret re-keying on both legs and a UDP or RadSec (RFC 6614 / RFC 6613) upstream leg per home server, Rate Limiting, DoS Protection
 **Partial**: EAP-TEAP inner methods that derive keying material (EAP-MSCHAPv2, inner EAP-TLS), OCSP response signature verification
 **Missing**: legacy tunneled EAP methods (TTLS/PEAP), DTLS transport, UDP-originated CoA
 
@@ -640,9 +640,9 @@ the in-memory `users` list does.
 - ✅ **Reply code follows the port** (§4.2): Access-Accept on the authentication socket and over RadSec, Accounting-Response on the accounting socket
 - ✅ Reply carries a correct Response Authenticator (RFC 2865 §3 / RFC 2866 §3) and a Message-Authenticator (the §5 attribute table permits it on both reply codes; radclient and FreeRADIUS verify it when present); Proxy-State echoed unmodified and in order (RFC 2865 §5.33); nothing else — no State, EAP-Message or Reply-Message
 - ✅ **The proxy never forwards Status-Server** (§4.3): it is answered before any routing decision, so a NAS probing the proxy learns the proxy's liveness only
-- ✅ **Home-server health probes are RFC 5997 clients**: random Request Authenticator (§3) and Identifier, Message-Authenticator under the home server's secret (§4.1), an ephemeral socket per probe so concurrent probes cannot mis-attribute replies. A reply counts only if it comes from the probed address with the same Identifier, its Response Authenticator verifies under that secret, and any Message-Authenticator it carries verifies too (§4.4, RFC 3579 §3.2). Access-Accept, Accounting-Response and an authenticated Access-Reject (which §4.2 permits a server to send) count as alive; an undecodable datagram, any other code, or a datagram that fails either check is skipped and the probe keeps waiting, so the probe fails only when its deadline passes without a verified reply
+- ✅ **Home-server health probes are RFC 5997 clients**: random Request Authenticator (§3), Message-Authenticator under the home server's secret (§4.1; the fixed `"radsec"` over RadSec). Over UDP each probe uses an ephemeral socket and a random Identifier, so concurrent probes cannot mis-attribute replies, and a reply counts only if it comes from the probed address; over a RadSec link the probe travels on the home server's authenticated TLS connection with an Identifier chosen from the ones free on that connection, and the TLS peer authentication stands in for the source-address check. On both transports the reply must carry the probe's Identifier, its Response Authenticator must verify under that secret, and any Message-Authenticator it carries must verify too (§4.4, RFC 3579 §3.2). Access-Accept, Accounting-Response and an authenticated Access-Reject (which §4.2 permits a server to send) count as alive; an undecodable datagram, any other code, or a reply that fails either check is skipped and the probe keeps waiting, so the probe fails only when its deadline passes without a verified reply. Over RadSec the probe is also the RFC 6613 §2.6 / RFC 3539 §3.4 watchdog of the connection (§4.3): a reply that fails an authenticator check closes the connection, as do two consecutive unanswered probes
 - ✅ Rate limiting and the duplicate-request cache apply to Status-Server as to every other code (§6)
-- ✅ Interop (scenario 14): radclient Status-Server to usg-home on 1812 → Access-Accept, on 1813 → Accounting-Response, to the proxy on 1812 → Access-Accept, each reply carrying a Message-Authenticator; wrong secret → no reply. The proxy's own probes against FreeRADIUS and usg-home are asserted to succeed with health checks enabled
+- ✅ Interop (scenario 14): radclient Status-Server to usg-home on 1812 → Access-Accept, on 1813 → Accounting-Response, to the proxy on 1812 → Access-Accept, each reply carrying a Message-Authenticator; wrong secret → no reply. The proxy's own probes against its three home servers — FreeRADIUS over UDP, FreeRADIUS over RadSec (inside the TLS connection) and usg-home — are asserted to succeed with health checks enabled
 
 ### ⚠️ Partial
 
@@ -675,7 +675,7 @@ the in-memory `users` list does.
 ### ❌ Not Implemented
 
 - ❌ **CoA/Disconnect over UDP** (RFC 5176 default port 3799). Only the RadSec path exists; a NAS that is not connected via RadSec cannot be reached.
-- ❌ Inbound CoA/Disconnect handling (the server only originates requests; it is not a Dynamic Authorization Server for upstream systems)
+- ❌ Inbound CoA/Disconnect handling (the server only originates requests; it is not a Dynamic Authorization Server for upstream systems). A CoA-Request / Disconnect-Request that a home server sends down the proxy's outbound RadSec link is answered with CoA-NAK / Disconnect-NAK, `Error-Cause` 406 (§3.5, RFC 6614 §2.5), not relayed to the NAS
 - ❌ Automatic retransmission / Event-Timestamp replay window on the server side
 
 **Files**:
@@ -688,32 +688,79 @@ the in-memory `users` list does.
 
 ## RFC 6614 - RADIUS over TLS (RadSec)
 
-### ✅ Implemented (v0.10.0)
+### ✅ Implemented (v0.10.0 inbound; outbound unreleased)
 
-**Status**: ✅ Default transport for configuration files (`transport = "radsec"`); plain UDP is the explicit `transport = "udp-insecure"` fallback and logs a startup warning
-**Build**: Requires the `tls` cargo feature (default features; the container image builds it since v0.10.1)
+**Status**: ✅ Default transport for configuration files (`transport = "radsec"`); plain UDP is the explicit `transport = "udp-insecure"` fallback and logs a startup warning. ✅ The proxy reaches a home server over RadSec when that home server is configured with `transport = "radsec"` (unreleased)
+**Build**: Requires the `tls` cargo feature (default features; the container image builds it since v0.10.1). A `transport = "radsec"` home server is a configuration error in a binary built without it (fail closed)
 
-**Features**:
+**Features (inbound listener, NAS → server)**:
 
 - ✅ TLS 1.3 listener on 2083/tcp (default `::`, dual-stack) with ML-KEM-1024-only key exchange (FIPS 203) via `usg-fips-tls`; negotiated parameters re-checked after the handshake, fail closed
 - ✅ Mutual TLS: NAS client certificate verified against `radsec.client_ca_path`; the client-cert CN is the authenticated NAS identity
-- ✅ RADIUS framing inside the tunnel delimited by the RADIUS `Length` field (RFC 6614 §2.2)
-- ✅ Fixed shared secret `"radsec"` for Authenticator / Message-Authenticator math (RFC 6614 §2.3)
+- ✅ RADIUS packets sent as-is on the stream and delimited by their own `Length` field (RFC 6614 §3.4 item 1); a `Length` outside 20..=4096 closes the connection (RFC 6613 §2.6.4)
+- ✅ Fixed shared secret `"radsec"` for Authenticator / Message-Authenticator math (RFC 6614 §2.3 item 4)
 - ✅ Authentication, accounting, and Status-Server on the single connection (§2.5); a Status-Server inside the tunnel must carry a Message-Authenticator under `"radsec"` and is answered with Access-Accept (RFC 5997 §4.1, §4.2)
 - ✅ Bidirectional connection used for server-originated CoA/Disconnect (RFC 5176)
+
+**Features (outbound link, proxy → home server; unreleased)**:
+
+- ✅ Per home server `transport: "udp"` (default) or `"radsec"` in `proxy.pools[].servers[]`, with a `tls` block (`ca_path`, `cert_path`, `key_path`, `server_name`, optional `revocation`). No `secret` is accepted for a RadSec home server: the hop secret is the fixed `"radsec"` (§2.3 item 4), so every re-keying step the proxy already performs (User-Password and Message-Authenticator on the request leg; Response Authenticator, MS-MPPE-Send/Recv-Key, Tunnel-Password and Message-Authenticator on the response leg) is keyed by `"radsec"` on that hop ([crates/radius-server/src/proxy/home_server.rs](../../crates/radius-server/src/proxy/home_server.rs))
+- ✅ **One persistent TLS connection per RadSec home server** (§2.5; "as per RFC 6613", §2.3 item 1) owned by a link task, built with the same `usg-fips-tls` provider as the listener: TLS 1.3 only, ML-KEM-1024-only key exchange, `TLS_AES_256_GCM_SHA384`, session resumption disabled so every reconnect is a full handshake with full certificate verification, no ALPN; `enforce_fips_parameters` re-checks the negotiated version, suite and group before a RADIUS byte is written. Failure to connect leads to continuous retries with exponentially growing, jittered intervals (§2.3 item 1: 500 ms doubling to a 30 s cap, ±25 %) ([crates/radius-server/src/proxy/radsec_client.rs](../../crates/radius-server/src/proxy/radsec_client.rs))
+- ✅ **Mutual authentication** (§2.3 item 2) with X.509 certificates: the proxy presents `tls.cert_path`/`tls.key_path`; the home server's chain is validated per RFC 5280 against `tls.ca_path` and must be valid for `tls.server_name` (DNS name or IP literal, also sent as SNI) (§2.3 item 3). The TLS connection authenticates the home server, so a proxied response is attributed to the home server by the connection it arrived on, never by source address, and a UDP datagram can never satisfy a RadSec entry
+- ✅ **Fail closed, no UDP fallback**: a TLS verification or parameter failure keeps the link down; while it is down a forwarded request stays in the proxy cache and the retry manager resends it on a new connection or, after `retry.max_retries`, answers the NAS with the signed Access-Reject it already understands
+- ✅ Home-server certificate **revocation checking** through the same `revocation` block as `eap.tls.revocation` / `radsec.revocation` (static CRLs, CRL Distribution Points, OCSP, fail-closed default): a `ServerCertVerifier` adapter runs WebPKI chain/validity/name validation first, then `RevocationCheckingVerifier::check_revocation` ([crates/radius-server/src/server_verifier.rs](../../crates/radius-server/src/server_verifier.rs))
+- ✅ Packets delimited by `Length` on the stream (§3.4 item 1) with the shared `take_frame`; **the connection is closed** on a `Length` outside 20..=4096, on a correctly framed packet that does not decode, on a proxied response whose Response Authenticator fails, and on a Status-Server reply whose Response Authenticator or Message-Authenticator fails (RFC 6613 §2.6.4); it is then re-established with backoff. A response that matches no outstanding request is discarded and the connection kept (§2.6.4 permits either)
+- ✅ RFC 5997 Status-Server probes travel over the same connection as the **RFC 3539 §3.4 application-layer watchdog** RFC 6613 §2.6 mandates (see RFC 6613 below); the probe's Identifier is chosen from the ones free on the connection
+- ✅ CoA-Request / Disconnect-Request arriving on the outbound link from the home server are answered with CoA-NAK / Disconnect-NAK carrying `Error-Cause` 406 (Unsupported Extension), signed under `"radsec"` (§2.5, RFC 5176 §3.5); dynamic authorization is not relayed to the NAS
+- ✅ Interop (scenario 15, `tests/interop/run.sh`): eapol_test EAP-TLS and radclient PAP → usg-radius proxy → FreeRADIUS 3.2.7 (OpenSSL 3.5.7) over RadSec, with a different secret on the NAS hop. FreeRADIUS's own log is the independent witness: `RADIUS/TLS - Connection Established`, `TLS-Session-Version = "TLS 1.3"`, `TLS-Session-Cipher-Suite = "TLS_AES_256_GCM_SHA384"`, the proxy's client certificate `CN=usg-proxy`, requests for the RadSec realm received on 2083 and never on UDP 1812; the proxy's log shows `RadSec link established` with `group=Some(MLKEM1024)`; eapol_test's `MPPE keys OK: 1  mismatch: 0` proves the response-leg re-keying from `"radsec"` to the NAS secret, and the PAP Access-Accept / wrong-password Access-Reject prove the request-leg re-keying to `"radsec"` (FreeRADIUS requires Message-Authenticator on that client)
+
+### ⚠️ Partial
+
+- ⚠️ **Proxy inactive under inbound `transport = "radsec"`** (pre-existing): `main.rs` runs the RadSec accept loop and never constructs the proxy components, so RadSec-in → RadSec-out proxying is not available; the proxy, and with it the outbound link, run only when the NAS hop is `transport = "udp-insecure"`
+- ⚠️ Stapled OCSP responses (RFC 6066 §8) on the home server's certificate are **ignored**; revocation is decided solely by `tls.revocation`
+- ⚠️ With `crl.fetch = true` or any OCSP mode the revocation fetch runs blocking inside the TLS handshake on the link's worker; the effective handshake deadline is the home server's `timeout` plus the fetch timeout, and the worker is pinned for that long on every reconnect (same pattern as the inbound listener; static CRLs never block). `// TODO(gap)` in [crates/radius-server/src/server_verifier.rs](../../crates/radius-server/src/server_verifier.rs)
+- ⚠️ No TCP keepalive or write timeout on the link: a half-dead peer is detected by the watchdog only (two unanswered probes: `2 × health_check.interval + health_check.timeout`), and a peer that stops reading while its socket stays alive stalls the link task until it resumes (the pool still fails over once probes mark the server Down)
+- ⚠️ Accounting-Request is not proxied over either transport (pre-existing)
 
 ### ❌ Not Implemented
 
 - ❌ **DTLS** (RFC 7360)
-- ❌ TLS 1.2 or non-ML-KEM cipher suites (intentionally excluded by the FIPS posture)
-- ❌ Certificate hot-rotation (certificates are loaded at startup; rotate via pod restart)
-- ❌ Certificate pinning / dynamic trust store reload
-- ❌ Outbound RadSec (proxying to upstream servers over TLS; the proxy module is UDP-only)
+- ❌ TLS 1.1/1.2 and the mandatory-to-implement suite `TLS_RSA_WITH_3DES_EDE_CBC_SHA` of §2.2 (intentionally excluded by the FIPS/PQ posture, inbound and outbound alike); a peer that cannot negotiate TLS 1.3 + ML-KEM-1024 + AES-256-GCM-SHA384 does not connect
+- ❌ Certificate hot-rotation (listener and outbound client certificates and CA bundles are loaded at startup; rotate via pod restart)
+- ❌ Certificate pinning / fingerprint-based trust (§2.3 item 3 SHOULD) and TLS-PSK (§2.3 item 2 MAY), inbound and outbound; X.509 chains to a configured CA only
+- ❌ Identifier rewriting on the upstream hop (see RFC 6613 below)
 
 **Files**:
 
 - [crates/radius-server/src/radsec.rs](../../crates/radius-server/src/radsec.rs) - Listener and connection loop
+- [crates/radius-server/src/radsec_frame.rs](../../crates/radius-server/src/radsec_frame.rs) - `RADSEC_SECRET`, `take_frame` and the `Length` bounds, shared by the listener and the link
+- [crates/radius-server/src/proxy/radsec_client.rs](../../crates/radius-server/src/proxy/radsec_client.rs) - Outbound link task (connect, FIPS gate, framing, demux, reconnect, CoA/Disconnect NAK)
+- [crates/radius-server/src/proxy/home_server.rs](../../crates/radius-server/src/proxy/home_server.rs) - `HomeServerTransport`, `HomeServerTlsConfig` and validation
+- [crates/radius-server/src/server_verifier.rs](../../crates/radius-server/src/server_verifier.rs) - Home-server certificate verifier (WebPKI + revocation)
 - [crates/radius-server/src/config.rs](../../crates/radius-server/src/config.rs) - `Transport` and `RadSecConfig`
+
+---
+
+## RFC 6613 - RADIUS over TCP (as used by RadSec)
+
+RFC 6613 is a normative reference of RFC 6614: RadSec connections are established and used "as per RFC 6613" (RFC 6614 §2.3 item 1) and receiver behaviour on bad frames is deferred to RFC 6613 §2.6.4 (RFC 6614 §3.4). usg-radius implements no plain RADIUS/TCP listener or client (RFC 6613 is Experimental and offers no security without TLS); the rules below apply to the RadSec connections.
+
+### ✅ Implemented (outbound link; unreleased)
+
+- ✅ **No retransmission over the same connection** (§2.6.1): the proxy cache records the link connection a request was written on; the retry manager resends a timed-out request only when the link is down or has moved to a new connection, and otherwise lets the deadline run to the signed Access-Reject after `retry.max_retries` ([crates/radius-server/src/proxy/retry.rs](../../crates/radius-server/src/proxy/retry.rs)). Modulo a reconnect racing the send: the connection generation is read just before the frame is queued, so a reconnect completing in that window can yield one extra copy on the new connection
+- ✅ **Connection closed on protocol violations** (§2.6.4): bad `Length`, undecodable packet, failed Response Authenticator on a proxied response, failed Response Authenticator or Message-Authenticator on a watchdog reply; re-established with backoff. A response that matches no request (unknown Proxy-State, unknown probe Identifier) is discarded and the connection kept
+- ✅ **Application-layer watchdog** (§2.4, §2.6; RFC 3539 §3.4; RFC 5997 §4.3): Status-Server is the watchdog message on every RadSec link, so `health_check.enabled = false` with a RadSec home server is a configuration error; two consecutive unanswered probes close the connection (RFC 3539 §3.4: not before the watchdog timer has expired twice) and the link reconnects. The miss counter is per home server, not per connection: after an outage the first missed probe on a fresh connection already resets it (earlier than RFC 3539 strictly requires, never later)
+- ✅ **Identifier space per connection** (§2.6, §2.6.5): the link tracks the Identifiers in flight on the current connection (released by the matching reply, aged out after 60 s, cleared on reconnect); the probe never takes an Identifier already in flight, but a forwarded request arriving later may still carry the probe's Identifier because NAS Identifiers are not rewritten (the accepted gap below), so the reservation is one-directional; `max_outstanding ≤ 255` is enforced at config load for a RadSec home server (one connection carries at most 256 outstanding requests with one reserved for the watchdog)
+
+### ⚠️ Partial
+
+- ⚠️ **NAS Identifiers are forwarded unchanged** on the one connection (§2.6, §2.6.5 "proxies ... with several clients need Identifier management"): no Identifier rewriting on the upstream hop, exactly as on the UDP socket today. Two NASes using the same Identifier at the same time collide on the connection; the proxy correlates by Proxy-State, so only a home server that deduplicates on (connection, Identifier) is affected and may discard the older request (§2.6.1 "Servers SHOULD still perform duplicate detection"). Accepted gap for this release — `// TODO(gap)` in [crates/radius-server/src/proxy/radsec_client.rs](../../crates/radius-server/src/proxy/radsec_client.rs)
+- ⚠️ §2.6.5 SHOULD reserve Identifier zero for Status-Server; the probe uses any free Identifier instead
+- ⚠️ An Identifier the home server never answers stays in flight for 60 s (`identifier_ttl`), longer than the retry manager's reject; a home server that silently drops many requests can leave the watchdog no free Identifier, and a probe that finds none is skipped and counted as a miss (two in a row reset the connection, which clears the set) — availability only
+- ⚠️ A write to a peer that stops reading (TCP window closed, socket alive) cannot be pre-empted by the watchdog reset: no write timeout and no TCP keepalive / `TCP_USER_TIMEOUT`; the health checker still marks the server Down and the pool fails over, the link itself recovers when the peer resumes or its TCP state disappears
+- ⚠️ The inbound listener closes the connection on a bad `Length` only; an undecodable frame or a failed authenticator on an inbound request is dropped and the connection kept (pre-existing)
+
+**Priority**: LOW (availability under Identifier collision; no authentication impact)
 
 ---
 
@@ -806,13 +853,13 @@ Set `"audit_log_path": "stdout"` (or `"-"`) to emit JSON Lines on stdout for the
 
 #### Certificate Revocation (CRL/OCSP) ✅ INTEGRATED
 
-**Status**: ✅ Wired into EAP-TLS and RadSec client-certificate verification (v0.12.0)
+**Status**: ✅ Wired into EAP-TLS and RadSec client-certificate verification (v0.12.0) and into the proxy's verification of RadSec home-server certificates (unreleased)
 **RFC**: RFC 5280 (CRL), RFC 6960 (OCSP), RFC 8954 (OCSP nonce)
 
 **Implemented** (`revocation` cargo feature of `radius-server`, which enables `radius-proto`'s; built into the container image, the release binary and the interop image):
 
-- ✅ `revocation` config block under `eap.tls` (supplicant certificates) and under `radsec` (NAS client certificates): `mode` (`crl_only` default, `ocsp_only`, `prefer_ocsp`, `both`), `on_error` (`fail_closed` default, `fail_open`), `crl.static_files`, `crl.fetch` + timeout/TTL/cache/size limits, `ocsp` timeout/TTL/cache/nonce/size limits. Validated at startup; a binary without the feature rejects a config that asks for it.
-- ✅ The rustls `WebPkiClientVerifier` of each listener is wrapped in `RevocationCheckingVerifier` when the block is present (chain validation first, then revocation); without the block the plain verifier is used unchanged
+- ✅ `revocation` config block under `eap.tls` (supplicant certificates), under `radsec` (NAS client certificates) and under `proxy.pools[].servers[].tls` (RadSec home-server certificates, checked by the proxy as a TLS client): `mode` (`crl_only` default, `ocsp_only`, `prefer_ocsp`, `both`), `on_error` (`fail_closed` default, `fail_open`), `crl.static_files`, `crl.fetch` + timeout/TTL/cache/size limits, `ocsp` timeout/TTL/cache/nonce/size limits. Validated at startup; a binary without the feature rejects a config that asks for it.
+- ✅ The rustls `WebPkiClientVerifier` of each listener is wrapped in `RevocationCheckingVerifier` when the block is present (chain validation first, then revocation); without the block the plain verifier is used unchanged. On the outbound RadSec link the same `check_revocation` runs behind rustls's `WebPkiServerVerifier` (chain, validity, `server_name`, then revocation); a stapled OCSP response is not consulted
 - ✅ Static CRL files (PEM/DER) loaded at startup and matched to the certificate's issuer; CRL Distribution Points fetched over HTTP(S) with TTL cache when enabled; `thisUpdate`/`nextUpdate` freshness enforced
 - ✅ OCSP request per RFC 6960 §4.1.1 (issuer taken from the handshake intermediates or the configured CA bundle), RFC 8954 nonce, response cache bounded by `nextUpdate`
 - ✅ Fail-closed by default: an undeterminable status (no source covers the issuer, fetch/parse/freshness error, responder unreachable) rejects the client; `fail_open` accepts and logs. A positive "revoked" always rejects
@@ -822,7 +869,7 @@ Set `"audit_log_path": "stdout"` (or `"-"`) to emit JSON Lines on stdout for the
 **Limitations**:
 
 - ⚠️ CRL and OCSP response **signatures are not verified** by the module (a CRL fetched from a Distribution Point, or an OCSP response, is trusted as delivered). Static CRL files sit in the same trust position as the CA bundle; for fetched sources use HTTPS Distribution Points / responders on a trusted path, or prefer `crl.static_files`. OCSP mode logs a startup warning for this reason
-- ⚠️ CRL/OCSP fetches block the TLS handshake for up to the configured timeout (default 5 s); size the timeout against the NAS's RADIUS timeout
+- ⚠️ CRL/OCSP fetches block the TLS handshake for up to the configured timeout (default 5 s); size the timeout against the NAS's RADIUS timeout. On the outbound RadSec link the fetch runs on the link task's worker on every (re)connect and the home server's `timeout` cannot pre-empt it, so the effective handshake deadline is `timeout` + fetch timeout; static CRLs never block
 - ⚠️ Only the end-entity certificate is checked (not intermediates); no delta CRLs; the CRL `nextUpdate` is enforced but `crlNumber` is not tracked
 - ⚠️ Static CRL files are read once at startup (no hot reload)
 
@@ -830,6 +877,7 @@ Set `"audit_log_path": "stdout"` (or `"-"`) to emit JSON Lines on stdout for the
 
 - [crates/radius-proto/src/revocation/](../../crates/radius-proto/src/revocation/) - CRL/OCSP module and `RevocationCheckingVerifier`
 - [crates/radius-server/src/client_verifier.rs](../../crates/radius-server/src/client_verifier.rs) - verifier selection for EAP-TLS and RadSec
+- [crates/radius-server/src/server_verifier.rs](../../crates/radius-server/src/server_verifier.rs) - verifier selection for RadSec home-server certificates (outbound link)
 - [crates/radius-server/src/config.rs](../../crates/radius-server/src/config.rs) - `RevocationConfig` and validation
 - [examples/configs/eap-tls-revocation.json](../../examples/configs/eap-tls-revocation.json) - documented example
 - [docs/docs/development/CRL-IMPLEMENTATION-PLAN.md](../development/CRL-IMPLEMENTATION-PLAN.md) - Design notes
@@ -1036,7 +1084,7 @@ Total:         156+ tests
 4. ✅ **Authentication Backends** - LDAP, PostgreSQL, EAP-TLS
 5. ✅ **CHAP Support** (v0.3.0) - Challenge/response with CHAP-Challenge fallback to the Request Authenticator
 6. ✅ **Message-Authenticator** (v0.3.0, required on EAP since v0.10.0) - HMAC-MD5 verification and generation
-7. ✅ **RadSec** (v0.10.0) - TLS 1.3 / ML-KEM-1024 mutual-TLS transport, default for config files
+7. ✅ **RadSec** (v0.10.0; outbound unreleased) - TLS 1.3 / ML-KEM-1024 mutual-TLS transport, default for config files; the proxy reaches `transport = "radsec"` home servers over one persistent connection each, watched by Status-Server per RFC 6613
 8. ✅ **CoA/Disconnect** (v0.10.0) - Server-originated over RadSec via the management API
 
 ### Priority 3 (MEDIUM) - ⚠️ PARTIAL
@@ -1099,11 +1147,12 @@ Total:         156+ tests
 | Status-Server | 5997 | ✅ Complete | unreleased | LOW | Message-Authenticator required and verified, Access-Accept / Accounting-Response by port, Proxy-State echoed, proxy answers locally, probes conformant; reply not tied to backend health, no enable/disable switch |
 | CHAP | 2865 | ✅ Complete | v0.3.0 | LOW | CHAP-Challenge or Request Authenticator |
 | Message-Authenticator | 2869 / 3579 | ✅ Complete | v0.3.0 / v0.10.0 | HIGH | Required on EAP requests since v0.10.0 |
-| RadSec | 6614 | ✅ Complete | v0.10.0 | HIGH | TLS 1.3 + ML-KEM-1024 mTLS; no DTLS |
+| RadSec | 6614 | ✅ Complete | v0.10.0 (inbound) / unreleased (outbound) | HIGH | TLS 1.3 + ML-KEM-1024 mTLS, inbound listener and proxy → home-server link (per home server `transport = "radsec"`, fixed `"radsec"` secret, home-server certificate revocation); no DTLS, no certificate pinning/PSK; proxy inactive under an inbound RadSec listener |
+| RADIUS over TCP rules | 6613 | ⚠️ On RadSec links | unreleased | LOW | No retransmission on a connection, close on protocol violation, Status-Server watchdog, Identifier tracking + `max_outstanding ≤ 255`; NAS Identifiers forwarded unchanged (no rewriting on the upstream hop) |
 | CoA/Disconnect | 5176 | ✅ RadSec only | v0.10.0 | MEDIUM | Server-originated via mgmt API; no UDP path |
 | NAS Identification | 2865 | ✅ Complete | v0.2.0 | MEDIUM | NAS-IP-Address or NAS-Identifier enforced |
 | Enumerated Values | 2865 | ✅ Strict mode | v0.2.0 | LOW | Lenient mode accepts unknown values |
-| Certificate Revocation | 5280 / 6960 | ✅ Integrated | v0.7.x / v0.12.0 | HIGH | `revocation` block for EAP-TLS + RadSec, fail-closed default; CRL/OCSP signatures not verified |
+| Certificate Revocation | 5280 / 6960 | ✅ Integrated | v0.7.x / v0.12.0 / unreleased | HIGH | `revocation` block for EAP-TLS, the RadSec listener and (unreleased) RadSec home servers, fail-closed default; CRL/OCSP signatures not verified; stapled OCSP ignored |
 | Accounting Port 1813 | 2866 | ✅ Bound | unreleased | - | `accounting_port`: 1813 (default) / `"shared"` / `"disabled"`; replies from 1813; wrong-port codes discarded |
 | Proxy-State | 2865 | ⚠️ Echoed | v0.x | MEDIUM | Ordering test on the Status-Server path; Access-Accept/Reject ordering tests pending |
 | Hot Reload | - | ❌ Deferred | - | MEDIUM | Only mgmt access policy reloads on SIGHUP |
@@ -1130,7 +1179,7 @@ The current implementation is **PRODUCTION-READY** for:
 
 3. **Modern Wireless Networks**
    - 802.1X port-based authentication
-   - RadSec (RFC 6614) transport between NAS and server
+   - RadSec (RFC 6614) transport between NAS and server, and from the proxy to its home servers
    - Server-originated CoA/Disconnect (RFC 5176) over RadSec
    - RADIUS accounting for usage tracking
 
@@ -1171,7 +1220,17 @@ The current implementation is **PRODUCTION-READY** for:
      different secret on each hop (`tests/interop/run.sh`)
    - Proxy-State echoed; multi-Proxy-State ordering regression tests pending
    - Hot reload not available
-   - Upstream (proxy) leg is UDP only
+   - Upstream leg is UDP or RadSec per home server (`transport = "radsec"`
+     with a `tls` block, fixed `"radsec"` hop secret, one persistent
+     TLS 1.3 / ML-KEM-1024 connection, Status-Server watchdog per RFC 6613,
+     no UDP fallback; interop scenario 15 against FreeRADIUS over RadSec)
+   - The proxy runs only when the NAS hop is `transport = "udp-insecure"`;
+     under an inbound RadSec listener the proxy components are not started
+   - NAS Identifiers are forwarded unchanged on the upstream hop (UDP socket
+     or RadSec connection): two NASes using the same Identifier at the same
+     time collide at a home server that deduplicates on Identifier
+     (RFC 6613 §2.6 gap)
+   - Accounting-Request is not proxied
 
 2. **Legacy Authentication**
    - PAP and CHAP supported
@@ -1206,7 +1265,7 @@ The current implementation is **PRODUCTION-READY** for:
    - ✅ Strong key derivation (RFC 5705)
    - ✅ Cryptographic session binding
    - ✅ Message-Authenticator required on EAP requests (Blast-RADIUS mitigation)
-   - ✅ RadSec transport: TLS 1.3, ML-KEM-1024, mutually authenticated
+   - ✅ RadSec transport: TLS 1.3, ML-KEM-1024, mutually authenticated — NAS → server and proxy → home server; the outbound link never falls back to UDP
 
 2. **DoS Protection**
    - ✅ Per-client rate limiting
@@ -1242,11 +1301,17 @@ The current implementation is **PRODUCTION-READY** for:
    - ✅ Required attributes and enumerations validated (strict mode)
 
 3. **Certificate Lifecycle**
-   - ✅ CRL/OCSP revocation checking of supplicant and NAS certificates at handshake time (`revocation` block, fail-closed default)
-   - ⚠️ CRL/OCSP signatures not verified; static CRL files read once at startup
-   - ⚠️ No certificate hot-rotation for RadSec or EAP-TLS
+   - ✅ CRL/OCSP revocation checking of supplicant, NAS and RadSec home-server certificates at handshake time (`revocation` block, fail-closed default)
+   - ⚠️ CRL/OCSP signatures not verified; static CRL files read once at startup; stapled OCSP on a home-server certificate ignored
+   - ⚠️ CRL Distribution Point / OCSP fetches block the TLS handshake on the worker that runs it (listener and outbound link alike); size the fetch timeout against the home server's `timeout`
+   - ⚠️ No certificate hot-rotation for RadSec (listener or outbound client certificate) or EAP-TLS
 
-4. **EAP Resource Exhaustion**
+5. **Proxy Upstream Hop**
+   - ✅ RadSec home servers: mutual X.509 authentication, chain + `server_name` validation, parameters re-checked after the handshake, resumption disabled, fail closed with no UDP fallback; responses attributed by the authenticated connection, never by source address; connection closed on a failed Response Authenticator or Message-Authenticator (RFC 6613 §2.6.4)
+   - ⚠️ The fixed `"radsec"` secret authenticates nothing on that hop: anyone on the TLS connection is the home server, which is why the link must never fall back and why `secret` is rejected on a RadSec home server
+   - ⚠️ NAS Identifiers forwarded unchanged on one connection (availability under collision, RFC 6613 §2.6; correlation by Proxy-State is unaffected)
+
+6. **EAP Resource Exhaustion**
    - ✅ Inbound EAP-TLS / EAP-TEAP fragment reassembly bounded at 64 KiB per conversation, L required on the first fragment, overrun and empty non-final fragments rejected, fail closed
    - ✅ EAP session store bounded: idle timeout (default 120 s) and LRU cap (default 4096) on conversations and their TLS state, released on Accept/Reject; evicted conversations fail closed; `radius_eap_sessions_evicted_total` counter
    - ✅ EAP-TEAP Phase 2 bounded per conversation (32 rounds, repeated Identity-Type TLV rejected), fail closed; a rejected packet never refreshes a session's LRU position
@@ -1255,7 +1320,7 @@ The current implementation is **PRODUCTION-READY** for:
    - ⚠️ EAP-TEAP with Basic-Password-Auth binds the inner method with the zero IMSK of RFC 9930 §6.2.1: the password is protected by the server-authenticated tunnel only, which the RFC marks NOT RECOMMENDED without a key-deriving inner method; supplicants must validate the server certificate (`ca_cert` / `domain_match`)
    - ⚠️ EAP Identifier not matched on responses and State = `username-millis-sequence` (predictable, unbound to the peer, can restart a live conversation, may exceed 253 octets); redesign as random peer-bound IDs is a tracked follow-up (see RFC 3748 above)
 
-5. **EAP-TEAP Inner Authentication**
+7. **EAP-TEAP Inner Authentication**
    - ✅ Basic-Password-Auth fails closed: no stored password, empty stored password or empty supplied password → Result=Failure inside the tunnel and Access-Reject; constant-time password comparison. An unreleased build (after v0.12.0, before this fix) accepted an empty password for any user without a stored password
    - ⚠️ Basic-Password-Auth needs the inner handler to supply the user's cleartext password (`get_user_password`): only the in-memory `users` list does; the PostgreSQL and LDAP handlers reject every TEAP authentication. `eap.enable_teap` therefore defaults to `false`
    - ⚠️ Inner methods with real keying material (EAP-MSCHAPv2, inner EAP-TLS) pending; current inner methods use the zero IMSK of RFC 9930 §6.2.1
@@ -1315,9 +1380,9 @@ The USG RADIUS server is **production-ready** for modern enterprise deployments 
 - **v0.10.1**: Container image built with the `tls` feature
 - **v0.11.0**: **MS-MPPE-Send/Recv-Key (RFC 2548)** on EAP Access-Accepts, RFC 9190 TLS 1.3 exporter labels + EAP-Key-Name, EAP-TEAP IMCK/CMK (RFC 7170 §5.2) and MSK (§5.4), Vendor-Specific and Tunnel-Password codecs, proxy re-keying of User-Password / Message-Authenticator (request leg) and MS-MPPE / Tunnel-Password / Message-Authenticator (response leg), signed proxy timeout rejects
 - **v0.12.0**: **Certificate revocation checking (RFC 5280 / RFC 6960)** wired into EAP-TLS and RadSec via the `revocation` block, fail-closed by default; EAP-Failure on every EAP Access-Reject (RFC 3579 §2.6.3); interop harness (revoked supplicant, 24 assertions) running in CI
-- **Unreleased**: **EAP-TEAP interoperable with wpa_supplicant (RFC 9930)**: §4.2.13 Crypto-Binding TLV with §6.3 Compound-MACs, §6.2 / §6.4 key schedule with the negotiated cipher suite's hash (pinned by independent known-answer vectors), §3.1 version bits, §3.6.6 Intermediate-Result + Result + Crypto-Binding termination, §4.2.15 one-octet Basic-Password-Auth-Resp lengths, RFC 3748 §5.3.1 EAP-Nak method switching, `eap.teap_tls`; interop harness on wpa_supplicant 2.12 with four TEAP scenarios (57 assertions). EAP-TEAP fragmentation in both phases and directions (§3.3) through the bounded reassembler, L flag only on fragmented TEAP messages, Phase 2 opened with the handshake flight, EAP-Success Identifier echoing the peer's last Response (RFC 3748 §4.2), first EAP-Request Identifier following the NAS's Identity Request (RFC 3748 §4.1); bounded EAP session store (idle timeout enforced on every packet + LRU cap, released on Accept/Reject, fail closed, `radius_eap_sessions_evicted_total`); `eap` block documented; EAP-TEAP Basic-Password-Auth fails closed (fixes an unreleased empty-password bypass), Phase 2 rounds bounded, `eap.enable_teap` default `false`. **Status-Server per RFC 5997**: Message-Authenticator required and verified with silent discard (§4.1), Access-Accept on the authentication port / Accounting-Response on the accounting port (§4.2), Message-Authenticator on every reply, Proxy-State echoed, proxy answers locally and never forwards (§4.3); **dedicated accounting socket** (`accounting_port`: 1813 default / `"shared"` / `"disabled"`, RFC 2866 §2) with per-socket code admission and Accounting-Response from 1813; home-server health probes made RFC 5997 clients (random Request Authenticator, signed, reply source / Identifier / Response Authenticator / Message-Authenticator verified, per-probe socket — fixes probes that conformant home servers discarded and concurrent probes sharing one socket); constant-time authenticator comparison; interop scenario 14 (Status-Server and the accounting port against radclient, proxy probes against FreeRADIUS and usg-home)
+- **Unreleased**: **EAP-TEAP interoperable with wpa_supplicant (RFC 9930)**: §4.2.13 Crypto-Binding TLV with §6.3 Compound-MACs, §6.2 / §6.4 key schedule with the negotiated cipher suite's hash (pinned by independent known-answer vectors), §3.1 version bits, §3.6.6 Intermediate-Result + Result + Crypto-Binding termination, §4.2.15 one-octet Basic-Password-Auth-Resp lengths, RFC 3748 §5.3.1 EAP-Nak method switching, `eap.teap_tls`; interop harness on wpa_supplicant 2.12 with four TEAP scenarios (57 assertions). EAP-TEAP fragmentation in both phases and directions (§3.3) through the bounded reassembler, L flag only on fragmented TEAP messages, Phase 2 opened with the handshake flight, EAP-Success Identifier echoing the peer's last Response (RFC 3748 §4.2), first EAP-Request Identifier following the NAS's Identity Request (RFC 3748 §4.1); bounded EAP session store (idle timeout enforced on every packet + LRU cap, released on Accept/Reject, fail closed, `radius_eap_sessions_evicted_total`); `eap` block documented; EAP-TEAP Basic-Password-Auth fails closed (fixes an unreleased empty-password bypass), Phase 2 rounds bounded, `eap.enable_teap` default `false`. **Status-Server per RFC 5997**: Message-Authenticator required and verified with silent discard (§4.1), Access-Accept on the authentication port / Accounting-Response on the accounting port (§4.2), Message-Authenticator on every reply, Proxy-State echoed, proxy answers locally and never forwards (§4.3); **dedicated accounting socket** (`accounting_port`: 1813 default / `"shared"` / `"disabled"`, RFC 2866 §2) with per-socket code admission and Accounting-Response from 1813; home-server health probes made RFC 5997 clients (random Request Authenticator, signed, reply source / Identifier / Response Authenticator / Message-Authenticator verified, per-probe socket — fixes probes that conformant home servers discarded and concurrent probes sharing one socket); constant-time authenticator comparison; interop scenario 14 (Status-Server and the accounting port against radclient, proxy probes against FreeRADIUS and usg-home). **Outbound RadSec (RFC 6614) for the proxy**: per home server `transport = "radsec"` with a `tls` block (`ca_path`, `cert_path`, `key_path`, `server_name`, optional `revocation`), no `secret` (fixed `"radsec"`, §2.3 item 4); one persistent mutually authenticated TLS 1.3 / ML-KEM-1024 / AES-256-GCM-SHA384 connection per home server with `enforce_fips_parameters` after every handshake, resumption disabled, fail closed with no UDP fallback, reconnect with capped jittered exponential backoff (§2.3 item 1); home-server certificate revocation through the same `revocation` block (static CRL, CRL-DP, OCSP) via a `ServerCertVerifier` adapter; RFC 6613 rules on the link — no retransmission over the same connection (§2.6.1), connection closed on a bad `Length`, an undecodable packet or a failed Response-/Message-Authenticator (§2.6.4), Status-Server as the mandatory RFC 3539 §3.4 watchdog (`health_check.enabled` required, two unanswered probes reset the connection), probe Identifiers chosen from the free ones and `max_outstanding ≤ 255` (§2.6, §2.6.5); CoA-/Disconnect-Request from a home server answered with NAK + `Error-Cause` 406 (RFC 6614 §2.5); NAS Identifiers still forwarded unchanged (accepted gap). Proxy fixes found on the way: a failed resend no longer loses the retry-count increment (infinite retries), `outstanding` no longer underflows, a stray datagram with a guessed Proxy-State can no longer evict a live cache entry (Response Authenticator verified before the entry is consumed), the proxy block is validated at config load. Interop harness: FreeRADIUS image on Debian trixie (3.2.7 / OpenSSL 3.5.7) running `-fxx -l stdout`, RadSec listener pinned to TLS 1.3 + `ecdh_curve = "MLKEM1024"` + client certificate; scenario 15 (EAP-TLS and PAP through the proxy to FreeRADIUS over RadSec, wrong password rejected) — 76 in-container assertions across 15 scenarios plus 12 host-side checks
 
 ---
 
 *Last Updated: 2026-10-28*
-*Document Version: 3.4 (unreleased: RFC 5997 Status-Server conformance, dedicated 1813/udp accounting socket, conformant health probes)*
+*Document Version: 3.5 (unreleased: RFC 5997 Status-Server conformance, dedicated 1813/udp accounting socket, conformant health probes, outbound RadSec for the proxy with RFC 6613 connection rules)*
