@@ -315,8 +315,14 @@ pub struct EapConfig {
     /// Enable EAP-TLS (Type 13). Default: false.
     #[serde(default)]
     pub enable_tls: bool,
-    /// Enable EAP-TEAP (Type 55, RFC 9930). Default: true.
-    #[serde(default = "default_true")]
+    /// Enable EAP-TEAP (Type 55, RFC 9930). Default: false.
+    ///
+    /// Off by default: TEAP's only inner method is Basic-Password-Auth, which
+    /// needs the inner handler to supply the user's cleartext password (the
+    /// in-memory `users` list does; a user without one always fails). When
+    /// enabled, TEAP is offered before EAP-TLS; EAP-TLS supplicants switch
+    /// with an EAP-Nak.
+    #[serde(default)]
     pub enable_teap: bool,
     /// Seconds an EAP conversation may sit without a packet from the peer
     /// before its state (EAP session plus TLS/TEAP context) is evicted.
@@ -752,6 +758,13 @@ impl Config {
 
         // EAP session bounds: zero would evict every conversation at once.
         if let Some(eap) = &self.eap {
+            if !eap.enable_tls && !eap.enable_teap {
+                return Err(ConfigError::Invalid(
+                    "eap: neither enable_tls nor enable_teap is set (both default to false); \
+                     enable at least one EAP method or remove the eap block"
+                        .to_string(),
+                ));
+            }
             if eap.session_idle_timeout_secs == 0 {
                 return Err(ConfigError::Invalid(
                     "eap.session_idle_timeout_secs must be at least 1".to_string(),
@@ -943,6 +956,30 @@ mod tests {
                 }}
             }}"#
         )
+    }
+
+    #[test]
+    fn eap_teap_is_off_by_default_and_the_eap_block_needs_a_method() {
+        let config: Config = serde_json::from_str(
+            r#"{"secret": "s3cret", "eap": {"enable_tls": true, "tls": {"cert_path": "c", "key_path": "k"}}}"#,
+        )
+        .unwrap();
+        let eap = config.eap.as_ref().unwrap();
+        assert!(!eap.enable_teap, "enable_teap defaults to false");
+        assert!(config.validate().is_ok());
+
+        let none: Config = serde_json::from_str(
+            r#"{"secret": "s3cret", "eap": {"tls": {"cert_path": "c", "key_path": "k"}}}"#,
+        )
+        .unwrap();
+        let err = none.validate().unwrap_err().to_string();
+        assert!(err.contains("enable_teap"), "{err}");
+
+        let teap_only: Config = serde_json::from_str(
+            r#"{"secret": "s3cret", "eap": {"enable_teap": true, "tls": {"cert_path": "c", "key_path": "k"}}}"#,
+        )
+        .unwrap();
+        assert!(teap_only.validate().is_ok());
     }
 
     #[test]

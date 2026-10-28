@@ -521,6 +521,9 @@ and Crypto-Binding TLV are also pinned by known-answer vectors from an
 independent implementation (`tests/vectors/teap_rfc9930_vectors.py`, Python
 standard library, written from the RFC text and self-checked against the
 published RFC 5246 `P_SHA256` vector) in `crates/radius-proto/src/eap/eap_teap.rs`.
+**Off by default** (`eap.enable_teap`, default `false`): Basic-Password-Auth
+needs the inner handler to supply the user's cleartext password, which only
+the in-memory `users` list does.
 
 - ✅ §3.1 Version negotiation: every server packet carries Version 1 in the
   Flags/Ver octet (`TeapPacket`); the peer's first response must propose
@@ -599,6 +602,21 @@ published RFC 5246 `P_SHA256` vector) in `crates/radius-proto/src/eap/eap_teap.r
   (its pre-RFC 9930 reading of RFC 7170 §5.2) and reports an MS-MPPE key
   mismatch against this server; 2.12 and hostap master derive it from
   S-IMCK[1] as RFC 9930 §6.2.2 / §6.4 specify
+- ✅ §4.2.14 / §4.2.15 Basic-Password-Auth fails closed: a user the inner
+  handler has no password for is rejected inside the tunnel (Result=Failure;
+  the tunnel still completes, so an unknown user is indistinguishable from a
+  wrong password), an empty expected or supplied password never matches, and
+  the password comparison is constant-time. Previously a missing password was
+  replaced by an empty string and an empty supplied password authenticated
+  (never released; see CHANGELOG). Handler-level tests
+  (`eap_teap_rejects_*` in `eap_auth.rs`) drive wrong-password,
+  empty-password (known and unknown user) and empty-stored-password
+  conversations to Access-Reject
+- ✅ Phase 2 bounded per conversation: at most 32 reassembled Phase 2
+  messages (`EapTeapServer::MAX_PHASE2_ROUNDS`), and a repeated Identity-Type
+  TLV is a protocol error; both fail closed (`EapError::Phase2LimitExceeded`
+  → Access-Reject, session released). Only a packet answered with an
+  Access-Challenge refreshes the session's LRU position
 
 ---
 
@@ -1020,7 +1038,10 @@ Total:         156+ tests
    with wpa_supplicant 2.12 (`eapol_test`, TLS 1.3 and TLS 1.2, direct and
    through the proxy, MS-MPPE keys matching). Inner methods producing real
    keying material (e.g. EAP-MSCHAPv2) are still pending; current inner
-   methods (Basic-Password-Auth, EAP-MD5) use the zero IMSK of §6.2.1.
+   methods (Basic-Password-Auth, EAP-MD5) use the zero IMSK of §6.2.1. Basic-Password-Auth fails closed
+   (no stored password, empty password → Result=Failure; constant-time
+   comparison), Phase 2 rounds are bounded, and TEAP is off by default
+   (`eap.enable_teap`).
 3. ⚠️ **Proxy-State** - Echoed in responses; ordering regression tests
    pending
 4. ❌ **Hot Configuration Reload** - Deferred (only the mgmt access policy reloads on SIGHUP)
@@ -1071,7 +1092,7 @@ Total:         156+ tests
 | Accounting Port 1813 | 2866 | ⚠️ Not bound | - | MEDIUM | Single UDP socket on listen_port |
 | Proxy-State | 2865 | ⚠️ Echoed | v0.x | MEDIUM | Ordering tests pending |
 | Hot Reload | - | ❌ Deferred | - | MEDIUM | Only mgmt access policy reloads on SIGHUP |
-| EAP-TEAP | 9930 (obsoletes 7170) | ✅ Basic-Password-Auth | v0.7.x / unreleased | MEDIUM | §4.2.13 Crypto-Binding TLV, §6.2–§6.4 key schedule (KATs + eapol_test interop over TLS 1.3 and 1.2, direct and via proxy), §3.3 fragmentation both ways (L only on fragmented messages), §3.6.6 protected termination, EAP-Nak switching; inner methods with real IMSK pending |
+| EAP-TEAP | 9930 (obsoletes 7170) | ✅ Basic-Password-Auth, off by default | v0.7.x / unreleased | MEDIUM | §4.2.13 Crypto-Binding TLV, §6.2–§6.4 key schedule (KATs + eapol_test interop over TLS 1.3 and 1.2, direct and via proxy), §3.3 fragmentation both ways (L only on fragmented messages), §3.6.6 protected termination, EAP-Nak switching; Basic-Password-Auth fails closed, Phase 2 rounds bounded; inner methods with real IMSK pending |
 
 ---
 
@@ -1216,10 +1237,16 @@ The current implementation is **PRODUCTION-READY** for:
 4. **EAP Resource Exhaustion**
    - ✅ Inbound EAP-TLS / EAP-TEAP fragment reassembly bounded at 64 KiB per conversation, L required on the first fragment, overrun and empty non-final fragments rejected, fail closed
    - ✅ EAP session store bounded: idle timeout (default 120 s) and LRU cap (default 4096) on conversations and their TLS state, released on Accept/Reject; evicted conversations fail closed; `radius_eap_sessions_evicted_total` counter
+   - ✅ EAP-TEAP Phase 2 bounded per conversation (32 rounds, repeated Identity-Type TLV rejected), fail closed; a rejected packet never refreshes a session's LRU position
    - ⚠️ Capacity eviction is LRU, so a peer within the rate limits can still displace in-progress conversations once the cap is reached; size `eap.max_sessions` and the rate limits together
    - ✅ EAP-TEAP Crypto-Binding (RFC 9930 §4.2.13 / §6.3) verified before any Result is examined, fail closed on an invalid binding, nonce, version or Flags, and the MSK released only after a verified binding and both Results Success; version negotiation and EAP-Nak switching bounded to one renegotiation per conversation
    - ⚠️ EAP-TEAP with Basic-Password-Auth binds the inner method with the zero IMSK of RFC 9930 §6.2.1: the password is protected by the server-authenticated tunnel only, which the RFC marks NOT RECOMMENDED without a key-deriving inner method; supplicants must validate the server certificate (`ca_cert` / `domain_match`)
    - ⚠️ EAP Identifier not matched on responses and State = `username-millis-sequence` (predictable, unbound to the peer, can restart a live conversation, may exceed 253 octets); redesign as random peer-bound IDs is a tracked follow-up (see RFC 3748 above)
+
+5. **EAP-TEAP Inner Authentication**
+   - ✅ Basic-Password-Auth fails closed: no stored password, empty stored password or empty supplied password → Result=Failure inside the tunnel and Access-Reject; constant-time password comparison. An unreleased build (after v0.12.0, before this fix) accepted an empty password for any user without a stored password
+   - ⚠️ Basic-Password-Auth needs the inner handler to supply the user's cleartext password (`get_user_password`): only the in-memory `users` list does; the PostgreSQL and LDAP handlers reject every TEAP authentication. `eap.enable_teap` therefore defaults to `false`
+   - ⚠️ Inner methods with real keying material (EAP-MSCHAPv2, inner EAP-TLS) pending; current inner methods use the zero IMSK of RFC 9930 §6.2.1
 
 ---
 
@@ -1277,7 +1304,7 @@ The USG RADIUS server is **production-ready** for modern enterprise deployments 
 - **v0.10.1**: Container image built with the `tls` feature
 - **v0.11.0**: **MS-MPPE-Send/Recv-Key (RFC 2548)** on EAP Access-Accepts, RFC 9190 TLS 1.3 exporter labels + EAP-Key-Name, EAP-TEAP IMCK/CMK (RFC 7170 §5.2) and MSK (§5.4), Vendor-Specific and Tunnel-Password codecs, proxy re-keying of User-Password / Message-Authenticator (request leg) and MS-MPPE / Tunnel-Password / Message-Authenticator (response leg), signed proxy timeout rejects
 - **v0.12.0**: **Certificate revocation checking (RFC 5280 / RFC 6960)** wired into EAP-TLS and RadSec via the `revocation` block, fail-closed by default; EAP-Failure on every EAP Access-Reject (RFC 3579 §2.6.3); interop harness (revoked supplicant, 24 assertions) running in CI
-- **Unreleased**: **EAP-TEAP interoperable with wpa_supplicant (RFC 9930)**: §4.2.13 Crypto-Binding TLV with §6.3 Compound-MACs, §6.2 / §6.4 key schedule with the negotiated cipher suite's hash (pinned by independent known-answer vectors), §3.1 version bits, §3.6.6 Intermediate-Result + Result + Crypto-Binding termination, §4.2.15 one-octet Basic-Password-Auth-Resp lengths, RFC 3748 §5.3.1 EAP-Nak method switching, `eap.teap_tls`; interop harness on wpa_supplicant 2.12 with four TEAP scenarios (57 assertions). EAP-TEAP fragmentation in both phases and directions (§3.3) through the bounded reassembler, L flag only on fragmented TEAP messages, Phase 2 opened with the handshake flight, EAP-Success Identifier echoing the peer's last Response (RFC 3748 §4.2), first EAP-Request Identifier following the NAS's Identity Request (RFC 3748 §4.1); bounded EAP session store (idle timeout enforced on every packet + LRU cap, released on Accept/Reject, fail closed, `radius_eap_sessions_evicted_total`); `eap` block documented
+- **Unreleased**: **EAP-TEAP interoperable with wpa_supplicant (RFC 9930)**: §4.2.13 Crypto-Binding TLV with §6.3 Compound-MACs, §6.2 / §6.4 key schedule with the negotiated cipher suite's hash (pinned by independent known-answer vectors), §3.1 version bits, §3.6.6 Intermediate-Result + Result + Crypto-Binding termination, §4.2.15 one-octet Basic-Password-Auth-Resp lengths, RFC 3748 §5.3.1 EAP-Nak method switching, `eap.teap_tls`; interop harness on wpa_supplicant 2.12 with four TEAP scenarios (57 assertions). EAP-TEAP fragmentation in both phases and directions (§3.3) through the bounded reassembler, L flag only on fragmented TEAP messages, Phase 2 opened with the handshake flight, EAP-Success Identifier echoing the peer's last Response (RFC 3748 §4.2), first EAP-Request Identifier following the NAS's Identity Request (RFC 3748 §4.1); bounded EAP session store (idle timeout enforced on every packet + LRU cap, released on Accept/Reject, fail closed, `radius_eap_sessions_evicted_total`); `eap` block documented; EAP-TEAP Basic-Password-Auth fails closed (fixes an unreleased empty-password bypass), Phase 2 rounds bounded, `eap.enable_teap` default `false`
 
 ---
 

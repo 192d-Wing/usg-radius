@@ -352,6 +352,9 @@ binary built with the `tls` cargo feature (the release binary and the
 container image are); a binary built without it refuses a configuration that
 has an `eap` block. `examples/configs/eap-tls-revocation.json` shows the
 complete block.
+At least one of `enable_tls` and `enable_teap` must be set, or the
+server refuses to start. The in-memory `users` list is the credential
+store for TEAP's inner Basic-Password-Auth.
 
 ```json
 {
@@ -417,7 +420,7 @@ Offer EAP-TLS (EAP Type 13).
 Offer EAP-TEAP (EAP Type 55).
 
 - **Type**: Boolean
-- **Default**: `true`
+- **Default**: `false`
 
 When both methods are enabled the server proposes TEAP first; a supplicant
 configured for EAP-TLS answers with an EAP-Nak listing Type 13 and is switched
@@ -426,6 +429,15 @@ Basic-Password-Auth interoperates with wpa_supplicant 2.12 (see
 [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md#rfc-9930---tunnel-eap-teap-version-1-obsoletes-rfc-7170));
 supplicants must validate the server certificate (`ca_cert` / `domain_match`),
 since the password is protected by the tunnel alone.
+
+!!! warning "EAP-TEAP is opt-in"
+    `enable_teap` defaults to `false`. TEAP's only inner method is
+    Basic-Password-Auth, which compares the password the supplicant sends
+    inside the TLS tunnel against the password stored for that user in
+    `users`. A user without a stored password (unknown user, or a backend
+    that does not supply cleartext passwords, such as PostgreSQL or LDAP) is
+    always rejected; an empty stored or supplied password is always rejected.
+    Enable TEAP only where the in-memory `users` list is the credential store.
 
 ### eap.session_idle_timeout_secs
 

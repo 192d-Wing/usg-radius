@@ -76,6 +76,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`eap.enable_teap` now defaults to `false`** (it defaulted to `true`).
+  EAP-TEAP is opt-in: its only inner method, Basic-Password-Auth, needs the
+  inner handler to supply the user's password (the in-memory `users` list
+  does; the PostgreSQL and LDAP handlers do not, so with them every TEAP
+  authentication is rejected), and when enabled it is offered before EAP-TLS
+  (EAP-TLS supplicants switch with an EAP-Nak). A config with an `eap` block
+  that enables neither `enable_tls` nor `enable_teap` is now rejected at
+  startup, so a deployment that relied on the old default fails loudly
+  instead of silently answering every EAP request with Access-Reject.
 - **EAP-TEAP Crypto-Binding wire format and BUFFER.** The previous 68-octet
   Crypto-Binding TLV with a single 32-octet HMAC-SHA256 over the Phase 2 TLV
   history is replaced by the RFC 9930 §4.2.13 / §6.3 format above; it was
@@ -91,6 +100,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **EAP-TEAP Basic-Password-Auth accepted an empty password for any user
+  without a stored password (authentication bypass; no released version
+  affected).** `start_eap_teap` substituted an empty string whenever the inner
+  handler's `get_user_password` returned `None`, which is the trait default
+  (PostgreSQL and LDAP handlers) and what the in-memory `users` handler
+  returns for an unknown user; the inner method then matched an empty
+  supplied password. Because Basic-Password-Auth derives no keying material
+  (zero IMSK), a peer could compute a valid Crypto-Binding compound MAC from
+  the TLS exporter alone, every MSK gate passed, and the conversation ended in
+  Access-Accept with MS-MPPE keys without any credential being checked. TEAP
+  was enabled and preferred by default. **v0.12.0 and earlier are not
+  affected**: through v0.12.0 the handler never initialized the TEAP TLS
+  connection, so every TEAP conversation failed on its first packet; the
+  unreleased fragmentation work above (PR 85) made the path reachable. Now a
+  user without a stored password gets an inner handler that fails every
+  Basic-Password-Auth-Resp (the tunnel still runs to completion with
+  Result=Failure, so an unknown user is indistinguishable from a wrong
+  password), an empty expected or supplied password fails before any
+  comparison, and the comparison is constant-time. Handler-level tests drive
+  wrong-password, empty-password (known and unknown user) and
+  empty-stored-password conversations to Access-Reject.
+- **EAP-TEAP Phase 2 is bounded per conversation.** A peer could keep a
+  conversation (and its TLS state) alive indefinitely with Phase 2 TLVs the
+  server answered or ignored, and every such packet refreshed the session's
+  LRU position, so one peer within the rate limits could keep it from being
+  evicted. Now a conversation accepts at most 32 reassembled Phase 2 messages
+  (`EapTeapServer::MAX_PHASE2_ROUNDS`) and a second Identity-Type TLV is a
+  protocol error; both fail closed (`EapError::Phase2LimitExceeded`,
+  Access-Reject, session released). Looking a session up no longer touches
+  it: only a packet the server answers with an Access-Challenge refreshes its
+  LRU position, a rejected packet never does.
 - **EAP-TEAP inbound fragment reassembly is bounded and fails closed** in both
   phases, through the same `TlsFragmentAssembler` v0.12.0 bounded for EAP-TLS
   (L and TLS Message Length required on the first fragment, announced length

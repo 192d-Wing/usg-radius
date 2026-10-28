@@ -1114,6 +1114,17 @@ pub struct EapTeapServer {
     /// fragment ACK is a protocol error.
     phase2_started: bool,
 
+    /// Reassembled Phase 2 messages received from the peer so far. Bounded
+    /// by `max_phase2_rounds`, so a peer cannot keep a conversation (and its
+    /// TLS state) alive indefinitely by sending TLVs the server answers or
+    /// ignores.
+    phase2_rounds: u32,
+    /// Upper bound on `phase2_rounds` (default [`Self::MAX_PHASE2_ROUNDS`]).
+    max_phase2_rounds: u32,
+    /// Set once the peer has sent an Identity-Type TLV. A second one is a
+    /// protocol error.
+    identity_type_received: bool,
+
     /// The Result the server sent (RFC 9930 §3.6.6).
     sent_result: Option<TeapResult>,
 
@@ -1192,6 +1203,9 @@ impl EapTeapServer {
             crypto_binding: None,
             crypto_binding_verified: false,
             phase2_started: false,
+            phase2_rounds: 0,
+            max_phase2_rounds: Self::MAX_PHASE2_ROUNDS,
+            identity_type_received: false,
             sent_result: None,
             peer_result: None,
             peer_version: None,
@@ -1204,6 +1218,38 @@ impl EapTeapServer {
             #[cfg(test)]
             test_plaintext: false,
         }
+    }
+
+    /// Default bound on the number of reassembled Phase 2 messages a peer
+    /// may send in one conversation. A Basic-Password-Auth conversation
+    /// needs two (the password response and the binding/result
+    /// acknowledgement); an inner EAP method a few more.
+    pub const MAX_PHASE2_ROUNDS: u32 = 32;
+
+    /// Override the Phase 2 round bound for this conversation.
+    pub fn set_max_phase2_rounds(&mut self, rounds: u32) {
+        self.max_phase2_rounds = rounds;
+    }
+
+    /// Count one reassembled Phase 2 message from the peer, bounded by
+    /// `max_phase2_rounds`. Fails closed past the bound.
+    fn count_phase2_round(&mut self) -> Result<(), EapError> {
+        self.phase2_rounds = self.phase2_rounds.saturating_add(1);
+        if self.phase2_rounds > self.max_phase2_rounds {
+            return Err(EapError::Phase2LimitExceeded("Phase 2 rounds"));
+        }
+        Ok(())
+    }
+
+    /// Note the peer's Identity-Type TLV (§4.2.3). The peer answers the
+    /// server's Identity-Type once, alongside its first inner-method
+    /// response; a second one is a protocol error.
+    fn note_identity_type_received(&mut self) -> Result<(), EapError> {
+        if self.identity_type_received {
+            return Err(EapError::Phase2LimitExceeded("repeated Identity-Type TLV"));
+        }
+        self.identity_type_received = true;
+        Ok(())
     }
 
     /// The Phase 1 TLS server, fragmenting outbound messages the TEAP way:
@@ -1463,6 +1509,10 @@ impl EapTeapServer {
                     return Ok(None);
                 };
 
+                // One more reassembled Phase 2 message from the peer, bounded
+                // so a peer cannot keep the conversation alive indefinitely.
+                self.count_phase2_round()?;
+
                 if encrypted.is_empty() {
                     // An empty packet that is not a fragment ACK (the caller
                     // handles those before reaching here). Before the first
@@ -1635,6 +1685,7 @@ impl EapTeapServer {
                     if IdentityType::from_tlv(tlv)? != IdentityType::User {
                         return Err(EapError::InvalidResponseFormat);
                     }
+                    self.note_identity_type_received()?;
                 }
                 // Unknown mandatory TLVs are not understood: fail closed
                 // rather than silently continue (§4.3.2).
@@ -1805,6 +1856,21 @@ impl BasicPasswordAuthHandler {
         }
     }
 
+    /// Handler for a user the backend has no password for (unknown user, or
+    /// a backend that does not supply cleartext passwords). Every
+    /// Basic-Password-Auth-Resp fails, but the method still completes so the
+    /// tunnel runs to Result=Failure exactly like a wrong password would
+    /// (no user enumeration). Never substitute an empty expected password.
+    pub fn without_password(expected_username: String) -> Self {
+        Self {
+            expected_username: Some(expected_username),
+            expected_password: None,
+            username: None,
+            complete: false,
+            result: TeapResult::Failure,
+        }
+    }
+
     /// Parse and check a Basic-Password-Auth-Resp TLV (RFC 9930 §4.2.15):
     ///
     /// ```text
@@ -1839,9 +1905,13 @@ impl BasicPasswordAuthHandler {
         }
         let password = &value[password_start..];
 
-        // Verify credentials (password in constant time).
+        // Verify credentials. Fail closed before any comparison when either
+        // side has no password: an empty expected password (the backend
+        // knows no password for this user, or stores an empty one) or an
+        // empty supplied password never authenticates. The password
+        // comparison itself is constant-time.
         let auth_success = match (&self.expected_username, &self.expected_password) {
-            (Some(exp_user), Some(exp_pass)) => {
+            (Some(exp_user), Some(exp_pass)) if !exp_pass.is_empty() && !password.is_empty() => {
                 &username == exp_user && constant_time_eq(password, exp_pass.as_bytes())
             }
             _ => false,
@@ -2445,8 +2515,21 @@ mod tests {
         }
     }
 
+    /// A password of the same length as [`test_password`] that differs in
+    /// its last character (the constant-time comparison compares content,
+    /// not only length).
+    fn wrong_password_same_length() -> String {
+        let mut wrong = test_password().to_string();
+        let last = wrong.pop().expect("test password is not empty");
+        wrong.push(if last == 'f' { '0' } else { 'f' });
+        wrong
+    }
+
+    /// An empty expected password (what a backend without a password for the
+    /// user used to be mapped to) never matches, not even an empty supplied
+    /// password. This used to be asserted as Success.
     #[test]
-    fn test_basic_password_auth_empty_credentials() {
+    fn test_basic_password_auth_empty_credentials_fail_closed() {
         // Empty username and password, taken from runtime data rather than
         // literals so the fixture carries no hard-coded credential.
         let empty = test_password()[..0].to_string();
@@ -2454,10 +2537,72 @@ mod tests {
         handler
             .process_inner_request(&password_response(empty.as_bytes(), empty.as_bytes()))
             .unwrap();
-
         assert!(handler.is_complete());
-        assert_eq!(handler.get_result(), TeapResult::Success);
-        assert_eq!(handler.get_identity(), Some(empty));
+        assert_eq!(handler.get_result(), TeapResult::Failure);
+        assert_eq!(handler.get_identity(), Some(empty.clone()));
+
+        let mut handler = BasicPasswordAuthHandler::new("alice".to_string(), empty.clone());
+        handler
+            .process_inner_request(&password_response(b"alice", empty.as_bytes()))
+            .unwrap();
+        assert_eq!(handler.get_result(), TeapResult::Failure);
+    }
+
+    /// An empty supplied password fails even though the expected one is set.
+    #[test]
+    fn test_basic_password_auth_empty_supplied_password_fails() {
+        let mut handler = password_handler();
+        let empty = test_password()[..0].to_string();
+        handler
+            .process_inner_request(&password_response(b"alice", empty.as_bytes()))
+            .unwrap();
+        assert!(handler.is_complete());
+        assert_eq!(handler.get_result(), TeapResult::Failure);
+    }
+
+    /// A handler for a user without a stored password rejects every
+    /// password, including an empty one, but still completes.
+    #[test]
+    fn test_basic_password_auth_without_password_rejects_everything() {
+        let empty = test_password()[..0].to_string();
+        let wrong = wrong_password();
+        for (case, supplied) in [empty.as_str(), test_password(), wrong.as_str()]
+            .into_iter()
+            .enumerate()
+        {
+            let mut handler = BasicPasswordAuthHandler::without_password("alice".to_string());
+            let result_tlv = handler
+                .process_inner_request(&password_response(b"alice", supplied.as_bytes()))
+                .unwrap();
+            assert!(handler.is_complete(), "case {case}");
+            assert_eq!(handler.get_result(), TeapResult::Failure, "case {case}");
+            assert_eq!(
+                TeapResult::from_result_tlv(&result_tlv).unwrap(),
+                TeapResult::Failure
+            );
+            assert_eq!(handler.get_identity(), Some("alice".to_string()));
+        }
+    }
+
+    /// Passwords of the right length but different content still fail.
+    #[test]
+    fn test_basic_password_auth_same_length_wrong_password_fails() {
+        let mut handler = password_handler();
+        handler
+            .process_inner_request(&password_response(
+                b"alice",
+                wrong_password_same_length().as_bytes(),
+            ))
+            .unwrap();
+        assert_eq!(handler.get_result(), TeapResult::Failure);
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
     }
 
     #[test]
@@ -2995,6 +3140,54 @@ mod tests {
             server.process_phase2_tlvs(&[]),
             Err(EapError::InvalidState)
         ));
+    }
+
+    /// The peer answers the server's Identity-Type once; a second
+    /// Identity-Type TLV is a protocol error, not a prompt to re-send the
+    /// inner method request.
+    #[test]
+    fn phase2_repeated_identity_type_is_an_error() {
+        let mut server = password_server();
+        server.open_phase2().unwrap();
+        assert!(matches!(
+            server.process_phase2_tlvs(&[IdentityType::User.to_tlv()]),
+            Ok(None)
+        ));
+        assert!(
+            matches!(
+                server.process_phase2_tlvs(&[IdentityType::User.to_tlv()]),
+                Err(EapError::Phase2LimitExceeded("repeated Identity-Type TLV"))
+            ),
+            "a repeated Identity-Type TLV must fail with Phase2LimitExceeded"
+        );
+    }
+
+    /// Every reassembled Phase 2 message counts as a round; past the bound
+    /// the conversation fails before the message is even decrypted.
+    #[test]
+    fn phase2_round_limit() {
+        let mut server = password_server();
+        server.set_max_phase2_rounds(2);
+        let packet = TeapPacket::new(EapTlsPacket::new(
+            crate::eap::eap_tls::TlsFlags::new(false, false, false),
+            None,
+            vec![0x17; 16],
+        ));
+        for round in 1..=2 {
+            let r = server.process_client_message(&packet);
+            // Garbage TLS data fails at decryption, not at the round bound.
+            assert!(
+                !matches!(r, Err(EapError::Phase2LimitExceeded(_))),
+                "round {round} hit the round bound before the configured limit"
+            );
+        }
+        assert!(
+            matches!(
+                server.process_client_message(&packet),
+                Err(EapError::Phase2LimitExceeded("Phase 2 rounds"))
+            ),
+            "the round past the limit must fail with Phase2LimitExceeded"
+        );
     }
 
     #[test]
