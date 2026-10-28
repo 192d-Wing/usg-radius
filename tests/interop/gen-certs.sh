@@ -4,13 +4,16 @@
 # EAP-TLS client certificates whose CN is the EAP identity each run uses, and a
 # CRL from the CA that revokes one of them (client-usg-revoked).
 #
-# Everything lands in tests/interop/certs/ (git-ignored) with mode 0644: the
+#   gen-certs.sh [out-dir]    # default tests/interop/certs/; run.sh passes .runs/<project>/certs
+#
+# Everything lands in the output directory (git-ignored) with mode 0644: the
 # files are bind-mounted read-only into containers that run as unprivileged
 # users (freerad, radius), and nothing here is a real secret.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
-out="$here/certs"
+out=${1:-$here/certs}
+mkdir -p "$out" && out=$(cd "$out" && pwd)
 days=${INTEROP_CERT_DAYS:-30}
 
 if [ -s "$out/ca.crt" ] && [ -z "${INTEROP_REGEN_CERTS:-}" ]; then

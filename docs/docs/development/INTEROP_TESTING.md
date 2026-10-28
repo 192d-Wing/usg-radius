@@ -38,11 +38,49 @@ tail of each eapol_test / radclient log and the three servers' logs.
 
 | Variable | Effect |
 |----------|--------|
-| `KEEP=1` | leave the servers running for manual poking (`docker compose -f tests/interop/compose.yaml down` to stop) |
+| `KEEP=1` | leave the servers running for manual poking; `run.sh` prints the `docker compose ... down` command that stops them |
 | `LOGS=1` | print the servers' logs even on success (`LOG_TAIL` lines, default 400) |
 | `INTEROP_VERBOSE=1` | on failure, print the complete eapol_test logs instead of the tails |
 | `DOCKER="limactl shell myvm docker"` | use an explicit docker CLI |
-| `INTEROP_REGEN_CERTS=1` | regenerate `tests/interop/certs/` |
+| `INTEROP_PROJECT=name` | compose project name (default `usg-radius-interop-<path hash>-<pid>`, unique per run) |
+| `INTEROP_NET=10.77.5` | the /24 for the compose network (default: the first free `10.77.N`) |
+| `INTEROP_REGEN_CERTS=1` | regenerate the certificates of a reused `INTEROP_PROJECT` |
+
+### Concurrent runs
+
+Several worktrees can run `run.sh` at the same time against one Docker host
+(the shared Lima VM, say) without seeing each other. Each run gets:
+
+- its own compose project, `usg-radius-interop-<hash of the checkout path>-<pid>`
+  unless `INTEROP_PROJECT` is set, so its containers, network and volumes are
+  its own;
+- its own image tag (`usg-radius-interop/<image>:<project>`), so a run never
+  starts another worktree's usg-radius build;
+- its own /24. Docker refuses overlapping subnets, so a fixed `10.77.0.0/24`
+  would stop a second run. `run.sh` skips the `10.77.N.0/24` networks already
+  on the host, starts from a point derived from the project name, and moves to
+  the next one if a concurrent run claims the same /24 first. The servers'
+  configs and the `nas` container's targets use `.10`/`.20`/`.30`/`.40` in that
+  /24; `run.sh` renders `freeradius/` and `usg-radius/` with the prefix
+  replaced;
+- its own run directory, `tests/interop/.runs/<project>/` (git-ignored):
+  `certs/` (the test PKI), `net-<prefix>-<pid>/` (the rendered configs and
+  `compose.env`, the values compose interpolates; a file because `limactl
+  shell` does not forward the environment) and, at teardown,
+  `logs/<service>.log`. `run.sh` writes a new `net-*` directory per subnet
+  attempt instead of rewriting files: Lima's virtiofs mount can hand the VM the
+  old size of a file rewritten a moment earlier, which truncates it.
+
+No container names and no host ports are fixed: the `nas` container talks to
+the servers over the compose network. A future scenario that needs a host port
+should publish the container port alone (`"1812/udp"`) and read the ephemeral
+host port back with `docker compose -p <project> port <service> 1812/udp`.
+
+Teardown runs on success, failure, `^C` and `SIGTERM`, and removes only this
+run's containers (including the `nas` one-off), network, volumes and images.
+The run directory is deleted after a passing run and kept, with the server
+logs, after a failing or interrupted one; delete `tests/interop/.runs/` at any
+time when no run is in progress.
 
 Files are under `tests/interop/`: `compose.yaml`, `gen-certs.sh`, the
 FreeRADIUS configuration (`freeradius/`), the two usg-radius configurations
@@ -351,11 +389,13 @@ supplicant) and only appeared against OpenSSL-based peers:
 
 `run.sh` prints, on failure, the tail of each eapol_test / radclient log and
 the three servers' logs. `INTEROP_VERBOSE=1` prints the full eapol_test logs.
-To iterate by hand, `KEEP=1 tests/interop/run.sh` leaves the servers up, then:
+To iterate by hand, `INTEROP_PROJECT=dbg INTEROP_NET=10.77.0 KEEP=1
+tests/interop/run.sh` leaves the servers up under a name and addresses you
+chose, then:
 
 ```bash
 cd tests/interop
-docker compose run --rm --no-deps --entrypoint eapol_test nas \
+docker compose -p dbg --env-file .runs/dbg/net-10.77.0-*/compose.env run --rm --no-deps --entrypoint eapol_test nas \
     -c /etc/eapol_test/eap-tls-usg.conf -a 10.77.0.30 -p 1812 \
     -s nas-usghome-secret-3 -r 0 -t 12 -e
 ```
