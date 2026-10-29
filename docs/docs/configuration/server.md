@@ -50,7 +50,9 @@ usg_radius /path/to/custom-config.json
 ```
 
 The `eap` block is optional; without it the server answers EAP-Message
-requests with Access-Reject. See [EAP Settings](#eap-settings).
+requests with Access-Reject. See [EAP Settings](#eap-settings). The optional
+`proxy` block forwards realms to home servers over UDP or RadSec; see
+[Proxy Settings](#proxy-settings).
 
 ## Server Settings
 
@@ -535,6 +537,92 @@ case. Size it together with `rate_limit_per_client_rps` and
 store and displace in-progress conversations once the cap is reached.
 Evictions are logged at debug level and counted in the
 `radius_eap_sessions_evicted_total{reason="idle"|"capacity"}` metric.
+
+## Proxy Settings
+
+The optional `proxy` object routes realms to pools of home servers. The full
+reference (realms, pools, strategies, retry, health checks, statistics) is
+[RADIUS Proxy](../proxy/README.md); this section covers the per-home-server
+keys and their validation. The proxy runs only under the `udp-insecure` NAS
+listener; the block is validated when the configuration loads, so a bad home
+server stops the server before it binds a socket.
+
+```json
+{
+  "proxy": {
+    "enabled": true,
+    "pools": [
+      {
+        "name": "home",
+        "strategy": "failover",
+        "servers": [
+          {
+            "name": "home-udp",
+            "address": "10.0.1.10:1812",
+            "secret": "${HOME_UDP_SECRET}",
+            "timeout": 5,
+            "max_outstanding": 100
+          },
+          {
+            "name": "home-radsec",
+            "address": "10.0.1.11:2083",
+            "transport": "radsec",
+            "tls": {
+              "ca_path": "/etc/radius/proxy/home-ca.pem",
+              "cert_path": "/etc/radius/proxy/proxy.pem",
+              "key_path": "/etc/radius/proxy/proxy.key",
+              "server_name": "radius2.home.example.com"
+            },
+            "timeout": 5,
+            "max_outstanding": 200
+          }
+        ]
+      }
+    ],
+    "realms": [
+      { "name": "home", "match": { "type": "suffix", "pattern": "home.example.com" }, "pool": "home" }
+    ],
+    "health_check": { "enabled": true, "interval": 20, "timeout": 5, "failures_before_down": 3, "successes_before_up": 2 },
+    "retry": { "max_retries": 3, "retry_interval": 5, "failover_on_timeout": true }
+  }
+}
+```
+
+### proxy.pools[].servers[]
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `address` | String | required | `ip:port` of the home server (an IP literal; no default port) |
+| `transport` | `"udp"` \| `"radsec"` | `"udp"` | Plain UDP RADIUS, or RadSec (RFC 6614): one persistent mutually authenticated TLS 1.3 connection |
+| `secret` | String | none | Shared secret. Required and non-empty for `udp`; must be absent for `radsec`, whose hop secret is the fixed `"radsec"` (RFC 6614 §2.3) |
+| `tls` | Object | none | Required for and only allowed with `radsec` |
+| `tls.ca_path` | String | required | PEM CA bundle the home server's certificate must chain to |
+| `tls.cert_path` | String | required | PEM client certificate chain the proxy presents (leaf first) |
+| `tls.key_path` | String | required | PEM private key for `tls.cert_path` |
+| `tls.server_name` | String | required | DNS name or IP literal the home server's certificate must be valid for; also sent as SNI |
+| `tls.revocation` | Object | none | CRL/OCSP checking of the home server's certificate; same fields as `eap.tls.revocation` and `radsec.revocation` (`mode`, `on_error`, `crl`, `ocsp`); needs a binary built with the `revocation` feature |
+| `timeout` | Integer | `30` | Request timeout in seconds; for `radsec` also the TCP connect and TLS handshake deadline. Must be > 0 |
+| `max_outstanding` | Integer | `100` | Requests in flight to this server; ≤ 255 for `radsec` (RFC 6613 §2.6, §2.6.5) |
+| `name` | String | none | Label used in logs and statistics |
+
+### Validation rules
+
+- `transport: "radsec"` requires a binary built with the `tls` cargo feature (the release binary and the container image are); otherwise the configuration is refused (fail closed).
+- A RadSec home server needs a `tls` block with non-empty `ca_path`, `cert_path`, `key_path` and a `server_name` that parses as a DNS name or IP address. A UDP home server must not have a `tls` block.
+- `secret` is required for `udp` and rejected for `radsec`.
+- `max_outstanding > 255` is rejected for `radsec`: one RadSec connection carries at most 256 outstanding requests, with one Identifier reserved for the Status-Server watchdog.
+- `proxy.health_check.enabled` must be `true` when any home server uses `radsec`; the Status-Server probe is the RFC 6613 §2.6 / RFC 3539 §3.4 watchdog of the connection (two unanswered probes close and reopen it).
+- `tls.revocation` is validated as the other `revocation` blocks are; a binary without the `revocation` feature refuses it.
+- Keep `health_check.interval` below the home server's TLS idle timeout (FreeRADIUS `idle_timeout`, 30 s by default); the probe is what keeps the connection open, and an idle close costs the next request a `retry.retry_interval` of latency.
+
+Typical errors:
+
+```plain
+Error: proxy: Home server 'home-radsec': secret must not be set with transport = "radsec" (RFC 6614 §2.3 fixes the hop secret to "radsec")
+Error: proxy: Home server 'home-radsec': transport = "radsec" requires a tls block (ca_path, cert_path, key_path, server_name)
+Error: proxy: Home server 'home-radsec': max_outstanding 1000 exceeds 255; one RadSec connection carries at most 256 outstanding requests with one Identifier reserved for the Status-Server watchdog (RFC 6613 §2.6, §2.6.5)
+Error: proxy: pool 'home' home server 'home-radsec': RadSec home servers require health_check.enabled: the Status-Server probe is the RFC 6613 §2.6 watchdog (RFC 3539 §3.4) of the connection
+```
 
 ## Complete Configuration Example
 

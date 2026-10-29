@@ -130,6 +130,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server now passes the RADIUS client address to the handler (default
   implementation delegates to `authenticate_request`), and
   `AuthResult::Discard` lets a handler send no reply at all.
+- **The proxy reaches home servers over RadSec (RFC 6614).** A home server
+  takes `"transport": "radsec"` and a `tls` block (`ca_path`, `cert_path`,
+  `key_path`, `server_name`, optional `revocation` — the same block as
+  `eap.tls.revocation` and `radsec.revocation`) in place of a `secret`: the
+  hop secret is the fixed string `"radsec"` of RFC 6614 §2.3 and the
+  certificates authenticate the hop. The proxy keeps one persistent TLS 1.3
+  connection per RadSec home server (ML-KEM-1024-only key exchange,
+  `TLS_AES_256_GCM_SHA384`, mutual certificate authentication, the home
+  server's certificate verified against `ca_path` and `server_name`, the
+  post-handshake FIPS parameter check of the inbound listener), reconnects
+  with exponential backoff and jitter, and never falls back to UDP: a TLS
+  verification failure closes the connection. Requests cross the hop re-keyed
+  as over UDP (User-Password and Message-Authenticator under `"radsec"`; the
+  response's Response Authenticator verified under `"radsec"`, its MS-MPPE
+  keys, Tunnel-Password and Message-Authenticator re-encrypted under the
+  NAS's secret) and responses are correlated by Proxy-State exactly as on
+  the UDP path. On the connection the proxy follows RFC 6613: a request is
+  never retransmitted over the connection it went out on (§2.6.1); a
+  malformed packet, a failed Response Authenticator or a probe reply failing
+  its Message-Authenticator closes the connection (§2.6.4); the RFC 5997
+  Status-Server health probe runs over the connection and is its RFC 3539
+  §3.4 watchdog, two unanswered probes reset it (§2.4, §2.6); one Identifier
+  is kept free for the watchdog and a probe never reuses an Identifier in
+  flight (§2.6, §2.6.5). A CoA-Request or Disconnect-Request arriving from
+  the home server is answered with CoA-NAK / Disconnect-NAK, Error-Cause 406
+  (RFC 6614 §2.5, RFC 5176 §3.5). Without the `tls` cargo feature a `radsec`
+  home server is a configuration error. New example
+  `examples/configs/proxy-radsec-upstream.json`; `examples/proxy_config.json`
+  gains a `radsec_pool`. The Status-Server probe under `"radsec"` is pinned by
+  an independent Python known-answer vector
+  (`tests/vectors/radsec_status_server_vector.py`). Interop: scenario 17
+  (nine assertions, 89 in total across seventeen scenarios) proxies EAP-TLS
+  (eapol_test) and PAP (radclient) through
+  usg-radius to FreeRADIUS 3.2.7 over RadSec with a different secret on the
+  NAS hop (the supplicant's MS-MPPE keys match, the wrong password gets an
+  Access-Reject), and nine host-side checks (13 in all) confirm from the FreeRADIUS and
+  proxy logs that the connection negotiated TLS 1.3, `TLS_AES_256_GCM_SHA384`
+  and ML-KEM-1024 (`group=Some(MLKEM1024)`), that FreeRADIUS verified the
+  proxy's client certificate, and that the RadSec realm never reached UDP
+  1812. Known gaps: the NAS's Identifier is forwarded unchanged on the one
+  connection (no Identifier rewriting on the upstream hop, as on the UDP
+  socket); a stapled OCSP response is ignored (revocation is decided by
+  `tls.revocation` alone); CRL-DP/OCSP fetches run inside the handshake; the
+  proxy is active only under the `udp-insecure` NAS listener, as before.
 
 ### Fixed
 
@@ -155,6 +199,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `request_cache_max_entries` entries: the eviction path kept a DashMap
   iterator (and its shard lock) alive across `remove`. The test for the bound
   had been ignored as "hangs"; it runs again.
+- **The proxy retried a request forever when the resend failed.** The retry
+  manager bumped `retry_count` on a copy of the cache entry and re-inserted
+  it only after a successful resend, so a send error (unreachable home
+  server) left the old entry, with the old count, in the cache: the request
+  was retried on every tick and the NAS never got the signed Access-Reject
+  after `retry.max_retries`. The count, the timestamp and the cache entry
+  are now updated before the send and a failed send counts as an attempt.
+- **A home server's `outstanding` gauge could underflow.** `record_timeout`
+  and `record_response` decremented it unconditionally (a failed resend
+  recorded the timeout without the matching request), wrapping the gauge to
+  2^64 − 1; the decrement now saturates at zero.
+- **The proxy removed a request's cache entry before verifying the
+  response.** A response from the wrong source, or one whose Response
+  Authenticator failed, had already consumed the entry, so a stray or forged
+  datagram carrying a guessed Proxy-State could discard a live proxied
+  request and the NAS timed out. The entry is now looked up, the origin and
+  the Response Authenticator checked, and only then removed; a failing
+  response leaves it in place and is logged.
+- `ProxyCache::insert` refused to replace an existing Proxy-State's entry
+  when the cache was full, which the retry manager relies on to re-insert an
+  entry before resending it.
 
 ### Changed
 
@@ -178,6 +243,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run's containers, network, volumes and images. Two worktrees sharing the
   Lima VM no longer tear down or reuse each other's containers. CI pins
   `INTEROP_PROJECT` so its log-collection step finds the containers.
+- **`health_check.enabled` is required when a RadSec home server is
+  configured.** The Status-Server probe is the RFC 6613 §2.6 watchdog of the
+  connection (RFC 3539 §3.4); `"enabled": false` together with a
+  `"transport": "radsec"` home server is now a configuration error. Keep
+  `health_check.interval` below the home server's TLS idle timeout
+  (FreeRADIUS's default `idle_timeout` is 30 s) so the connection stays warm.
+- **`max_outstanding` is capped at 255 for a RadSec home server** (RFC 6613
+  §2.6, §2.6.5: one Identifier space per connection, one Identifier kept free
+  for the watchdog). UDP home servers are unchanged.
+- The interop harness's FreeRADIUS image moves from Debian bookworm to
+  `debian:trixie-slim` (freeradius 3.2.7, OpenSSL 3.5), the first Debian
+  release whose OpenSSL has the ML-KEM TLS groups, so FreeRADIUS's RadSec
+  listener (`ecdh_curve = "MLKEM1024"`, TLS 1.3 only, client certificate
+  required) can complete a handshake with the ML-KEM-1024-only proxy; the
+  image build asserts that `openssl list -tls-groups` contains `MLKEM1024`.
+  The eapol_test image stays on bookworm. Harness only; the shipping image is
+  unchanged.
 
 ### Testing
 

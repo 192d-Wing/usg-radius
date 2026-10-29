@@ -227,11 +227,8 @@ mod tests {
     ) -> HomeServerPoolConfig {
         let servers = (0..num_servers)
             .map(|i| HomeServerConfig {
-                address: format!("127.0.0.1:180{}", i),
-                secret: format!("secret{}", i),
-                timeout: 30,
-                max_outstanding: 100,
                 name: Some(format!("Server{}", i)),
+                ..HomeServerConfig::udp(format!("127.0.0.1:180{}", i), format!("secret{}", i))
             })
             .collect();
 

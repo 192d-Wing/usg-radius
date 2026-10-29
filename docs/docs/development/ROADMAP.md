@@ -13,9 +13,15 @@ See [RFC-COMPLIANCE.md](../protocol/RFC-COMPLIANCE.md) for detailed gap analysis
 
 - ❌ No DTLS transport; RadSec is TLS 1.3 only
 - ❌ CoA/Disconnect only over RadSec (no UDP/3799 path)
-- ❌ No certificate hot-rotation for RadSec or EAP-TLS
-- ⚠️ Revocation: no delta or Issuing Distribution Point CRLs, static CRLs not hot-reloaded (CRL and OCSP signatures are verified since the unreleased revocation-signature change)
+- ❌ No certificate hot-rotation for RadSec (listener or proxy client certificate) or EAP-TLS
+- ⚠️ Revocation: no delta or Issuing Distribution Point CRLs, static CRLs not hot-reloaded (CRL and OCSP signatures are verified since the unreleased revocation-signature change, for the inbound listeners and the proxy's outbound RadSec link alike)
 - ⚠️ EAP-TEAP has only the Basic-Password-Auth inner method (zero IMSK); no EAP-MSCHAPv2 or inner EAP-TLS
+- ⚠️ The proxy forwards NAS Identifiers unchanged on its upstream hop (UDP socket or RadSec connection), so two NASes using the same Identifier at the same time collide at a home server that deduplicates on Identifier (RFC 6613 §2.6); the proxy runs only under the `udp-insecure` NAS listener
+
+Closed since v0.13.0 (unreleased): outbound RadSec (RFC 6614) from the proxy to
+`transport: "radsec"` home servers with the RFC 6613 connection rules (one
+persistent TLS 1.3 / ML-KEM-1024 connection per home server, fixed `"radsec"`
+hop secret, Status-Server watchdog, home-server certificate revocation).
 
 ### Completed Features (v0.1.0 through v0.13.0)
 
@@ -1240,17 +1246,19 @@ let config = RevocationConfig::disabled();
 - [x] TLS 1.3 support (TLS 1.2 intentionally excluded by the FIPS posture; ML-KEM-1024-only key exchange)
 - [x] Certificate-based authentication (NAS client certificate is the authenticated identity)
 - [x] RADIUS over TLS (RadSec) on 2083/tcp, default transport for config files
+- [x] Outbound RadSec from the proxy to `transport: "radsec"` home servers (unreleased): one persistent mutually authenticated connection per home server, fixed `"radsec"` hop secret, RFC 6613 connection rules (no retransmission on a connection, close on protocol violation, Status-Server watchdog, Identifier tracking, `max_outstanding ≤ 255`), home-server certificate revocation via `tls.revocation`; interop scenario 17 against FreeRADIUS 3.2.7 over RadSec
 - [ ] DTLS support (RFC 7360) - **not shipped**
 - [x] Perfect Forward Secrecy (ephemeral ML-KEM key exchange)
 
 ### Certificate Management for RadSec ⚠️ PARTIAL
 
-- [ ] Dynamic certificate loading - **not shipped** (certificates load at startup)
+- [ ] Dynamic certificate loading - **not shipped** (certificates load at startup, listener and outbound link alike)
 - [ ] Certificate rotation - **not shipped** (rotate by pod restart)
-- [x] Mutual TLS authentication (`radsec.client_ca_path` always required)
-- [ ] Certificate pinning - **not shipped**
+- [x] Mutual TLS authentication (`radsec.client_ca_path` always required; the proxy always presents `tls.cert_path` to a RadSec home server)
+- [ ] Certificate pinning / fingerprint trust - **not shipped** (inbound and outbound)
+- [x] CRL/OCSP checks on NAS certificates (`radsec.revocation`, v0.12.0) and on home-server certificates (`proxy.pools[].servers[].tls.revocation`, unreleased)
 
-**Deferred follow-ups**: DTLS, certificate hot-rotation/pinning, CRL/OCSP checks on NAS certificates (module exists under the `revocation` feature, not integrated)
+**Deferred follow-ups**: DTLS, certificate hot-rotation/pinning, Identifier rewriting on the proxy's upstream hop (RFC 6613 §2.6), proxying under the inbound RadSec listener, TCP keepalive on outbound links, revocation fetches off the handshake path
 
 ---
 

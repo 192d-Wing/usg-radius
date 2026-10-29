@@ -4,7 +4,8 @@
 #
 #   nas (eapol_test, radclient) 10.77.0.40
 #     --[nas-proxy-secret-1]-->   usg-proxy 10.77.0.20
-#                                   --[proxy-freeradius-secret-2]--> freeradius 10.77.0.10  (realm freeradius.test)
+#                                   --[proxy-freeradius-secret-2]--> freeradius 10.77.0.10:1812  (UDP, realm freeradius.test)
+#                                   --[RadSec, TLS 1.3 ML-KEM-1024, mTLS, secret "radsec"]--> freeradius 10.77.0.10:2083  (realm radsec.test)
 #                                   --[proxy-usghome-secret-4]-->    usg-home   10.77.0.30  (realm usg.test)
 #     --[nas-usghome-secret-3]--> usg-home  10.77.0.30   (EAP-TLS with CRL checking, no proxy)
 #     --[nas-usghome-secret-3]--> usg-home  10.77.0.30:1813  (Accounting-Request, Status-Server -> Accounting-Response)
@@ -19,6 +20,12 @@
 # a host port; the nas container reaches the servers over this network. A
 # scenario that does need one should publish the container port alone
 # ("1812/udp") and read the ephemeral host port back with `compose port`.
+#
+# The RadSec hop (RFC 6614) is the one RADIUS hop carried over TLS: the proxy
+# authenticates with <certs>/usg-proxy.crt, FreeRADIUS with
+# <certs>/freeradius-server.crt (server_name "freeradius"), both under
+# <certs>/ca.crt; freeradius/sites-radsec is rendered for the run's /24 like
+# every other config under freeradius/ and usg-radius/.
 name: ${INTEROP_PROJECT:-usg-radius-interop}
 
 networks:
@@ -39,6 +46,7 @@ services:
       - ${INTEROP_CONF:-.}/freeradius/clients.conf:/etc/freeradius/3.0/clients.conf:ro
       - ${INTEROP_CONF:-.}/freeradius/eap:/etc/freeradius/3.0/mods-available/eap:ro
       - ${INTEROP_CONF:-.}/freeradius/authorize:/etc/freeradius/3.0/mods-config/files/authorize:ro
+      - ${INTEROP_CONF:-.}/freeradius/sites-radsec:/etc/freeradius/3.0/sites-enabled/radsec:ro
       - ${INTEROP_CERTS:-./certs}:/etc/freeradius/interop-certs:ro
 
   usg-proxy:
@@ -56,6 +64,8 @@ services:
         ipv4_address: ${INTEROP_NET:-10.77.0}.20
     volumes:
       - ${INTEROP_CONF:-.}/usg-radius/proxy.json:/etc/radius/proxy.json:ro
+      # CA bundle, client certificate and key for the RadSec home server.
+      - ${INTEROP_CERTS:-./certs}:/certs:ro
     depends_on:
       - freeradius
 

@@ -898,6 +898,15 @@ impl Config {
             rev.validate("radsec.revocation")?;
         }
 
+        // Proxy: pools, realms and every home server (address, secret,
+        // transport, RadSec tls block) are checked here so a bad home server
+        // fails at config load rather than at `RadiusServer::new`.
+        if let Some(proxy) = &self.proxy {
+            proxy
+                .validate()
+                .map_err(|e| ConfigError::Invalid(format!("proxy: {e}")))?;
+        }
+
         // Validate management API security config.
         if let Some(mgmt) = &self.mgmt {
             if let Some(tls) = &mgmt.tls
@@ -1170,7 +1179,10 @@ mod tests {
             // the feature is on; its shape is still checked below.
             let needs_revocation_feature =
                 contents.contains("\"revocation\"") && !cfg!(feature = "revocation");
-            if !shell_template && !needs_revocation_feature {
+            // Likewise a `transport = "radsec"` *home server* (its `tls` block
+            // is the only place `server_name` appears) needs the `tls` feature.
+            let needs_tls_feature = contents.contains("\"server_name\"") && !cfg!(feature = "tls");
+            if !shell_template && !needs_revocation_feature && !needs_tls_feature {
                 config
                     .validate()
                     .unwrap_or_else(|e| panic!("{name}: does not validate: {e}"));
@@ -1185,6 +1197,176 @@ mod tests {
             seen += 1;
         }
         assert!(seen >= 8, "expected the example configs, found {seen}");
+    }
+
+    #[test]
+    fn example_proxy_config_json_radsec_pool_parses_and_validates() {
+        // `examples/proxy_config.json` lives outside `examples/configs`, so the
+        // loop above does not see it. The whole file must load as a `Config`
+        // (clients use `address`, home servers are IP literals) and validate
+        // under the default features, its RadSec pool must be a secret-less
+        // `transport = "radsec"` server (the `tls.revocation` block is only
+        // described in its `_comment`, since the default build has no
+        // `revocation` feature), and the pre-RadSec pools must still read as
+        // UDP.
+        use crate::proxy::home_server::HomeServerTransport;
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/proxy_config.json"
+        );
+        let contents = fs::read_to_string(path).unwrap();
+        let config: Config = serde_json::from_str(&contents)
+            .unwrap_or_else(|e| panic!("proxy_config.json: does not parse as a Config: {e}"));
+        let proxy = config.proxy.as_ref().expect("proxy block");
+        assert!(proxy.enabled);
+        assert!(
+            proxy.health_check.enabled,
+            "RadSec home servers need the Status-Server watchdog (RFC 6613 §2.6)"
+        );
+
+        let pool = proxy
+            .pools
+            .iter()
+            .find(|p| p.name == "radsec_pool")
+            .expect("radsec_pool");
+        assert_eq!(pool.servers.len(), 1);
+        let server = &pool.servers[0];
+        assert_eq!(server.transport, HomeServerTransport::Radsec);
+        assert!(
+            server.secret.is_empty(),
+            "a RadSec home server carries no secret (RFC 6614 §2.3 item 4)"
+        );
+        assert!(server.max_outstanding <= 255, "RFC 6613 §2.6.5");
+        let tls = server.tls.as_ref().expect("tls block");
+        assert_eq!(tls.server_name, "radius.partner.example.net");
+        assert!(
+            tls.revocation.is_none(),
+            "the example must load under the default features (no `revocation`)"
+        );
+        assert!(
+            proxy.realms.iter().any(|r| r.pool == "radsec_pool"),
+            "a realm routes to the RadSec pool"
+        );
+
+        // `usg-radius --validate examples/proxy_config.json` runs this.
+        let result = config.validate();
+        if cfg!(feature = "tls") {
+            result.unwrap_or_else(|e| panic!("proxy_config.json: does not validate: {e}"));
+        } else {
+            // Fail closed: a RadSec home server needs the `tls` feature.
+            assert!(result.is_err());
+        }
+
+        for server in proxy
+            .pools
+            .iter()
+            .filter(|p| p.name != "radsec_pool")
+            .flat_map(|p| &p.servers)
+        {
+            assert_eq!(
+                server.transport,
+                HomeServerTransport::Udp,
+                "{}",
+                server.address
+            );
+            assert!(server.tls.is_none());
+            assert!(!server.secret.is_empty());
+        }
+    }
+
+    // --- proxy block validation at config load ---
+
+    /// A full config whose proxy has one home server with the given JSON.
+    fn proxy_config_json(server: &str) -> String {
+        format!(
+            r#"{{
+                "secret": "s3cret",
+                "transport": "udp-insecure",
+                "accounting_port": 1813,
+                "clients": [{{"address": "10.0.0.0/8", "secret": "nas-secret"}}],
+                "proxy": {{
+                    "enabled": true,
+                    "pools": [{{"name": "home", "servers": [{server}]}}],
+                    "realms": [{{"name": "home", "match": {{"type": "suffix", "pattern": "home.test"}}, "pool": "home"}}]
+                }}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn config_validate_rejects_a_proxy_block_with_an_invalid_home_server() {
+        // Empty secret on a UDP home server.
+        let config: Config =
+            serde_json::from_str(&proxy_config_json(r#"{"address": "10.0.0.1:1812"}"#)).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("proxy:"), "{err}");
+        assert!(err.contains("secret"), "{err}");
+
+        // RadSec home server without its tls block.
+        let config: Config = serde_json::from_str(&proxy_config_json(
+            r#"{"address": "10.0.0.1:2083", "transport": "radsec"}"#,
+        ))
+        .unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("proxy:"), "{err}");
+
+        // RadSec home server with a secret.
+        let config: Config = serde_json::from_str(&proxy_config_json(
+            r#"{"address": "10.0.0.1:2083", "transport": "radsec", "secret": "x",
+                "tls": {"ca_path": "ca", "cert_path": "c", "key_path": "k", "server_name": "h.test"}}"#,
+        ))
+        .unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        // Without `tls` the feature check fails first (fail closed either way).
+        let expected = if cfg!(feature = "tls") {
+            "secret must not be set"
+        } else {
+            "`tls` feature"
+        };
+        assert!(err.contains(expected), "{err}");
+
+        // A disabled proxy block is not validated (as before).
+        let config: Config = serde_json::from_str(
+            r#"{"secret": "s3cret", "proxy": {"enabled": false, "pools": [{"name": "p", "servers": [{"address": "bad"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_with_a_radsec_home_server_loads() {
+        use crate::proxy::home_server::HomeServerTransport;
+
+        let config: Config = serde_json::from_str(&proxy_config_json(
+            r#"{
+                "address": "10.0.0.1:2083",
+                "transport": "radsec",
+                "name": "home-radsec",
+                "tls": {
+                    "ca_path": "/certs/home-ca.pem",
+                    "cert_path": "/certs/proxy.pem",
+                    "key_path": "/certs/proxy.key",
+                    "server_name": "home.example.test"
+                }
+            }"#,
+        ))
+        .unwrap();
+        let server = &config.proxy.as_ref().unwrap().pools[0].servers[0];
+        assert_eq!(server.transport, HomeServerTransport::Radsec);
+        assert!(server.secret.is_empty());
+        assert_eq!(
+            server.tls.as_ref().unwrap().server_name,
+            "home.example.test"
+        );
+
+        let result = config.validate();
+        if cfg!(feature = "tls") {
+            result.expect("a RadSec home server validates with the tls feature");
+        } else {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("`tls` feature"), "{err}");
+        }
     }
 
     /// Minimal config with an EAP-TLS block carrying the given `revocation` JSON

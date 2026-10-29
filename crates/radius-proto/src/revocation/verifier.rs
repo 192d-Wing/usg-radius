@@ -312,6 +312,13 @@ impl RevocationCheckingVerifier {
 
     /// Check every certificate of the peer's chain except the trust anchor.
     ///
+    /// This is the transport-agnostic entry point: the [`ClientCertVerifier`]
+    /// impl below calls it for peer (supplicant / NAS) certificates, and
+    /// radius-server's outbound RadSec `ServerCertVerifier` calls it for the
+    /// home server's certificate after WebPKI chain and name validation.
+    /// Nothing in here depends on which end of the handshake the certificate
+    /// came from.
+    ///
     /// When more than one path links the end entity to a configured issuer
     /// (a CA renewed under the same Name and key, cross-certificates), every
     /// path is checked and any revoked link rejects: the handshake may have
@@ -322,7 +329,7 @@ impl RevocationCheckingVerifier {
     /// * `Ok(())` - Nothing is revoked (or a check failed under fail-open)
     /// * `Err(RevocationError)` - A certificate is revoked OR a check failed
     ///   under fail-closed
-    fn check_chain(
+    pub fn check_chain(
         &self,
         end_entity: &[u8],
         intermediates: &[&[u8]],

@@ -1,9 +1,11 @@
 #!/usr/bin/env sh
 # Generate the throw-away test PKI for the interop run: one CA, two RADIUS
-# server certificates (FreeRADIUS home server, usg-radius home server), three
-# EAP-TLS client certificates whose CN is the EAP identity each run uses, a
-# CRL from the CA that revokes one of them (client-usg-revoked), and a forged
-# CRL (ca-wrongkey.crl) that names the CA as issuer and revokes nothing but is
+# server certificates (FreeRADIUS home server, usg-radius home server; the
+# FreeRADIUS one also serves its RadSec listener), one RadSec client certificate
+# for the usg-radius proxy (usg-proxy, EKU clientAuth), three EAP-TLS client
+# certificates whose CN is the EAP identity each run uses, a CRL from the CA
+# that revokes one of them (client-usg-revoked), and a forged CRL
+# (ca-wrongkey.crl) that names the CA as issuer and revokes nothing but is
 # signed by a different key.
 #
 #   gen-certs.sh [out-dir]    # default tests/interop/certs/; run.sh passes .runs/<project>/certs
@@ -18,7 +20,10 @@ out=${1:-$here/certs}
 mkdir -p "$out" && out=$(cd "$out" && pwd)
 days=${INTEROP_CERT_DAYS:-30}
 
-if [ -s "$out/ca.crt" ] && [ -s "$out/ca-wrongkey.crl" ] && [ -z "${INTEROP_REGEN_CERTS:-}" ]; then
+# usg-proxy.crt and ca-wrongkey.crl are the newest files in the set: a certs/
+# dir from before either was added is regenerated instead of reused.
+if [ -s "$out/ca.crt" ] && [ -s "$out/usg-proxy.crt" ] && [ -s "$out/ca-wrongkey.crl" ] \
+    && [ -z "${INTEROP_REGEN_CERTS:-}" ]; then
     echo "gen-certs: reusing $out (set INTEROP_REGEN_CERTS=1 to regenerate)"
     exit 0
 fi
@@ -70,6 +75,10 @@ issue() { # issue <name> <subject CN> <section>
 # Server certificates (SAN = the compose service name).
 issue freeradius-server freeradius server
 issue usg-home-server   usg-home   server
+
+# RadSec client certificate for the proxy -> FreeRADIUS hop (RFC 6614 section
+# 2.3: mutual TLS). FreeRADIUS checks the chain against ca.crt, not the CN.
+issue usg-proxy usg-proxy client
 
 # Client certificates: CN must equal the EAP identity. usg-radius checks that
 # (EapTlsServer::verify_peer_identity); FreeRADIUS does not by default.

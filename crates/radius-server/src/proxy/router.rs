@@ -205,11 +205,8 @@ mod tests {
             name: name.to_string(),
             strategy: LoadBalanceStrategy::RoundRobin,
             servers: vec![HomeServerConfig {
-                address: "127.0.0.1:1812".to_string(),
-                secret: "test_secret".to_string(),
-                timeout: 30,
-                max_outstanding: 100,
                 name: Some(server_name.to_string()),
+                ..HomeServerConfig::udp("127.0.0.1:1812", "test_secret")
             }],
         };
 

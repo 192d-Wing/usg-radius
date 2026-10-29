@@ -65,6 +65,21 @@ pub enum ProxyError {
     /// Invalid realm pattern
     #[error("Invalid realm pattern: {0}")]
     InvalidRealmPattern(String),
+
+    /// The RadSec link to a home server is not connected (RFC 6614 upstream
+    /// transport). Nothing is queued: the request stays in the proxy cache
+    /// and the retry manager resends it once the link is back.
+    #[error("RadSec link to home server {0} is not connected")]
+    LinkDown(String),
+
+    /// The RadSec link's bounded outbound queue is full.
+    #[error("RadSec link to home server {0} is busy (outbound queue full)")]
+    LinkBusy(String),
+
+    /// TLS setup error for a RadSec home server at startup (certificate, key,
+    /// CA bundle, CRL or server name). Display only; never key material.
+    #[error("RadSec TLS error: {0}")]
+    Tls(String),
 }
 
 /// Result type for proxy operations

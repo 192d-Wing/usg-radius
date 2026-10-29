@@ -12,7 +12,7 @@ A RADIUS (Remote Authentication Dial-In User Service) server implementation in R
 - **Accounting**: Accounting-Request and Accounting-Response on a dedicated 1813/udp socket (`accounting_port`, RFC 2866 §2) with full session lifecycle
 - **EAP Support**: EAP-TLS (RFC 5216) and EAP-TEAP (RFC 7170) over EAP-Message (Type 79) for 802.1X, with fragmentation, MSK/EMSK derivation and Access-Challenge multi-round flows
 - **CHAP and PAP**: CHAP-Password (RFC 2865 §5.3) and User-Password authentication
-- **RadSec Transport**: RADIUS over mutually authenticated TLS 1.3 (RFC 6614) with ML-KEM-1024 key exchange; the default transport for config files, with `udp-insecure` as an explicit fallback
+- **RadSec Transport**: RADIUS over mutually authenticated TLS 1.3 (RFC 6614) with ML-KEM-1024 key exchange; the default transport for config files, with `udp-insecure` as an explicit fallback. The proxy also reaches home servers over RadSec (`transport: "radsec"` per home server: one persistent connection, fixed `"radsec"` hop secret, Status-Server watchdog per RFC 6613, no UDP fallback)
 - **CoA / Disconnect**: Server-originated Change-of-Authorization and Disconnect (RFC 5176) over RadSec, triggered from the management API
 - **Status Server**: RFC 5997 Status-Server with Message-Authenticator verification; Access-Accept on the authentication port, Accounting-Response on the accounting port; the proxy answers probes itself and probes its home servers the same way
 - **Password Encryption**: MD5-based User-Password encryption per RFC 2865 Section 5.2
@@ -61,11 +61,12 @@ A RADIUS (Remote Authentication Dial-In User Service) server implementation in R
 - **RFC 5176**: Dynamic Authorization Extensions - Server-originated CoA/Disconnect over RadSec
 - **RFC 5216**: EAP-TLS - Certificate-based authentication with RFC 5705 key export
 - **RFC 5997**: RADIUS Status-Server - Message-Authenticator required and verified, reply code by port, never forwarded by the proxy
-- **RFC 6614**: RADIUS over TLS (RadSec) - TLS 1.3 mutual authentication, default transport
+- **RFC 6613**: RADIUS over TCP - connection rules applied to RadSec links from the proxy to its home servers (no retransmission over a connection, close on protocol violation, Status-Server watchdog, Identifier tracking); NAS Identifiers are forwarded unchanged (no rewriting on the upstream hop)
+- **RFC 6614**: RADIUS over TLS (RadSec) - TLS 1.3 mutual authentication, default transport; outbound from the proxy to `transport: "radsec"` home servers with the fixed `"radsec"` hop secret and home-server certificate revocation checking
 - **RFC 7170**: EAP-TEAP - TLS tunnel and TLV protocol with Crypto-Binding and MSK derivation (inner methods with real keying material pending)
 - **RFC 9190**: EAP-TLS 1.3 - Version-correct exporter labels and EAP-Key-Name
 
-See [RFC Compliance](docs/docs/protocol/RFC-COMPLIANCE.md) for the gap analysis, including what is not yet implemented (DTLS, CoA over UDP, delta CRLs).
+See [RFC Compliance](docs/docs/protocol/RFC-COMPLIANCE.md) for the gap analysis, including what is not yet implemented (DTLS, CoA over UDP, delta CRLs, Identifier rewriting on the proxy's upstream hop, certificate hot-rotation).
 
 ## Installation
 
@@ -402,6 +403,7 @@ Contributions are welcome! Please feel free to submit issues or pull requests.
 - [RFC 5176 - Dynamic Authorization Extensions](https://tools.ietf.org/html/rfc5176)
 - [RFC 5216 - EAP-TLS](https://tools.ietf.org/html/rfc5216)
 - [RFC 5997 - RADIUS Status-Server](https://tools.ietf.org/html/rfc5997)
+- [RFC 6613 - RADIUS over TCP](https://tools.ietf.org/html/rfc6613)
 - [RFC 6614 - RADIUS over TLS (RadSec)](https://tools.ietf.org/html/rfc6614)
 - [RFC 7170 - EAP-TEAP](https://tools.ietf.org/html/rfc7170)
 

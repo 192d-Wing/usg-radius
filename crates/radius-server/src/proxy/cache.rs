@@ -56,6 +56,13 @@ pub struct ProxyCacheEntry {
     pub proxy_state: ProxyStateKey,
     /// Client secret for response authentication
     pub client_secret: Vec<u8>,
+    /// For a RadSec home server: the link's connection generation
+    /// (`RadsecLinkHandle::connections()`) the request was last written on.
+    /// RFC 6613 §2.6.1: a request MUST NOT be retransmitted over the TCP
+    /// connection it was sent on, so the retry manager resends it only once
+    /// the link is on a different connection. `None` for UDP (connectionless)
+    /// and for a RadSec server without a link attached.
+    pub sent_on_connection: Option<u64>,
 }
 
 /// Proxy cache for tracking in-flight requests
@@ -149,12 +156,13 @@ impl ProxyCache {
         }
     }
 
-    /// Insert a new entry into the cache
+    /// Insert a new entry into the cache, or replace the entry with the same
+    /// Proxy-State (the retry manager re-inserts timed-out entries).
     ///
-    /// Returns error if cache is full (at max capacity)
+    /// Returns error if cache is full (at max capacity) and the entry is new.
     pub fn insert(&self, entry: ProxyCacheEntry) -> ProxyResult<()> {
-        // Check capacity
-        if self.cache.len() >= self.max_entries {
+        // Check capacity (a replacement does not grow the cache)
+        if self.cache.len() >= self.max_entries && !self.cache.contains_key(&entry.proxy_state) {
             return Err(ProxyError::CacheFull(self.cache.len()));
         }
 
@@ -236,11 +244,8 @@ mod tests {
 
     fn create_test_home_server() -> Arc<HomeServer> {
         let config = HomeServerConfig {
-            address: "192.168.1.1:1812".to_string(),
-            secret: "test_secret".to_string(),
-            timeout: 30,
-            max_outstanding: 100,
             name: Some("Test Server".to_string()),
+            ..HomeServerConfig::udp("192.168.1.1:1812", "test_secret")
         };
         Arc::new(HomeServer::new(config).unwrap())
     }
@@ -258,6 +263,7 @@ mod tests {
             retry_count: 0,
             proxy_state: generate_proxy_state_key(),
             client_secret: b"test_secret".to_vec(),
+            sent_on_connection: None,
         }
     }
 
