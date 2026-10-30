@@ -91,7 +91,7 @@ ldap3 = "0.12"
 # runtime `sqlx::query(...)` API (no compile-time `query!`/`FromRow`). Omitting it
 # drops `sqlx-macros-core`, which otherwise pulls every driver (mysql/sqlite) and
 # the unpatched `rsa` crate (RUSTSEC-2023-0071) into the tree.
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "postgres",
     "chrono",
